@@ -19,6 +19,10 @@
 #   stop     unload the sing-box agent (turns the proxy off first, so the
 #            system is never left pointing at a dead port)
 #   restart  reload sing-box
+#   webrtc   block|allow|status - control whether the browser may use
+#            non-proxied UDP. A SOCKS proxy cannot carry UDP, so WebRTC
+#            would otherwise reach the network directly and expose the real
+#            address regardless of everything else here.
 #
 # NOTE: applications with their own explicit proxy setting ignore the macOS
 # system proxy, so they are unaffected by this script and keep whatever path
@@ -57,6 +61,14 @@ for var in PROXY_HOST PROXY_PORT UPSTREAM_HOST UPSTREAM_PORT UPSTREAM_PROCESS \
 done
 
 PLIST="$HOME/Library/LaunchAgents/$SINGBOX_AGENT.plist"
+
+# Chromium-family preference domain whose WebRTC policy we toggle.
+# Override in the env file for Brave, Edge, Chromium, etc.
+BROWSER_DOMAIN="${BROWSER_DOMAIN:-com.google.Chrome}"
+
+# Chrome renamed this policy; write and read both so either vintage works.
+WEBRTC_KEYS=(WebRtcIPHandlingPolicy WebRtcIPHandling)
+WEBRTC_BLOCK_VALUE=disable_non_proxied_udp
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 ok()   { printf '  \033[32m[ok]\033[0m   %s\n' "$1"; }
@@ -113,6 +125,63 @@ cmd_stop() {
     ok "sing-box stopped"
 }
 
+# "blocked" if either policy key pins non-proxied UDP off, else "allowed".
+webrtc_state() {
+    local k v
+    for k in "${WEBRTC_KEYS[@]}"; do
+        v=$(defaults read "$BROWSER_DOMAIN" "$k" 2>/dev/null)
+        [ "$v" = "$WEBRTC_BLOCK_VALUE" ] && { echo blocked; return; }
+    done
+    echo allowed
+}
+
+browser_running() { pgrep -f 'Google Chrome' >/dev/null 2>&1; }
+
+cmd_webrtc() {
+    local k
+    case "${1:-status}" in
+        block)
+            for k in "${WEBRTC_KEYS[@]}"; do
+                defaults write "$BROWSER_DOMAIN" "$k" -string "$WEBRTC_BLOCK_VALUE"
+            done
+            ok "WebRTC blocked from using non-proxied UDP"
+            ;;
+        allow)
+            # Delete rather than set "default": a mandatory policy also
+            # overrides extension-set privacy settings, so leaving one in
+            # place would silently defeat any extension-based control later.
+            for k in "${WEBRTC_KEYS[@]}"; do
+                defaults delete "$BROWSER_DOMAIN" "$k" 2>/dev/null
+            done
+            warn "WebRTC may now reach the network directly"
+            warn "any page in the browser can read your real address while this is on"
+            ;;
+        status) ;;
+        *)
+            echo "usage: vpnchain webrtc {block|allow|status}" >&2
+            exit 1
+            ;;
+    esac
+
+    echo
+    if [ "$(webrtc_state)" = blocked ]; then
+        ok "webrtc: BLOCKED - no direct UDP, real address not exposed"
+    else
+        bad "webrtc: ALLOWED - real address exposed to any page"
+    fi
+
+    if [ "${1:-status}" != status ]; then
+        echo
+        if browser_running; then
+            warn "the browser is running - quit it COMPLETELY (Cmd-Q) and reopen"
+            warn "policies are only read at startup; closing windows is not enough"
+        else
+            ok "browser not running - the new setting applies at next launch"
+        fi
+        echo "         verify at chrome://policy"
+    fi
+}
+
 cmd_status() {
     bold "chain components"
 
@@ -149,6 +218,16 @@ cmd_status() {
     fi
 
     echo
+    bold "browser udp"
+    if [ "$(webrtc_state)" = blocked ]; then
+        ok "WebRTC blocked from non-proxied UDP"
+    else
+        bad "WebRTC ALLOWED direct UDP - your real address is exposed"
+        echo "         a SOCKS proxy cannot carry UDP, so this bypasses the"
+        echo "         chain entirely. run: vpnchain webrtc block"
+    fi
+
+    echo
     bold "what the outside world sees"
     local direct chain
     direct=$(curl -s -m 10 https://api.ipify.org 2>/dev/null)
@@ -177,8 +256,10 @@ case "${1:-status}" in
     stop)    cmd_stop ;;
     restart) cmd_stop; cmd_start; proxy_on ;;
     status)  cmd_status ;;
+    webrtc)  cmd_webrtc "${2:-status}" ;;
     *)
         echo "usage: vpnchain {on|off|start|stop|restart|status}"
+        echo "       vpnchain webrtc {block|allow|status}"
         exit 1
         ;;
 esac
