@@ -1,0 +1,184 @@
+#!/bin/bash
+# vpnchain - toggle a chained proxy setup on macOS.
+#
+#   GUI apps
+#     -> macOS system SOCKS proxy
+#        -> sing-box: userspace WireGuard endpoint (no tun, no root)
+#           -> detour via an upstream SOCKS proxy
+#              -> upstream transport
+#                 -> WireGuard peer, which is the visible exit address
+#
+# Everything site-specific lives in $XDG_CONFIG_HOME/vpnchain/env, which is
+# deliberately outside this repo. See the template printed by this script when
+# that file is missing.
+#
+#   on       enable the system proxy (GUI traffic rides the chain)
+#   off      disable it - direct connection, no restrictions
+#   status   show every link in the chain and what the outside world sees
+#   start    load the sing-box agent
+#   stop     unload the sing-box agent (turns the proxy off first, so the
+#            system is never left pointing at a dead port)
+#   restart  reload sing-box
+#
+# NOTE: applications with their own explicit proxy setting ignore the macOS
+# system proxy, so they are unaffected by this script and keep whatever path
+# they were already configured for.
+
+set -uo pipefail
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/env"
+
+if [ ! -r "$CONFIG" ]; then
+    cat >&2 <<EOF
+vpnchain: missing config at $CONFIG
+
+Create it with your site-local values:
+
+    PROXY_HOST=127.0.0.1
+    PROXY_PORT=1080
+    UPSTREAM_HOST=127.0.0.1
+    UPSTREAM_PORT=<port of the upstream SOCKS proxy>
+    UPSTREAM_PROCESS=<process name of the upstream proxy core>
+    EXPECTED_EXIT_IP=<the address the chain should present>
+    SINGBOX_AGENT=<launchd label of your sing-box agent>
+EOF
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+. "$CONFIG"
+
+for var in PROXY_HOST PROXY_PORT UPSTREAM_HOST UPSTREAM_PORT UPSTREAM_PROCESS \
+           EXPECTED_EXIT_IP SINGBOX_AGENT; do
+    if [ -z "${!var:-}" ]; then
+        echo "vpnchain: $var is not set in $CONFIG" >&2
+        exit 1
+    fi
+done
+
+PLIST="$HOME/Library/LaunchAgents/$SINGBOX_AGENT.plist"
+
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+ok()   { printf '  \033[32m[ok]\033[0m   %s\n' "$1"; }
+warn() { printf '  \033[33m[warn]\033[0m %s\n' "$1"; }
+bad()  { printf '  \033[31m[bad]\033[0m  %s\n' "$1"; }
+
+# Every network service backed by a real ethernet/wifi device, so the setting
+# applies whether you are on Wi-Fi or plugged in.
+services() {
+    networksetup -listnetworkserviceorder 2>/dev/null | awk '
+        /^\([0-9]+\)/        { name = substr($0, index($0, " ") + 1) }
+        /Device: en[0-9]+\)/ { if (name != "") { print name; name = "" } }'
+}
+
+proxy_on() {
+    while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+        networksetup -setsocksfirewallproxy "$svc" "$PROXY_HOST" "$PROXY_PORT" >/dev/null 2>&1
+        networksetup -setsocksfirewallproxystate "$svc" on >/dev/null 2>&1
+        ok "proxy ON  -> $svc"
+    done < <(services)
+}
+
+proxy_off() {
+    while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+        networksetup -setsocksfirewallproxystate "$svc" off >/dev/null 2>&1
+        ok "proxy OFF -> $svc"
+    done < <(services)
+}
+
+agent_running() { pgrep -f 'sing-box run' >/dev/null 2>&1; }
+
+cmd_start() {
+    if agent_running; then
+        ok "sing-box already running"
+        return
+    fi
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
+        || launchctl load -w "$PLIST" 2>/dev/null
+    sleep 2
+    if agent_running; then
+        ok "sing-box started"
+    else
+        bad "sing-box failed to start - check its stderr log"
+    fi
+}
+
+cmd_stop() {
+    # Never leave the system proxy pointing at a port with nothing behind it.
+    proxy_off
+    launchctl bootout "gui/$(id -u)/$SINGBOX_AGENT" 2>/dev/null \
+        || launchctl unload -w "$PLIST" 2>/dev/null
+    ok "sing-box stopped"
+}
+
+cmd_status() {
+    bold "chain components"
+
+    if pgrep -f "$UPSTREAM_PROCESS" >/dev/null 2>&1; then
+        local pid started
+        pid=$(pgrep -f "$UPSTREAM_PROCESS" | head -1)
+        started=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/  */ /g')
+        ok "upstream core running (pid $pid, up since$started)"
+        echo "         a changed pid means it restarted - node switch or reboot"
+    else
+        bad "upstream core NOT running - nothing downstream can work"
+    fi
+
+    nc -z -G 2 "$UPSTREAM_HOST" "$UPSTREAM_PORT" >/dev/null 2>&1 \
+        && ok "upstream SOCKS listening on $UPSTREAM_PORT" \
+        || bad "upstream SOCKS $UPSTREAM_PORT not accepting connections"
+
+    agent_running \
+        && ok "sing-box running (pid $(pgrep -f 'sing-box run' | head -1))" \
+        || bad "sing-box NOT running - run: vpnchain start"
+
+    nc -z -G 2 "$PROXY_HOST" "$PROXY_PORT" >/dev/null 2>&1 \
+        && ok "sing-box listening on $PROXY_PORT" \
+        || bad "sing-box $PROXY_PORT not accepting connections"
+
+    echo
+    bold "system proxy"
+    local enabled
+    enabled=$(scutil --proxy | awk '/SOCKSEnable/ {print $3}')
+    if [ "${enabled:-0}" = "1" ]; then
+        ok "ON  -> $(scutil --proxy | awk '/SOCKSProxy/ {print $3}'):$(scutil --proxy | awk '/SOCKSPort/ {print $3}')"
+    else
+        warn "OFF - GUI apps are going direct on your ISP address"
+    fi
+
+    echo
+    bold "what the outside world sees"
+    local direct chain
+    direct=$(curl -s -m 10 https://api.ipify.org 2>/dev/null)
+    chain=$(curl -s -m 25 --retry 2 --retry-delay 3 \
+        --socks5-hostname "$PROXY_HOST:$PROXY_PORT" https://api.ipify.org 2>/dev/null)
+
+    printf '  %-26s %s\n' "direct (your ISP):" "${direct:-unreachable}"
+    printf '  %-26s %s\n' "through the chain:" "${chain:-unreachable}"
+
+    echo
+    if [ "$chain" = "$EXPECTED_EXIT_IP" ]; then
+        ok "chain is intact - exiting at the expected address"
+    elif [ -z "$chain" ]; then
+        bad "chain is down - run: vpnchain off   to restore normal browsing"
+    else
+        bad "WRONG EXIT IP: $chain (expected $EXPECTED_EXIT_IP)"
+        echo "         traffic reached the upstream proxy but skipped the"
+        echo "         WireGuard layer - check sing-box's detour setting"
+    fi
+}
+
+case "${1:-status}" in
+    on)      cmd_start; proxy_on; echo; cmd_status ;;
+    off)     proxy_off; echo; warn "sing-box still running; 'vpnchain stop' to shut it down too" ;;
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    restart) cmd_stop; cmd_start; proxy_on ;;
+    status)  cmd_status ;;
+    *)
+        echo "usage: vpnchain {on|off|start|stop|restart|status}"
+        exit 1
+        ;;
+esac
