@@ -23,6 +23,10 @@
 #            non-proxied UDP. A SOCKS proxy cannot carry UDP, so WebRTC
 #            would otherwise reach the network directly and expose the real
 #            address regardless of everything else here.
+#   mode     chained|direct|status - whether the WireGuard endpoint dials
+#            through the upstream proxy or straight at its peer. chained hides
+#            that a VPN is in use at all; direct is a hop shorter and carries
+#            UDP as UDP, but is trivially identifiable as a VPN.
 #   browser  quit and relaunch the browser from this shell with SPOOF_TZ set.
 #            Both the timezone and the WebRTC policy are read only at startup,
 #            so applying either one means a full restart - closing windows is
@@ -106,6 +110,37 @@ BROWSER_BIN="$BROWSER_APP/Contents/MacOS/$(basename "${BROWSER_APP%.app}")"
 # reintroduce them.
 SPOOF_TZ="${SPOOF_TZ:-}"
 
+SINGBOX_CONFIG="${SINGBOX_CONFIG:-$HOME/.config/sing-box/config.json}"
+
+# Tag of the sing-box outbound pointing at the upstream proxy. This is what
+# gets written back as the endpoint's "detour" when re-enabling chained mode,
+# so it must match the tag actually used in SINGBOX_CONFIG. Override in the
+# env file if yours differs.
+UPSTREAM_TAG="${UPSTREAM_TAG:-upstream}"
+
+# chained: the WireGuard endpoint dials through the upstream SOCKS proxy, so
+#          only ordinary TLS leaves the machine and the tunnel survives
+#          censorship. Costs a hop, and carries UDP over TCP.
+# direct:  the endpoint dials its peer itself. Faster and simpler, but the
+#          link is plainly a VPN to anyone watching.
+#
+# The only difference in the config is the endpoint's "detour" key.
+singbox_mode() {
+    python3 - "$SINGBOX_CONFIG" <<'PY' 2>/dev/null || echo unknown
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    print("unknown"); raise SystemExit
+eps = c.get("endpoints") or []
+wg = next((e for e in eps if e.get("type") == "wireguard"), None)
+if wg is None:
+    print("unknown")
+else:
+    print("chained" if wg.get("detour") else "direct")
+PY
+}
+
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 ok()   { printf '  \033[32m[ok]\033[0m   %s\n' "$1"; }
 warn() { printf '  \033[33m[warn]\033[0m %s\n' "$1"; }
@@ -175,6 +210,65 @@ webrtc_state() {
 # osascript quit command and this script's own arguments, which would make the
 # quit-wait loop below never finish.
 browser_running() { pgrep -f "$BROWSER_BIN" >/dev/null 2>&1; }
+
+cmd_mode() {
+    local want="${1:-status}" cur
+    cur=$(singbox_mode)
+
+    if [ "$want" = status ]; then
+        echo "mode: $cur"
+        return
+    fi
+    if [ "$want" != chained ] && [ "$want" != direct ]; then
+        echo "usage: vpnchain mode {chained|direct|status}" >&2
+        exit 1
+    fi
+    if [ "$cur" = unknown ]; then
+        bad "could not read a wireguard endpoint from $SINGBOX_CONFIG"
+        exit 1
+    fi
+    if [ "$cur" = "$want" ]; then
+        ok "already in $want mode"
+        return
+    fi
+
+    # Edit in place rather than keeping two config files, so the keys and the
+    # peer cannot drift apart between them.
+    python3 - "$SINGBOX_CONFIG" "$want" "$UPSTREAM_TAG" <<'PY' || exit 1
+import json, shutil, sys
+path, want, tag = sys.argv[1], sys.argv[2], sys.argv[3]
+c = json.load(open(path))
+wg = next(e for e in c["endpoints"] if e.get("type") == "wireguard")
+if want == "chained":
+    wg["detour"] = tag
+else:
+    wg.pop("detour", None)
+shutil.copy2(path, path + ".bak")
+with open(path, "w") as f:
+    json.dump(c, f, indent=2)
+    f.write("\n")
+PY
+
+    if ! sing-box check -c "$SINGBOX_CONFIG" 2>/dev/null; then
+        bad "edited config failed validation - restoring"
+        mv "$SINGBOX_CONFIG.bak" "$SINGBOX_CONFIG"
+        exit 1
+    fi
+    rm -f "$SINGBOX_CONFIG.bak"
+    ok "config switched to $want mode"
+
+    launchctl kickstart -k "gui/$(id -u)/$SINGBOX_AGENT" 2>/dev/null \
+        || { cmd_stop >/dev/null 2>&1; cmd_start >/dev/null 2>&1; }
+    sleep 3
+    agent_running && ok "sing-box restarted" || bad "sing-box did not come back"
+
+    if [ "$want" = direct ]; then
+        echo
+        warn "the tunnel is now plainly a VPN on the wire: UDP straight to the"
+        warn "peer address, with none of the upstream's cover traffic"
+        warn "it will also fail outright on networks that block UDP or VPNs"
+    fi
+}
 
 cmd_browser() {
     if [ ! -x "$BROWSER_BIN" ]; then
@@ -287,21 +381,29 @@ cmd_webrtc() {
 }
 
 cmd_status() {
-    bold "chain components"
+    local mode
+    mode=$(singbox_mode)
+    bold "chain components  [mode: $mode]"
 
-    if pgrep -f "$UPSTREAM_PROCESS" >/dev/null 2>&1; then
-        local pid started
-        pid=$(pgrep -f "$UPSTREAM_PROCESS" | head -1)
-        started=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/  */ /g')
-        ok "upstream core running (pid $pid, up since$started)"
-        echo "         a changed pid means it restarted - node switch or reboot"
+    if [ "$mode" = direct ]; then
+        warn "upstream hop DISABLED - WireGuard dials its peer directly"
+        echo "         faster, but the link is plainly a VPN on the wire"
+        echo "         re-enable with: vpnchain mode chained"
     else
-        bad "upstream core NOT running - nothing downstream can work"
-    fi
+        if pgrep -f "$UPSTREAM_PROCESS" >/dev/null 2>&1; then
+            local pid started
+            pid=$(pgrep -f "$UPSTREAM_PROCESS" | head -1)
+            started=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/  */ /g')
+            ok "upstream core running (pid $pid, up since$started)"
+            echo "         a changed pid means it restarted - node switch or reboot"
+        else
+            bad "upstream core NOT running - nothing downstream can work"
+        fi
 
-    nc -z -G 2 "$UPSTREAM_HOST" "$UPSTREAM_PORT" >/dev/null 2>&1 \
-        && ok "upstream SOCKS listening on $UPSTREAM_PORT" \
-        || bad "upstream SOCKS $UPSTREAM_PORT not accepting connections"
+        nc -z -G 2 "$UPSTREAM_HOST" "$UPSTREAM_PORT" >/dev/null 2>&1 \
+            && ok "upstream SOCKS listening on $UPSTREAM_PORT" \
+            || bad "upstream SOCKS $UPSTREAM_PORT not accepting connections"
+    fi
 
     agent_running \
         && ok "sing-box running (pid $(pgrep -f 'sing-box run' | head -1))" \
@@ -406,9 +508,11 @@ case "${1:-status}" in
     status)  cmd_status ;;
     webrtc)  cmd_webrtc "${2:-status}" ;;
     browser) cmd_browser ;;
+    mode)    cmd_mode "${2:-status}" ;;
     *)
         echo "usage: vpnchain {on|off|start|stop|restart|status}"
         echo "       vpnchain webrtc {block|allow|status}"
+        echo "       vpnchain mode {chained|direct|status}"
         echo "       vpnchain browser"
         exit 1
         ;;
