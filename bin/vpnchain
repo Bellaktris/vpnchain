@@ -38,10 +38,19 @@
 #            the full chain. Every listener involved is already running, so
 #            nothing is switched or restarted and this is safe to run while
 #            browsing. Override with BENCH_URL / BENCH_BYTES / BENCH_RUNS.
-#   browser [with-webrtc]
+#   browser [upstream-only] [with-webrtc]
 #            quit and relaunch the browser from this shell with SPOOF_TZ and
 #            the WebRTC policy applied. Both are read only at startup, which
 #            is why this is a restart - closing windows is not enough.
+#
+#            upstream-only opens a SEPARATE instance, with its own throwaway
+#            profile, pointed at the inbound that bypasses the WireGuard
+#            endpoint - so it exits at the upstream instead of the pinned
+#            address. It coexists with the main browser; a browser can only
+#            hold one proxy, so a second exit means a second instance. That
+#            exit is a shared datacenter address flagged as a proxy by IP
+#            databases, so expect CAPTCHAs - the trade is that the session is
+#            not linked to the pinned address.
 #
 #            A SOCKS proxy cannot carry UDP, so WebRTC would otherwise reach
 #            the network directly and expose the real address regardless of
@@ -94,6 +103,10 @@ Optional:
     SPOOF_TZ=<tz database zone the browser should report, e.g. America/Denver>
              match it to the exit address's geolocation; applied only by
              'vpnchain browser'
+    UPSTREAM_ONLY_PORT=<sing-box inbound that bypasses the WireGuard endpoint,
+             default 1081; must exist in SINGBOX_CONFIG>
+    UPSTREAM_ONLY_TZ=<timezone for that instance, default UTC>
+    UPSTREAM_ONLY_PROFILE=<its throwaway profile dir>
     BROWSER_APP=<path to the browser bundle, defaults to Google Chrome>
     BROWSER_DOMAIN=<its preference domain, for the WebRTC policy>
 EOF
@@ -136,6 +149,20 @@ BROWSER_BIN="$BROWSER_APP/Contents/MacOS/$(basename "${BROWSER_APP%.app}")"
 # LaunchServices-launched apps at all. Both paths are disproven - do not
 # reintroduce them.
 SPOOF_TZ="${SPOOF_TZ:-}"
+
+# Second sing-box inbound, routed straight to the upstream so it bypasses the
+# WireGuard endpoint. Same daemon, no reconfiguration - picking an exit is just
+# picking a port, and both can be in use at once.
+UPSTREAM_ONLY_PORT="${UPSTREAM_ONLY_PORT:-1081}"
+
+# That exit is a shared datacenter address, so UTC is the better timezone for
+# it: it is what Tor Browser and Firefox resistFingerprinting report, which
+# puts the instance in a large set rather than making it distinctive.
+UPSTREAM_ONLY_TZ="${UPSTREAM_ONLY_TZ:-UTC}"
+
+# Wiped on every launch - an unlinked exit paired with a profile that
+# accumulates cookies would defeat itself.
+UPSTREAM_ONLY_PROFILE="${UPSTREAM_ONLY_PROFILE:-$HOME/.cache/vpnchain-upstream-profile}"
 
 SINGBOX_CONFIG="${SINGBOX_CONFIG:-$HOME/.config/sing-box/config.json}"
 
@@ -370,40 +397,63 @@ cmd_bench() {
 }
 
 cmd_browser() {
-    # Default to the protected launch. The flag names what you opt INTO, so
-    # the bare command cannot accidentally mean "expose my real address".
-    local want=block
-    case "${1:-}" in
-        ""|block)     want=block ;;
-        with-webrtc)  want=allow ;;
-        *) echo "usage: vpnchain browser [with-webrtc]" >&2; exit 1 ;;
-    esac
+    # Flags name what you opt INTO, so the bare command cannot accidentally
+    # mean "expose my real address" or "use the unlinked exit".
+    local want=block exit_kind=pinned a
+    for a in "$@"; do
+        case "$a" in
+            "")             ;;
+            with-webrtc)    want=allow ;;
+            upstream-only)  exit_kind=upstream ;;
+            *) echo "usage: vpnchain browser [upstream-only] [with-webrtc]" >&2
+               exit 1 ;;
+        esac
+    done
 
     if [ ! -x "$BROWSER_BIN" ]; then
         bad "browser binary not found: $BROWSER_BIN"
         exit 1
     fi
 
-    if browser_running; then
-        ok "asking the browser to quit (it will restore your session)"
-        osascript -e "quit app \"$(basename "${BROWSER_APP%.app}")\"" >/dev/null 2>&1
-        local i=0
-        while browser_running && [ "$i" -lt 60 ]; do
-            sleep 0.25
-            i=$((i + 1))
-        done
-        if browser_running; then
-            bad "browser is still running - it may be holding an unsaved prompt"
-            bad "launching now would just hand off to the existing process and"
-            bad "change nothing, so stopping here. Quit it manually and retry."
-            exit 1
-        fi
-        ok "browser quit"
+    local port tz profile_args=()
+    if [ "$exit_kind" = upstream ]; then
+        # Bypasses the WireGuard endpoint entirely, so this exits at the
+        # upstream rather than the pinned address. A browser can only hold one
+        # proxy, so this has to be a SEPARATE instance with its own profile -
+        # it coexists with the main one rather than replacing it.
+        port="$UPSTREAM_ONLY_PORT"
+        tz="$UPSTREAM_ONLY_TZ"
+        rm -rf "$UPSTREAM_ONLY_PROFILE"
+        profile_args=(--user-data-dir="$UPSTREAM_ONLY_PROFILE" --no-first-run
+                      --no-default-browser-check)
+        ok "separate instance, fresh profile: $UPSTREAM_ONLY_PROFILE"
+        warn "this exit is flagged as a proxy by IP databases - expect CAPTCHAs"
     else
-        ok "browser was not running"
+        port="$PROXY_PORT"
+        tz="$SPOOF_TZ"
+        if browser_running; then
+            ok "asking the browser to quit (it will restore your session)"
+            osascript -e "quit app \"$(basename "${BROWSER_APP%.app}")\"" >/dev/null 2>&1
+            local i=0
+            while browser_running && [ "$i" -lt 60 ]; do
+                sleep 0.25
+                i=$((i + 1))
+            done
+            if browser_running; then
+                bad "browser is still running - it may be holding an unsaved prompt"
+                bad "launching now would just hand off to the existing process and"
+                bad "change nothing, so stopping here. Quit it manually and retry."
+                exit 1
+            fi
+            ok "browser quit"
+        else
+            ok "browser was not running"
+        fi
     fi
 
     # The policy is read at startup, so it has to be in place before launching.
+    # It is global to the preference domain, so it also governs the separate
+    # instance - which is why it is set here either way.
     set_webrtc "$want"
     [ "$want" = block ] && ok "webrtc policy set to block" \
                         || warn "webrtc policy relaxed for this launch"
@@ -413,26 +463,35 @@ cmd_browser() {
     # Chrome still hands over hostnames rather than pre-resolving, so remote
     # DNS - and therefore no DNS leak - is preserved.
     local bpid
-    local proxy_flag="--proxy-server=socks5://$PROXY_HOST:$PROXY_PORT"
-    ok "proxy pinned to this launch: $PROXY_HOST:$PROXY_PORT"
-    if [ -n "$SPOOF_TZ" ]; then
-        ok "launching with TZ=$SPOOF_TZ"
-        TZ="$SPOOF_TZ" nohup "$BROWSER_BIN" "$proxy_flag" >/dev/null 2>&1 &
+    local proxy_flag="--proxy-server=socks5://$PROXY_HOST:$port"
+    ok "proxy pinned to this launch: $PROXY_HOST:$port"
+    if [ -n "$tz" ]; then
+        ok "launching with TZ=$tz"
+        TZ="$tz" nohup "$BROWSER_BIN" "$proxy_flag" "${profile_args[@]}" >/dev/null 2>&1 &
     else
-        warn "SPOOF_TZ not set - launching with the system timezone"
-        nohup "$BROWSER_BIN" "$proxy_flag" >/dev/null 2>&1 &
+        warn "no timezone configured - launching with the system timezone"
+        nohup "$BROWSER_BIN" "$proxy_flag" "${profile_args[@]}" >/dev/null 2>&1 &
     fi
     bpid=$!
     disown 2>/dev/null
-
     sleep 3
-    if browser_running; then
+
+    if [ "$exit_kind" = upstream ]; then
+        # Deliberately not recorded in STATE: that tracks the main browser, and
+        # overwriting it would make status report the throwaway instance as if
+        # it were your everyday one.
+        kill -0 "$bpid" 2>/dev/null && ok "instance started (pid $bpid)" \
+                                    || bad "instance did not come up"
+    elif browser_running; then
         ok "browser started (pid $bpid)"
         # Record what this launch applied, so status can tell a browser we
         # configured from one started some other way - and so the on-disk
         # policy being restored below does not make status lie about what
         # the running browser is actually doing.
-        printf 'PID=%s\nTZ=%s\nWEBRTC=%s\n' "$bpid" "$SPOOF_TZ" \
+        printf 'PID=%s
+TZ=%s
+WEBRTC=%s
+' "$bpid" "$tz" \
             "$([ "$want" = block ] && echo blocked || echo allowed)" > "$STATE"
     else
         bad "browser did not come up"
@@ -455,17 +514,19 @@ cmd_browser() {
 
     echo
     bold "applied at this launch"
+    [ "$exit_kind" = upstream ] && warn "exit: upstream only - NOT the pinned address" \
+                                || ok "exit: the pinned address"
     if [ "$want" = block ]; then
         ok "webrtc: BLOCKED"
     else
         bad "webrtc: ALLOWED - real address exposed to any page in this browser"
     fi
-    if [ -n "$SPOOF_TZ" ]; then
-        ok "timezone: $SPOOF_TZ"
+    if [ -n "$tz" ]; then
+        ok "timezone: $tz"
         echo "         verify in the console:"
         echo "         Intl.DateTimeFormat().resolvedOptions().timeZone"
     else
-        warn "timezone: system default (set SPOOF_TZ in $CONFIG)"
+        warn "timezone: system default"
     fi
 }
 
@@ -603,12 +664,12 @@ case "${1:-status}" in
     restart) if [ -n "${2:-}" ]; then switch_mode "$2" || true; fi
              cmd_stop; cmd_start; echo; wait_for_chain ;;
     status)  cmd_status ;;
-    browser) cmd_browser "${2:-}" ;;
+    browser) shift; cmd_browser "$@" ;;
     bench)   cmd_bench ;;
     *)
         echo "usage: vpnchain {start|restart} [chained|direct]"
         echo "       vpnchain {stop|status|bench}"
-        echo "       vpnchain browser [with-webrtc]"
+        echo "       vpnchain browser [upstream-only] [with-webrtc]"
         exit 1
         ;;
 esac
