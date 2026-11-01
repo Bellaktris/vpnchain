@@ -39,18 +39,25 @@
 # Omit it to keep whatever the config already has. status reports the active
 # mode, so there is no separate command to query it.
 #
-#   webrtc   block|allow|status - control whether the browser may use
-#            non-proxied UDP. A SOCKS proxy cannot carry UDP, so WebRTC
-#            would otherwise reach the network directly and expose the real
-#            address regardless of everything else here.
 #   bench    measure throughput layer by layer: no proxy, upstream only, and
 #            the full chain. Every listener involved is already running, so
 #            nothing is switched or restarted and this is safe to run while
 #            browsing. Override with BENCH_URL / BENCH_BYTES / BENCH_RUNS.
-#   browser  quit and relaunch the browser from this shell with SPOOF_TZ set.
-#            Both the timezone and the WebRTC policy are read only at startup,
-#            so applying either one means a full restart - closing windows is
-#            not enough.
+#   browser [webrtc]
+#            quit and relaunch the browser from this shell with SPOOF_TZ and
+#            the WebRTC policy applied. Both are read only at startup, which
+#            is why this is a restart - closing windows is not enough.
+#
+#            A SOCKS proxy cannot carry UDP, so WebRTC would otherwise reach
+#            the network directly and expose the real address regardless of
+#            everything else here. The default launch prevents that.
+#
+#            Pass webrtc to relax the policy for the launch; block is restored
+#            on disk immediately afterwards. The running browser already read the
+#            relaxed value and keeps it until it quits, so the exposure is
+#            scoped to that session and the next launch is protected again -
+#            no timer, nothing to remember. Use it when a call needs to
+#            connect.
 #
 # NOTE: applications with their own explicit proxy setting ignore the macOS
 # system proxy, so they are unaffected by this script and keep whatever path
@@ -234,6 +241,22 @@ webrtc_state() {
     echo allowed
 }
 
+set_webrtc() {
+    local k
+    if [ "$1" = block ]; then
+        for k in "${WEBRTC_KEYS[@]}"; do
+            defaults write "$BROWSER_DOMAIN" "$k" -string "$WEBRTC_BLOCK_VALUE"
+        done
+    else
+        # Delete rather than writing "default": a mandatory policy also
+        # overrides extension-set privacy settings, so leaving one in place
+        # would silently defeat any extension-based control later.
+        for k in "${WEBRTC_KEYS[@]}"; do
+            defaults delete "$BROWSER_DOMAIN" "$k" 2>/dev/null
+        done
+    fi
+}
+
 # Match the binary path specifically. A looser pattern also matches the
 # osascript quit command and this script's own arguments, which would make the
 # quit-wait loop below never finish.
@@ -378,6 +401,15 @@ cmd_bench() {
 }
 
 cmd_browser() {
+    # Default to the protected launch. The flag names what you opt INTO, so
+    # the bare command cannot accidentally mean "expose my real address".
+    local want=block
+    case "${1:-}" in
+        ""|block)  want=block ;;
+        webrtc)    want=allow ;;
+        *) echo "usage: vpnchain browser [webrtc]" >&2; exit 1 ;;
+    esac
+
     if [ ! -x "$BROWSER_BIN" ]; then
         bad "browser binary not found: $BROWSER_BIN"
         exit 1
@@ -402,6 +434,11 @@ cmd_browser() {
         ok "browser was not running"
     fi
 
+    # The policy is read at startup, so it has to be in place before launching.
+    set_webrtc "$want"
+    [ "$want" = block ] && ok "webrtc policy set to block" \
+                        || warn "webrtc policy relaxed for this launch"
+
     local bpid
     if [ -n "$SPOOF_TZ" ]; then
         ok "launching with TZ=$SPOOF_TZ"
@@ -416,22 +453,37 @@ cmd_browser() {
     sleep 3
     if browser_running; then
         ok "browser started (pid $bpid)"
-        # Record what this launch actually applied, so status can tell a
-        # browser we configured from one started some other way.
-        printf 'PID=%s\nTZ=%s\nWEBRTC=%s\n' \
-            "$bpid" "$SPOOF_TZ" "$(webrtc_state)" > "$STATE"
+        # Record what this launch applied, so status can tell a browser we
+        # configured from one started some other way - and so the on-disk
+        # policy being restored below does not make status lie about what
+        # the running browser is actually doing.
+        printf 'PID=%s\nTZ=%s\nWEBRTC=%s\n' "$bpid" "$SPOOF_TZ" \
+            "$([ "$want" = block ] && echo blocked || echo allowed)" > "$STATE"
     else
         bad "browser did not come up"
         rm -f "$STATE"
     fi
 
+    # Put the protective policy back immediately. The running browser already
+    # read the relaxed one and keeps it for its lifetime, so the exposure is
+    # scoped to this session and the next launch is protected by default -
+    # no timer, nothing to remember.
+    if [ "$want" = allow ]; then
+        set_webrtc block
+        echo
+        warn "on-disk policy restored to block"
+        warn "THIS browser keeps direct UDP until you quit it - any page in it"
+        warn "can read your real address. The next launch is protected again."
+        echo "         caveat: if the browser re-reads policy mid-session it"
+        echo "         may pick up the restored block and drop WebRTC."
+    fi
+
     echo
     bold "applied at this launch"
-    if [ "$(webrtc_state)" = blocked ]; then
+    if [ "$want" = block ]; then
         ok "webrtc: BLOCKED"
     else
-        bad "webrtc: ALLOWED - real address exposed to any page"
-        echo "         vpnchain webrtc block && vpnchain browser"
+        bad "webrtc: ALLOWED - real address exposed to any page in this browser"
     fi
     if [ -n "$SPOOF_TZ" ]; then
         ok "timezone: $SPOOF_TZ"
@@ -442,50 +494,6 @@ cmd_browser() {
     fi
 }
 
-cmd_webrtc() {
-    local k
-    case "${1:-status}" in
-        block)
-            for k in "${WEBRTC_KEYS[@]}"; do
-                defaults write "$BROWSER_DOMAIN" "$k" -string "$WEBRTC_BLOCK_VALUE"
-            done
-            ok "WebRTC blocked from using non-proxied UDP"
-            ;;
-        allow)
-            # Delete rather than set "default": a mandatory policy also
-            # overrides extension-set privacy settings, so leaving one in
-            # place would silently defeat any extension-based control later.
-            for k in "${WEBRTC_KEYS[@]}"; do
-                defaults delete "$BROWSER_DOMAIN" "$k" 2>/dev/null
-            done
-            warn "WebRTC may now reach the network directly"
-            warn "any page in the browser can read your real address while this is on"
-            ;;
-        status) ;;
-        *)
-            echo "usage: vpnchain webrtc {block|allow|status}" >&2
-            exit 1
-            ;;
-    esac
-
-    echo
-    if [ "$(webrtc_state)" = blocked ]; then
-        ok "webrtc: BLOCKED - no direct UDP, real address not exposed"
-    else
-        bad "webrtc: ALLOWED - real address exposed to any page"
-    fi
-
-    if [ "${1:-status}" != status ]; then
-        echo
-        if browser_running; then
-            warn "the browser is running - quit it COMPLETELY (Cmd-Q) and reopen"
-            warn "policies are only read at startup; closing windows is not enough"
-        else
-            ok "browser not running - the new setting applies at next launch"
-        fi
-        echo "         verify at chrome://policy"
-    fi
-}
 
 cmd_status() {
     local mode
@@ -620,15 +628,13 @@ case "${1:-status}" in
     restart) if [ -n "${2:-}" ]; then switch_mode "$2" || true; fi
              cmd_stop; cmd_start; proxy_on; echo; wait_for_chain ;;
     status)  cmd_status ;;
-    webrtc)  cmd_webrtc "${2:-status}" ;;
-    browser) cmd_browser ;;
+    browser) cmd_browser "${2:-}" ;;
     bench)   cmd_bench ;;
     *)
         echo "usage: vpnchain {on|start|restart} [chained|direct]"
-        echo "       vpnchain {off|stop|status}"
-        echo "       vpnchain webrtc {block|allow|status}"
-        echo "       vpnchain browser"
-        echo "       vpnchain bench"
+        echo "       vpnchain {off|stop}"
+        echo "       vpnchain {status|bench}"
+        echo "       vpnchain browser [webrtc]"
         exit 1
         ;;
 esac
