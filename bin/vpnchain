@@ -63,6 +63,14 @@
 #            protected again - no timer, nothing to remember. Use it when a
 #            call needs to connect.
 #
+#   config   write the sing-box config from the env file, which is the single
+#            source of truth for it. start does this automatically when no
+#            config exists, since writing a missing file cannot lose anything.
+#            Regenerating an existing one can - hand-added routing rules are
+#            not carried over - so that stays explicit. status compares the
+#            live config against what the env file describes and says so when
+#            they diverge, which is the case the split would otherwise hide.
+#
 # NOTE: the proxy is pinned per browser launch rather than set system-wide.
 # The scope is therefore exactly the browsers this script starts - nothing
 # else on the machine is touched, and stopping the agent cannot strand macOS
@@ -208,6 +216,20 @@ bad()  { printf '  \033[31m[bad]\033[0m  %s\n' "$1"; }
 agent_running() { pgrep -f 'sing-box run' >/dev/null 2>&1; }
 
 cmd_start() {
+    # Bootstrap only. Writing a config that does not exist cannot discard
+    # anything, so it is safe to do implicitly; regenerating one that does
+    # exist can, which is why that stays behind an explicit verb.
+    if [ ! -f "$SINGBOX_CONFIG" ]; then
+        if have_wg_creds; then
+            warn "no config at $SINGBOX_CONFIG - generating one"
+            cmd_config
+        else
+            bad "no config at $SINGBOX_CONFIG, and the env file lacks the"
+            bad "WireGuard values needed to generate one"
+            exit 1
+        fi
+    fi
+
     if agent_running; then
         ok "sing-box already running"
         return
@@ -436,6 +458,25 @@ cmd_config() {
         warn "from the backup if you had any"
     fi
 
+    generate_config "$SINGBOX_CONFIG" "$mode" || {
+        restore_config_backup; bad "generation failed"; exit 1; }
+
+    if ! sing-box check -c "$SINGBOX_CONFIG" 2>&1; then
+        bad "generated config failed validation"
+        restore_config_backup
+        exit 1
+    fi
+    ok "config written and valid: $SINGBOX_CONFIG"
+    # Only worth saying when something is already running the old one; during
+    # bootstrap the caller starts the agent immediately after this.
+    agent_running && echo "         apply it with: vpnchain restart"
+}
+
+# Renders the config implied by the env file to $1. Kept separate from
+# cmd_config so status can render to a temp file and compare, which is how
+# drift between the env file and the live config gets noticed.
+generate_config() {
+    local out="$1" mode="$2"
     MODE="$mode" P_HOST="$PROXY_HOST" P_PORT="$PROXY_PORT" \
     U_PORT="$INCOGNITO_PORT" UP_HOST="$UPSTREAM_HOST" \
     UP_PORT="$UPSTREAM_PORT" UP_TAG="$UPSTREAM_TAG" \
@@ -443,7 +484,7 @@ cmd_config() {
     WG_PRIVATE_KEY="$WG_PRIVATE_KEY" WG_ADDRESS="$WG_ADDRESS" \
     WG_PEER_PUBLIC_KEY="$WG_PEER_PUBLIC_KEY" \
     WG_PEER_HOST="$WG_PEER_HOST" WG_PEER_PORT="$WG_PEER_PORT" \
-    OUT="$SINGBOX_CONFIG" \
+    OUT="$out" \
     python3 - <<'PY' || { restore_config_backup; bad "generation failed"; exit 1; }
 import json, os
 e = os.environ
@@ -504,14 +545,15 @@ with open(out, "w") as f:
     f.write("\n")
 os.chmod(out, 0o600)   # it holds the private key
 PY
+}
 
-    if ! sing-box check -c "$SINGBOX_CONFIG" 2>&1; then
-        bad "generated config failed validation"
-        restore_config_backup
-        exit 1
-    fi
-    ok "config written and valid: $SINGBOX_CONFIG"
-    echo "         apply it with: vpnchain restart"
+# true when every value the generator needs is present
+have_wg_creds() {
+    local v
+    for v in WG_PRIVATE_KEY WG_ADDRESS WG_PEER_PUBLIC_KEY WG_PEER_HOST WG_PEER_PORT; do
+        [ -z "${!v:-}" ] && return 1
+    done
+    return 0
 }
 
 cmd_browser() {
@@ -718,6 +760,19 @@ cmd_status() {
     else
         warn "sing-box $INCOGNITO_PORT not listening"
         echo "         'browser incognito' needs it; add it with: vpnchain config"
+    fi
+
+    if have_wg_creds; then
+        local tmpcfg
+        tmpcfg=$(mktemp -t vpnchain-cfg)
+        if generate_config "$tmpcfg" "$mode" 2>/dev/null \
+           && ! diff -q "$tmpcfg" "$SINGBOX_CONFIG" >/dev/null 2>&1; then
+            warn "live config differs from what the env file describes"
+            echo "         either it was hand-edited, or the env file changed"
+            echo "         since it was generated. Regenerate with:"
+            echo "           vpnchain config   (backs the current one up first)"
+        fi
+        rm -f "$tmpcfg"
     fi
 
     echo
