@@ -585,6 +585,9 @@ cmd_browser() {
         exit 1
     fi
 
+    # NOTE: expanded as ${profile_args[@]+"${profile_args[@]}"} below, not
+    # "${profile_args[@]}" - bash 3.2, which is /bin/bash on macOS, errors on
+    # an empty array under set -u.
     local port tz profile_args=()
     if [ "$exit_kind" = upstream ]; then
         # Bypasses the WireGuard endpoint entirely, so this exits at the
@@ -643,10 +646,12 @@ cmd_browser() {
     ok "proxy pinned to this launch: $PROXY_HOST:$port"
     if [ -n "$tz" ]; then
         ok "launching with TZ=$tz"
-        TZ="$tz" nohup "$BROWSER_BIN" "$proxy_flag" "${profile_args[@]}" >/dev/null 2>&1 &
+        TZ="$tz" nohup "$BROWSER_BIN" "$proxy_flag" \
+            ${profile_args[@]+"${profile_args[@]}"} >/dev/null 2>&1 &
     else
         warn "no timezone configured - launching with the system timezone"
-        nohup "$BROWSER_BIN" "$proxy_flag" "${profile_args[@]}" >/dev/null 2>&1 &
+        nohup "$BROWSER_BIN" "$proxy_flag" \
+            ${profile_args[@]+"${profile_args[@]}"} >/dev/null 2>&1 &
     fi
     bpid=$!
     disown 2>/dev/null
@@ -790,85 +795,93 @@ cmd_status() {
     fi
 
     echo
-    bold "browser - configured"
-    local cur_webrtc
+    # One section, not two. The configured values are only interesting as
+    # PENDING state - once a browser is running, what it actually got is what
+    # matters, and printing both invites reading the wrong one.
+    local cur_webrtc s_pid s_tz s_webrtc
     cur_webrtc=$(webrtc_state)
-    if [ "$cur_webrtc" = blocked ]; then
-        ok "webrtc: BLOCKED from non-proxied UDP"
-    else
-        bad "webrtc: ALLOWED direct UDP - your real address is exposed"
-        echo "         a SOCKS proxy cannot carry UDP, so this bypasses the"
-        echo "         chain entirely. run: vpnchain browser"
-    fi
-    [ -n "$SPOOF_TZ" ] && ok "timezone: $SPOOF_TZ" \
-                       || warn "timezone: no spoof configured (SPOOF_TZ unset)"
-
-    echo
-    bold "browser - running"
-    local s_pid s_tz s_webrtc
     s_pid=""; s_tz=""; s_webrtc=""
     if [ -r "$STATE" ]; then
-        s_pid=$(sed -n 's/^PID=//p'    "$STATE")
-        s_tz=$(sed -n  's/^TZ=//p'     "$STATE")
+        s_pid=$(sed -n 's/^PID=//p'       "$STATE")
+        s_tz=$(sed -n  's/^TZ=//p'        "$STATE")
         s_webrtc=$(sed -n 's/^WEBRTC=//p' "$STATE")
     fi
 
-    # A recorded pid is only meaningful if it is still alive AND still the
+    # A recorded pid only means something if it is still alive AND still the
     # browser - pids get recycled.
     if [ -n "$s_pid" ] && kill -0 "$s_pid" 2>/dev/null \
        && ps -p "$s_pid" -o command= 2>/dev/null | grep -qF "$BROWSER_BIN"; then
-        ok "started by vpnchain (pid $s_pid)"
-
-        if [ "$s_tz" = "$SPOOF_TZ" ]; then
-            [ -n "$s_tz" ] && ok "timezone in effect: $s_tz" \
-                           || warn "timezone in effect: system default"
-        else
-            bad "timezone in effect: ${s_tz:-system default}, config now ${SPOOF_TZ:-unset}"
-            echo "         restart to apply: vpnchain browser"
-        fi
+        bold "browser (pid $s_pid, started by vpnchain)"
 
         if [ "$s_webrtc" = "$cur_webrtc" ]; then
-            ok "webrtc in effect: $s_webrtc"
+            [ "$s_webrtc" = blocked ] \
+                && ok "webrtc: blocked from non-proxied UDP" \
+                || bad "webrtc: ALLOWED - any page can read your real address"
         else
-            bad "webrtc in effect: $s_webrtc, config now $cur_webrtc"
-            echo "         policies are read at startup only"
+            bad "webrtc: $s_webrtc in this session, config now $cur_webrtc"
+            echo "         the policy is read at startup only"
             echo "         restart to apply: vpnchain browser"
         fi
+
+        if [ "$s_tz" = "$SPOOF_TZ" ]; then
+            [ -n "$s_tz" ] && ok "timezone: $s_tz" \
+                           || warn "timezone: system default"
+        else
+            bad "timezone: ${s_tz:-system default} in this session, config now ${SPOOF_TZ:-unset}"
+            echo "         restart to apply: vpnchain browser"
+        fi
+
     elif browser_running; then
-        bad "browser is running but was NOT started by vpnchain"
-        echo "         the timezone spoof is not applied, and the webrtc"
-        echo "         policy may predate your last change"
-        echo "         run: vpnchain browser"
+        bold "browser (running, NOT started by vpnchain)"
+        bad "nothing from this config is applied to it"
+        echo "         no timezone spoof, no proxy flag - it is browsing on"
+        echo "         your real address - and its webrtc policy may predate"
+        echo "         your last change"
+        echo "         relaunch with: vpnchain browser"
+
     else
-        warn "browser not running"
+        bold "browser (not running)"
+        if [ "$cur_webrtc" = blocked ]; then
+            ok "next launch: webrtc blocked, exit $PROXY_HOST:$PROXY_PORT"
+        else
+            bad "next launch: webrtc ALLOWED - real address would be exposed"
+            echo "         fix with: vpnchain browser   (sets block, then launches)"
+        fi
+        [ -n "$SPOOF_TZ" ] && ok "next launch: timezone $SPOOF_TZ" \
+                           || warn "next launch: system timezone (SPOOF_TZ unset)"
     fi
 
     echo
-    bold "what the outside world sees"
-    local direct chain
+    # Gather first, then lead with the verdict - the addresses are supporting
+    # detail for it, not the other way round.
+    local direct chain incog=""
     direct=$(curl -s -m 10 https://api.ipify.org 2>/dev/null)
     chain=$(curl -s -m 25 --retry 2 --retry-delay 3 \
         --socks5-hostname "$PROXY_HOST:$PROXY_PORT" https://api.ipify.org 2>/dev/null)
-
-    printf '  %-26s %s\n' "direct (your ISP):" "${direct:-unreachable}"
-    printf '  %-26s %s\n' "pinned exit:" "${chain:-unreachable}"
     if nc -z -G 2 "$PROXY_HOST" "$INCOGNITO_PORT" >/dev/null 2>&1; then
-        local incog
         incog=$(curl -s -m 25 --socks5-hostname "$PROXY_HOST:$INCOGNITO_PORT" \
                 https://api.ipify.org 2>/dev/null)
-        printf '  %-26s %s\n' "incognito exit:" "${incog:-unreachable}"
+        incog="${incog:-unreachable}"
     fi
 
-    echo
     if [ "$chain" = "$EXPECTED_EXIT_IP" ]; then
         ok "chain is intact - exiting at the expected address"
     elif [ -z "$chain" ]; then
-        bad "chain is down - run: vpnchain off   to restore normal browsing"
+        bad "chain is down - nothing is reaching the pinned exit"
+        echo "         a browser started outside vpnchain is unproxied, so"
+        echo "         ordinary browsing still works meanwhile"
+        echo "         check: tail ~/.config/sing-box/sing-box.err.log"
     else
         bad "WRONG EXIT IP: $chain (expected $EXPECTED_EXIT_IP)"
         echo "         traffic reached the upstream proxy but skipped the"
         echo "         WireGuard layer - check sing-box's detour setting"
     fi
+
+    echo
+    bold "what the outside world sees"
+    printf '  %-26s %s\n' "direct (your ISP):" "${direct:-unreachable}"
+    printf '  %-26s %s\n' "pinned exit:" "${chain:-unreachable}"
+    [ -n "$incog" ] && printf '  %-26s %s\n' "incognito exit:" "$incog"
 }
 
 case "${1:-status}" in
