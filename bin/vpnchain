@@ -43,7 +43,7 @@
 #            the full chain. Every listener involved is already running, so
 #            nothing is switched or restarted and this is safe to run while
 #            browsing. Override with BENCH_URL / BENCH_BYTES / BENCH_RUNS.
-#   browser [webrtc]
+#   browser [with-webrtc]
 #            quit and relaunch the browser from this shell with SPOOF_TZ and
 #            the WebRTC policy applied. Both are read only at startup, which
 #            is why this is a restart - closing windows is not enough.
@@ -52,12 +52,12 @@
 #            the network directly and expose the real address regardless of
 #            everything else here. The default launch prevents that.
 #
-#            Pass webrtc to relax the policy for the launch; block is restored
-#            on disk immediately afterwards. The running browser already read the
-#            relaxed value and keeps it until it quits, so the exposure is
-#            scoped to that session and the next launch is protected again -
-#            no timer, nothing to remember. Use it when a call needs to
-#            connect.
+#            Pass with-webrtc to relax the policy for the launch; block is
+#            restored on disk immediately afterwards. The running browser
+#            already read the relaxed value and keeps it until it quits, so
+#            the exposure is scoped to that session and the next launch is
+#            protected again - no timer, nothing to remember. Use it when a
+#            call needs to connect.
 #
 # NOTE: applications with their own explicit proxy setting ignore the macOS
 # system proxy, so they are unaffected by this script and keep whatever path
@@ -153,13 +153,9 @@ BENCH_URL="${BENCH_URL:-https://ash-speed.hetzner.com/100MB.bin}"
 BENCH_BYTES="${BENCH_BYTES:-5000000}"
 BENCH_RUNS="${BENCH_RUNS:-2}"
 
-# chained: the WireGuard endpoint dials through the upstream SOCKS proxy, so
-#          only ordinary TLS leaves the machine and the tunnel survives
-#          censorship. Costs a hop, and carries UDP over TCP.
-# direct:  the endpoint dials its peer itself. Faster and simpler, but the
-#          link is plainly a VPN to anyone watching.
-#
-# The only difference in the config is the endpoint's "detour" key.
+# The only difference between the modes in the config is whether the WireGuard
+# endpoint carries a "detour" key. See the header for which to prefer - briefly,
+# chained, since it measured faster as well as more discreet.
 singbox_mode() {
     python3 - "$SINGBOX_CONFIG" <<'PY' 2>/dev/null || echo unknown
 import json, sys
@@ -405,9 +401,9 @@ cmd_browser() {
     # the bare command cannot accidentally mean "expose my real address".
     local want=block
     case "${1:-}" in
-        ""|block)  want=block ;;
-        webrtc)    want=allow ;;
-        *) echo "usage: vpnchain browser [webrtc]" >&2; exit 1 ;;
+        ""|block)     want=block ;;
+        with-webrtc)  want=allow ;;
+        *) echo "usage: vpnchain browser [with-webrtc]" >&2; exit 1 ;;
     esac
 
     if [ ! -x "$BROWSER_BIN" ]; then
@@ -549,7 +545,7 @@ cmd_status() {
     else
         bad "webrtc: ALLOWED direct UDP - your real address is exposed"
         echo "         a SOCKS proxy cannot carry UDP, so this bypasses the"
-        echo "         chain entirely. run: vpnchain webrtc block"
+        echo "         chain entirely. run: vpnchain browser"
     fi
     [ -n "$SPOOF_TZ" ] && ok "timezone: $SPOOF_TZ" \
                        || warn "timezone: no spoof configured (SPOOF_TZ unset)"
@@ -634,7 +630,7 @@ case "${1:-status}" in
         echo "usage: vpnchain {on|start|restart} [chained|direct]"
         echo "       vpnchain {off|stop}"
         echo "       vpnchain {status|bench}"
-        echo "       vpnchain browser [webrtc]"
+        echo "       vpnchain browser [with-webrtc]"
         exit 1
         ;;
 esac
