@@ -24,17 +24,15 @@
 #
 #   chained  the WireGuard endpoint dials through the upstream SOCKS proxy, so
 #            only ordinary TLS leaves the machine and the tunnel survives
-#            censorship. Carries UDP over TCP, which sounds like a cost but
-#            measured FASTER than direct and at rough parity with the bare
-#            connection: the first hop is a nearby CDN edge over TCP, and the
-#            CDN backbone carries it the rest of the way.
-#   direct   the endpoint dials its peer itself. Fewer moving parts, but it is
-#            plainly a VPN on the wire, dead where UDP or VPNs are filtered,
-#            and measured roughly half the throughput with high variance -
-#            raw long-haul UDP, where loss hurts because WireGuard does not
-#            retransmit and the inner TCP has to.
+#            censorship. Carries UDP over TCP.
+#   direct   the endpoint dials its peer itself. Fewer moving parts, but
+#            plainly a VPN on the wire and dead where UDP or VPNs are filtered.
 #
-# So direct is for isolating problems with the upstream, not for speed.
+# Latency is identical between them - same peer, same ocean crossing, both
+# measured ~1.8x the bare connection. Throughput was too noisy across repeated
+# runs to call a winner; the medians favoured chained but the ranges overlap.
+# Choose on concealment, not speed. Use 'bench' with a raised BENCH_RUNS if
+# you want a defensible answer on your own link.
 #
 # Omit it to keep whatever the config already has. status reports the active
 # mode, so there is no separate command to query it.
@@ -154,8 +152,7 @@ BENCH_BYTES="${BENCH_BYTES:-5000000}"
 BENCH_RUNS="${BENCH_RUNS:-2}"
 
 # The only difference between the modes in the config is whether the WireGuard
-# endpoint carries a "detour" key. See the header for which to prefer - briefly,
-# chained, since it measured faster as well as more discreet.
+# endpoint carries a "detour" key.
 singbox_mode() {
     python3 - "$SINGBOX_CONFIG" <<'PY' 2>/dev/null || echo unknown
 import json, sys
@@ -498,8 +495,8 @@ cmd_status() {
 
     if [ "$mode" = direct ]; then
         warn "upstream hop DISABLED - WireGuard dials its peer directly"
-        echo "         plainly a VPN on the wire, and measured slower and"
-        echo "         more variable than chained - not a speed win"
+        echo "         plainly a VPN on the wire - no concealment, and no"
+        echo "         measured speed advantage over chained either"
         echo "         this persists across reboots until changed back"
         echo "         restore with: vpnchain restart chained"
     else
