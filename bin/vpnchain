@@ -23,6 +23,10 @@
 #            non-proxied UDP. A SOCKS proxy cannot carry UDP, so WebRTC
 #            would otherwise reach the network directly and expose the real
 #            address regardless of everything else here.
+#   browser  quit and relaunch the browser from this shell with SPOOF_TZ set.
+#            Both the timezone and the WebRTC policy are read only at startup,
+#            so applying either one means a full restart - closing windows is
+#            not enough.
 #
 # NOTE: applications with their own explicit proxy setting ignore the macOS
 # system proxy, so they are unaffected by this script and keep whatever path
@@ -31,6 +35,14 @@
 set -uo pipefail
 
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/env"
+
+# What `vpnchain browser` launched the browser with. macOS hides other
+# processes' environments, so the running browser's timezone cannot be read
+# back - the alternative would be a remote-debugging port, which lets any
+# local process drive the browser. Recording provenance instead keeps that
+# attack surface closed, at the cost of only knowing about browsers this
+# script started.
+STATE="${CONFIG%/env}/browser.state"
 
 if [ ! -r "$CONFIG" ]; then
     cat >&2 <<EOF
@@ -45,6 +57,14 @@ Create it with your site-local values:
     UPSTREAM_PROCESS=<process name of the upstream proxy core>
     EXPECTED_EXIT_IP=<the address the chain should present>
     SINGBOX_AGENT=<launchd label of your sing-box agent>
+
+Optional:
+
+    SPOOF_TZ=<tz database zone the browser should report, e.g. America/Denver>
+             match it to the exit address's geolocation; applied only by
+             'vpnchain browser'
+    BROWSER_APP=<path to the browser bundle, defaults to Google Chrome>
+    BROWSER_DOMAIN=<its preference domain, for the WebRTC policy>
 EOF
     exit 1
 fi
@@ -69,6 +89,22 @@ BROWSER_DOMAIN="${BROWSER_DOMAIN:-com.google.Chrome}"
 # Chrome renamed this policy; write and read both so either vintage works.
 WEBRTC_KEYS=(WebRtcIPHandlingPolicy WebRtcIPHandling)
 WEBRTC_BLOCK_VALUE=disable_non_proxied_udp
+
+BROWSER_APP="${BROWSER_APP:-/Applications/Google Chrome.app}"
+BROWSER_BIN="$BROWSER_APP/Contents/MacOS/$(basename "${BROWSER_APP%.app}")"
+
+# Timezone the browser should report. The browser has no timezone setting and
+# delegates to the OS, but it honours TZ, which takes effect before ICU
+# initialises - so main thread, iframes and Web Workers all agree. Only the
+# zone interpretation changes; the clock itself stays correct, leaving TLS
+# validity, JWT expiry and TOTP alone.
+#
+# This must be a launch from a shell. Wrapping it in a .app bundle was tried
+# and produced a correct spoof but markedly slower page loads; the bundle
+# launch context, not TZ, was responsible. `launchctl setenv` does not reach
+# LaunchServices-launched apps at all. Both paths are disproven - do not
+# reintroduce them.
+SPOOF_TZ="${SPOOF_TZ:-}"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 ok()   { printf '  \033[32m[ok]\033[0m   %s\n' "$1"; }
@@ -135,7 +171,75 @@ webrtc_state() {
     echo allowed
 }
 
-browser_running() { pgrep -f 'Google Chrome' >/dev/null 2>&1; }
+# Match the binary path specifically. A looser pattern also matches the
+# osascript quit command and this script's own arguments, which would make the
+# quit-wait loop below never finish.
+browser_running() { pgrep -f "$BROWSER_BIN" >/dev/null 2>&1; }
+
+cmd_browser() {
+    if [ ! -x "$BROWSER_BIN" ]; then
+        bad "browser binary not found: $BROWSER_BIN"
+        exit 1
+    fi
+
+    if browser_running; then
+        ok "asking the browser to quit (it will restore your session)"
+        osascript -e "quit app \"$(basename "${BROWSER_APP%.app}")\"" >/dev/null 2>&1
+        local i=0
+        while browser_running && [ "$i" -lt 60 ]; do
+            sleep 0.25
+            i=$((i + 1))
+        done
+        if browser_running; then
+            bad "browser is still running - it may be holding an unsaved prompt"
+            bad "launching now would just hand off to the existing process and"
+            bad "change nothing, so stopping here. Quit it manually and retry."
+            exit 1
+        fi
+        ok "browser quit"
+    else
+        ok "browser was not running"
+    fi
+
+    local bpid
+    if [ -n "$SPOOF_TZ" ]; then
+        ok "launching with TZ=$SPOOF_TZ"
+        TZ="$SPOOF_TZ" nohup "$BROWSER_BIN" >/dev/null 2>&1 &
+    else
+        warn "SPOOF_TZ not set - launching with the system timezone"
+        nohup "$BROWSER_BIN" >/dev/null 2>&1 &
+    fi
+    bpid=$!
+    disown 2>/dev/null
+
+    sleep 3
+    if browser_running; then
+        ok "browser started (pid $bpid)"
+        # Record what this launch actually applied, so status can tell a
+        # browser we configured from one started some other way.
+        printf 'PID=%s\nTZ=%s\nWEBRTC=%s\n' \
+            "$bpid" "$SPOOF_TZ" "$(webrtc_state)" > "$STATE"
+    else
+        bad "browser did not come up"
+        rm -f "$STATE"
+    fi
+
+    echo
+    bold "applied at this launch"
+    if [ "$(webrtc_state)" = blocked ]; then
+        ok "webrtc: BLOCKED"
+    else
+        bad "webrtc: ALLOWED - real address exposed to any page"
+        echo "         vpnchain webrtc block && vpnchain browser"
+    fi
+    if [ -n "$SPOOF_TZ" ]; then
+        ok "timezone: $SPOOF_TZ"
+        echo "         verify in the console:"
+        echo "         Intl.DateTimeFormat().resolvedOptions().timeZone"
+    else
+        warn "timezone: system default (set SPOOF_TZ in $CONFIG)"
+    fi
+}
 
 cmd_webrtc() {
     local k
@@ -218,13 +322,57 @@ cmd_status() {
     fi
 
     echo
-    bold "browser udp"
-    if [ "$(webrtc_state)" = blocked ]; then
-        ok "WebRTC blocked from non-proxied UDP"
+    bold "browser - configured"
+    local cur_webrtc
+    cur_webrtc=$(webrtc_state)
+    if [ "$cur_webrtc" = blocked ]; then
+        ok "webrtc: BLOCKED from non-proxied UDP"
     else
-        bad "WebRTC ALLOWED direct UDP - your real address is exposed"
+        bad "webrtc: ALLOWED direct UDP - your real address is exposed"
         echo "         a SOCKS proxy cannot carry UDP, so this bypasses the"
         echo "         chain entirely. run: vpnchain webrtc block"
+    fi
+    [ -n "$SPOOF_TZ" ] && ok "timezone: $SPOOF_TZ" \
+                       || warn "timezone: no spoof configured (SPOOF_TZ unset)"
+
+    echo
+    bold "browser - running"
+    local s_pid s_tz s_webrtc
+    s_pid=""; s_tz=""; s_webrtc=""
+    if [ -r "$STATE" ]; then
+        s_pid=$(sed -n 's/^PID=//p'    "$STATE")
+        s_tz=$(sed -n  's/^TZ=//p'     "$STATE")
+        s_webrtc=$(sed -n 's/^WEBRTC=//p' "$STATE")
+    fi
+
+    # A recorded pid is only meaningful if it is still alive AND still the
+    # browser - pids get recycled.
+    if [ -n "$s_pid" ] && kill -0 "$s_pid" 2>/dev/null \
+       && ps -p "$s_pid" -o command= 2>/dev/null | grep -qF "$BROWSER_BIN"; then
+        ok "started by vpnchain (pid $s_pid)"
+
+        if [ "$s_tz" = "$SPOOF_TZ" ]; then
+            [ -n "$s_tz" ] && ok "timezone in effect: $s_tz" \
+                           || warn "timezone in effect: system default"
+        else
+            bad "timezone in effect: ${s_tz:-system default}, config now ${SPOOF_TZ:-unset}"
+            echo "         restart to apply: vpnchain browser"
+        fi
+
+        if [ "$s_webrtc" = "$cur_webrtc" ]; then
+            ok "webrtc in effect: $s_webrtc"
+        else
+            bad "webrtc in effect: $s_webrtc, config now $cur_webrtc"
+            echo "         policies are read at startup only"
+            echo "         restart to apply: vpnchain browser"
+        fi
+    elif browser_running; then
+        bad "browser is running but was NOT started by vpnchain"
+        echo "         the timezone spoof is not applied, and the webrtc"
+        echo "         policy may predate your last change"
+        echo "         run: vpnchain browser"
+    else
+        warn "browser not running"
     fi
 
     echo
@@ -257,9 +405,11 @@ case "${1:-status}" in
     restart) cmd_stop; cmd_start; proxy_on ;;
     status)  cmd_status ;;
     webrtc)  cmd_webrtc "${2:-status}" ;;
+    browser) cmd_browser ;;
     *)
         echo "usage: vpnchain {on|off|start|stop|restart|status}"
         echo "       vpnchain webrtc {block|allow|status}"
+        echo "       vpnchain browser"
         exit 1
         ;;
 esac
