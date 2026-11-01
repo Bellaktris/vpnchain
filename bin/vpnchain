@@ -1,8 +1,8 @@
 #!/bin/bash
 # vpnchain - toggle a chained proxy setup on macOS.
 #
-#   GUI apps
-#     -> macOS system SOCKS proxy
+#   browser, launched by 'vpnchain browser'
+#     -> --proxy-server, pinned to that launch only
 #        -> sing-box: userspace WireGuard endpoint (no tun, no root)
 #           -> detour via an upstream SOCKS proxy
 #              -> upstream transport
@@ -12,15 +12,12 @@
 # deliberately outside this repo. See the template printed by this script when
 # that file is missing.
 #
-#   on [mode]       enable the system proxy (GUI traffic rides the chain)
-#   off             disable it - direct connection, no restrictions
-#   start [mode]    load the sing-box agent without touching the proxy
-#   stop            unload the agent (turns the proxy off first, so the system
-#                   is never left pointing at a dead port)
-#   restart [mode]  reload sing-box
+#   start [mode]    load the sing-box agent
+#   stop            unload it
+#   restart [mode]  reload it
 #   status          show every link in the chain and what the outside sees
 #
-# The optional [mode] on on/start/restart is one of:
+# The optional [mode] on start/restart is one of:
 #
 #   chained  the WireGuard endpoint dials through the upstream SOCKS proxy, so
 #            only ordinary TLS leaves the machine and the tunnel survives
@@ -57,9 +54,14 @@
 #            protected again - no timer, nothing to remember. Use it when a
 #            call needs to connect.
 #
-# NOTE: applications with their own explicit proxy setting ignore the macOS
-# system proxy, so they are unaffected by this script and keep whatever path
-# they were already configured for.
+# NOTE: the proxy is pinned per browser launch rather than set system-wide.
+# The scope is therefore exactly the browsers this script starts - nothing
+# else on the machine is touched, and stopping the agent cannot strand macOS
+# pointing at a dead port.
+#
+# The trade is that this fails OPEN, not safe: a browser started from the Dock
+# or Spotlight carries no proxy flag and browses on your real address. Nothing
+# prevents that; status reports it, which is detection rather than prevention.
 
 set -uo pipefail
 
@@ -174,30 +176,6 @@ ok()   { printf '  \033[32m[ok]\033[0m   %s\n' "$1"; }
 warn() { printf '  \033[33m[warn]\033[0m %s\n' "$1"; }
 bad()  { printf '  \033[31m[bad]\033[0m  %s\n' "$1"; }
 
-# Every network service backed by a real ethernet/wifi device, so the setting
-# applies whether you are on Wi-Fi or plugged in.
-services() {
-    networksetup -listnetworkserviceorder 2>/dev/null | awk '
-        /^\([0-9]+\)/        { name = substr($0, index($0, " ") + 1) }
-        /Device: en[0-9]+\)/ { if (name != "") { print name; name = "" } }'
-}
-
-proxy_on() {
-    while IFS= read -r svc; do
-        [ -z "$svc" ] && continue
-        networksetup -setsocksfirewallproxy "$svc" "$PROXY_HOST" "$PROXY_PORT" >/dev/null 2>&1
-        networksetup -setsocksfirewallproxystate "$svc" on >/dev/null 2>&1
-        ok "proxy ON  -> $svc"
-    done < <(services)
-}
-
-proxy_off() {
-    while IFS= read -r svc; do
-        [ -z "$svc" ] && continue
-        networksetup -setsocksfirewallproxystate "$svc" off >/dev/null 2>&1
-        ok "proxy OFF -> $svc"
-    done < <(services)
-}
 
 agent_running() { pgrep -f 'sing-box run' >/dev/null 2>&1; }
 
@@ -217,8 +195,6 @@ cmd_start() {
 }
 
 cmd_stop() {
-    # Never leave the system proxy pointing at a port with nothing behind it.
-    proxy_off
     launchctl bootout "gui/$(id -u)/$SINGBOX_AGENT" 2>/dev/null \
         || launchctl unload -w "$PLIST" 2>/dev/null
     ok "sing-box stopped"
@@ -432,13 +408,19 @@ cmd_browser() {
     [ "$want" = block ] && ok "webrtc policy set to block" \
                         || warn "webrtc policy relaxed for this launch"
 
+    # The proxy is pinned to this launch rather than set system-wide, so the
+    # scope is exactly this browser and nothing else on the machine is touched.
+    # Chrome still hands over hostnames rather than pre-resolving, so remote
+    # DNS - and therefore no DNS leak - is preserved.
     local bpid
+    local proxy_flag="--proxy-server=socks5://$PROXY_HOST:$PROXY_PORT"
+    ok "proxy pinned to this launch: $PROXY_HOST:$PROXY_PORT"
     if [ -n "$SPOOF_TZ" ]; then
         ok "launching with TZ=$SPOOF_TZ"
-        TZ="$SPOOF_TZ" nohup "$BROWSER_BIN" >/dev/null 2>&1 &
+        TZ="$SPOOF_TZ" nohup "$BROWSER_BIN" "$proxy_flag" >/dev/null 2>&1 &
     else
         warn "SPOOF_TZ not set - launching with the system timezone"
-        nohup "$BROWSER_BIN" >/dev/null 2>&1 &
+        nohup "$BROWSER_BIN" "$proxy_flag" >/dev/null 2>&1 &
     fi
     bpid=$!
     disown 2>/dev/null
@@ -528,9 +510,13 @@ cmd_status() {
     local enabled
     enabled=$(scutil --proxy | awk '/SOCKSEnable/ {print $3}')
     if [ "${enabled:-0}" = "1" ]; then
-        ok "ON  -> $(scutil --proxy | awk '/SOCKSProxy/ {print $3}'):$(scutil --proxy | awk '/SOCKSPort/ {print $3}')"
+        warn "SET -> $(scutil --proxy | awk '/SOCKSProxy/ {print $3}'):$(scutil --proxy | awk '/SOCKSPort/ {print $3}')"
+        echo "         this script no longer manages it; the proxy is pinned"
+        echo "         per browser launch. A leftover system setting silently"
+        echo "         routes Safari, Mail and others through the chain too."
+        echo "         clear it in System Settings > Network > Proxies"
     else
-        warn "OFF - GUI apps are going direct on your ISP address"
+        ok "not set - only browsers launched by vpnchain are proxied"
     fi
 
     echo
@@ -610,23 +596,18 @@ cmd_status() {
 }
 
 case "${1:-status}" in
-    on)      maybe_switch_mode "${2:-}"; cmd_start; proxy_on
-             echo; wait_for_chain; echo; cmd_status ;;
-    off)     proxy_off; echo
-             warn "sing-box still running; 'vpnchain stop' to shut it down too" ;;
     start)   maybe_switch_mode "${2:-}"; cmd_start; wait_for_chain ;;
     stop)    cmd_stop ;;
              # switch_mode, not maybe_switch_mode: this verb restarts the agent
              # itself, so reloading inside the switch would do it twice.
     restart) if [ -n "${2:-}" ]; then switch_mode "$2" || true; fi
-             cmd_stop; cmd_start; proxy_on; echo; wait_for_chain ;;
+             cmd_stop; cmd_start; echo; wait_for_chain ;;
     status)  cmd_status ;;
     browser) cmd_browser "${2:-}" ;;
     bench)   cmd_bench ;;
     *)
-        echo "usage: vpnchain {on|start|restart} [chained|direct]"
-        echo "       vpnchain {off|stop}"
-        echo "       vpnchain {status|bench}"
+        echo "usage: vpnchain {start|restart} [chained|direct]"
+        echo "       vpnchain {stop|status|bench}"
         echo "       vpnchain browser [with-webrtc]"
         exit 1
         ;;
