@@ -38,15 +38,15 @@
 #            the full chain. Every listener involved is already running, so
 #            nothing is switched or restarted and this is safe to run while
 #            browsing. Override with BENCH_URL / BENCH_BYTES / BENCH_RUNS.
-#   browser [upstream-only] [with-webrtc]
+#   browser [incognito] [with-webrtc]
 #            quit and relaunch the browser from this shell with SPOOF_TZ and
 #            the WebRTC policy applied. Both are read only at startup, which
 #            is why this is a restart - closing windows is not enough.
 #
-#            upstream-only opens a SEPARATE instance, with its own throwaway
-#            profile, pointed at the inbound that bypasses the WireGuard
-#            endpoint - so it exits at the upstream instead of the pinned
-#            address. It coexists with the main browser; a browser can only
+#            incognito opens a SEPARATE incognito instance pointed at the
+#            inbound that bypasses the WireGuard
+#            endpoint - so it changes TWO things at once: nothing persists,
+#            AND it exits at the upstream instead of the pinned address. It coexists with the main browser; a browser can only
 #            hold one proxy, so a second exit means a second instance. That
 #            exit is a shared datacenter address flagged as a proxy by IP
 #            databases, so expect CAPTCHAs - the trade is that the session is
@@ -103,10 +103,10 @@ Optional:
     SPOOF_TZ=<tz database zone the browser should report, e.g. America/Denver>
              match it to the exit address's geolocation; applied only by
              'vpnchain browser'
-    UPSTREAM_ONLY_PORT=<sing-box inbound that bypasses the WireGuard endpoint,
+    INCOGNITO_PORT=<sing-box inbound that bypasses the WireGuard endpoint,
              default 1081; must exist in SINGBOX_CONFIG>
-    UPSTREAM_ONLY_TZ=<timezone for that instance, default UTC>
-    UPSTREAM_ONLY_PROFILE=<its throwaway profile dir>
+    INCOGNITO_TZ=<timezone for that instance, default UTC>
+    INCOGNITO_PROFILE=<its throwaway profile dir>
     BROWSER_APP=<path to the browser bundle, defaults to Google Chrome>
     BROWSER_DOMAIN=<its preference domain, for the WebRTC policy>
 EOF
@@ -153,16 +153,17 @@ SPOOF_TZ="${SPOOF_TZ:-}"
 # Second sing-box inbound, routed straight to the upstream so it bypasses the
 # WireGuard endpoint. Same daemon, no reconfiguration - picking an exit is just
 # picking a port, and both can be in use at once.
-UPSTREAM_ONLY_PORT="${UPSTREAM_ONLY_PORT:-1081}"
+INCOGNITO_PORT="${INCOGNITO_PORT:-1081}"
 
 # That exit is a shared datacenter address, so UTC is the better timezone for
 # it: it is what Tor Browser and Firefox resistFingerprinting report, which
 # puts the instance in a large set rather than making it distinctive.
-UPSTREAM_ONLY_TZ="${UPSTREAM_ONLY_TZ:-UTC}"
+INCOGNITO_TZ="${INCOGNITO_TZ:-UTC}"
 
-# Wiped on every launch - an unlinked exit paired with a profile that
-# accumulates cookies would defeat itself.
-UPSTREAM_ONLY_PROFILE="${UPSTREAM_ONLY_PROFILE:-$HOME/.cache/vpnchain-upstream-profile}"
+# Only needed to force a SEPARATE browser process, which is what lets this
+# instance hold a different proxy. The session itself runs --incognito, so no
+# browsing data lands here and the directory needs no maintenance.
+INCOGNITO_PROFILE="${INCOGNITO_PROFILE:-$HOME/.cache/vpnchain-upstream-profile}"
 
 SINGBOX_CONFIG="${SINGBOX_CONFIG:-$HOME/.config/sing-box/config.json}"
 
@@ -396,19 +397,146 @@ cmd_bench() {
     echo "    vpnchain restart direct && vpnchain bench"
 }
 
+# Any failure after the backup is taken must put the old config back, or a
+# half-written one is left in place for the next start to trip over.
+restore_config_backup() {
+    if [ -f "$SINGBOX_CONFIG.bak" ]; then
+        mv "$SINGBOX_CONFIG.bak" "$SINGBOX_CONFIG"
+        warn "previous config restored"
+    fi
+}
+
+# Writes a known-good config from the env file. Deliberately a separate verb
+# rather than something start does implicitly: regenerating wholesale discards
+# any routing rules added by hand, which should be a decision rather than a
+# surprise. Runtime toggles stay surgical for the same reason.
+cmd_config() {
+    local v missing=()
+    for v in WG_PRIVATE_KEY WG_ADDRESS WG_PEER_PUBLIC_KEY WG_PEER_HOST WG_PEER_PORT; do
+        [ -z "${!v:-}" ] && missing+=("$v")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        bad "cannot generate - missing in $CONFIG:"
+        printf '         %s\n' "${missing[@]}"
+        exit 1
+    fi
+
+    # Preserve whichever mode is already in effect; generating should not
+    # silently move you between concealment postures.
+    local mode
+    mode=$(singbox_mode)
+    [ "$mode" = unknown ] && mode=chained
+    ok "generating a $mode config"
+
+    mkdir -p "$(dirname "$SINGBOX_CONFIG")"
+    if [ -f "$SINGBOX_CONFIG" ]; then
+        cp -p "$SINGBOX_CONFIG" "$SINGBOX_CONFIG.bak"
+        ok "previous config saved as $(basename "$SINGBOX_CONFIG").bak"
+        warn "hand-added routing rules are NOT carried over; merge them back"
+        warn "from the backup if you had any"
+    fi
+
+    MODE="$mode" P_HOST="$PROXY_HOST" P_PORT="$PROXY_PORT" \
+    U_PORT="$INCOGNITO_PORT" UP_HOST="$UPSTREAM_HOST" \
+    UP_PORT="$UPSTREAM_PORT" UP_TAG="$UPSTREAM_TAG" \
+    WG_MTU="${WG_MTU:-1390}" WG_DNS="${WG_DNS:-8.8.8.8}" \
+    WG_PRIVATE_KEY="$WG_PRIVATE_KEY" WG_ADDRESS="$WG_ADDRESS" \
+    WG_PEER_PUBLIC_KEY="$WG_PEER_PUBLIC_KEY" \
+    WG_PEER_HOST="$WG_PEER_HOST" WG_PEER_PORT="$WG_PEER_PORT" \
+    OUT="$SINGBOX_CONFIG" \
+    python3 - <<'PY' || { restore_config_backup; bad "generation failed"; exit 1; }
+import json, os
+e = os.environ
+
+wg = {
+    "type": "wireguard", "tag": "tunnel", "system": False,
+    "mtu": int(e["WG_MTU"]),
+    "address": [e["WG_ADDRESS"]],
+    "private_key": e["WG_PRIVATE_KEY"],
+    "peers": [{
+        "address": e["WG_PEER_HOST"],
+        "port": int(e["WG_PEER_PORT"]),
+        "public_key": e["WG_PEER_PUBLIC_KEY"],
+        "allowed_ips": ["0.0.0.0/0"],
+        "persistent_keepalive_interval": 25,
+    }],
+}
+if e["MODE"] == "chained":
+    wg["detour"] = e["UP_TAG"]
+
+cfg = {
+    "log": {"level": "info", "timestamp": True},
+    # Names for the incognito inbound resolve through the upstream too.
+    # Resolving them through the tunnel would have the site see one origin
+    # while its authoritative DNS saw another.
+    "dns": {
+        "servers": [
+            {"type": "udp", "tag": "tunnel-dns",
+             "server": e["WG_DNS"], "detour": "tunnel"},
+            {"type": "udp", "tag": "upstream-dns",
+             "server": e["WG_DNS"], "detour": e["UP_TAG"]},
+        ],
+        "rules": [{"inbound": ["upstream-in"], "server": "upstream-dns"}],
+        "final": "tunnel-dns",
+        "strategy": "ipv4_only",
+    },
+    "inbounds": [
+        {"type": "mixed", "tag": "pinned-in",
+         "listen": e["P_HOST"], "listen_port": int(e["P_PORT"])},
+        {"type": "mixed", "tag": "upstream-in",
+         "listen": e["P_HOST"], "listen_port": int(e["U_PORT"])},
+    ],
+    "endpoints": [wg],
+    "outbounds": [
+        {"type": "socks", "tag": e["UP_TAG"], "server": e["UP_HOST"],
+         "server_port": int(e["UP_PORT"]), "version": "5"},
+    ],
+    "route": {
+        "rules": [{"inbound": ["upstream-in"], "action": "route",
+                   "outbound": e["UP_TAG"]}],
+        "final": "tunnel",
+    },
+}
+
+out = e["OUT"]
+with open(out, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+os.chmod(out, 0o600)   # it holds the private key
+PY
+
+    if ! sing-box check -c "$SINGBOX_CONFIG" 2>&1; then
+        bad "generated config failed validation"
+        restore_config_backup
+        exit 1
+    fi
+    ok "config written and valid: $SINGBOX_CONFIG"
+    echo "         apply it with: vpnchain restart"
+}
+
 cmd_browser() {
     # Flags name what you opt INTO, so the bare command cannot accidentally
     # mean "expose my real address" or "use the unlinked exit".
-    local want=block exit_kind=pinned a
+    local want=block exit_kind=pinned already_up=0 a
     for a in "$@"; do
         case "$a" in
             "")             ;;
             with-webrtc)    want=allow ;;
-            upstream-only)  exit_kind=upstream ;;
-            *) echo "usage: vpnchain browser [upstream-only] [with-webrtc]" >&2
+            incognito)  exit_kind=upstream ;;
+            *) echo "usage: vpnchain browser [incognito] [with-webrtc]" >&2
                exit 1 ;;
         esac
     done
+
+    # Refused rather than merely warned about: an unlinked session that is
+    # allowed to use non-proxied UDP leaks the real address into exactly the
+    # session whose whole purpose is not carrying it.
+    if [ "$exit_kind" = upstream ] && [ "$want" = allow ]; then
+        bad "incognito and with-webrtc are mutually exclusive"
+        echo "         WebRTC would expose your real address inside the"
+        echo "         session that exists specifically to avoid that"
+        exit 1
+    fi
 
     if [ ! -x "$BROWSER_BIN" ]; then
         bad "browser binary not found: $BROWSER_BIN"
@@ -421,12 +549,18 @@ cmd_browser() {
         # upstream rather than the pinned address. A browser can only hold one
         # proxy, so this has to be a SEPARATE instance with its own profile -
         # it coexists with the main one rather than replacing it.
-        port="$UPSTREAM_ONLY_PORT"
-        tz="$UPSTREAM_ONLY_TZ"
-        rm -rf "$UPSTREAM_ONLY_PROFILE"
-        profile_args=(--user-data-dir="$UPSTREAM_ONLY_PROFILE" --no-first-run
-                      --no-default-browser-check)
-        ok "separate instance, fresh profile: $UPSTREAM_ONLY_PROFILE"
+        port="$INCOGNITO_PORT"
+        tz="$INCOGNITO_TZ"
+        # --incognito does the cleanup for us: nothing is persisted, so the
+        # profile dir needs no wiping. --user-data-dir is still required -
+        # without it --incognito just opens a window in the EXISTING browser,
+        # which carries the main instance's proxy rather than this one.
+        profile_args=(--user-data-dir="$INCOGNITO_PROFILE" --incognito
+                      --no-first-run --no-default-browser-check)
+        # Remember whether one was already up: a second launch hands off to
+        # it and this invocation's flags are silently discarded.
+        pgrep -f "$INCOGNITO_PROFILE" >/dev/null 2>&1 && already_up=1
+        ok "separate incognito instance (nothing persisted)"
         warn "this exit is flagged as a proxy by IP databases - expect CAPTCHAs"
     else
         port="$PROXY_PORT"
@@ -480,8 +614,19 @@ cmd_browser() {
         # Deliberately not recorded in STATE: that tracks the main browser, and
         # overwriting it would make status report the throwaway instance as if
         # it were your everyday one.
-        kill -0 "$bpid" 2>/dev/null && ok "instance started (pid $bpid)" \
-                                    || bad "instance did not come up"
+        # Not the launcher pid: if an instance with this profile is already
+        # running, the launch hands off to it and the launcher exits at once,
+        # which would read as a failure. Ask whether the instance exists.
+        if ! pgrep -f "$INCOGNITO_PROFILE" >/dev/null 2>&1; then
+            bad "incognito instance did not come up"
+        elif [ "$already_up" = 1 ]; then
+            warn "an instance was ALREADY running - this launch handed off to it"
+            warn "and its flags were discarded. The proxy and timezone in effect"
+            warn "are whatever that instance started with, not what is printed"
+            warn "above. Quit it first if you changed INCOGNITO_PORT or _TZ."
+        else
+            ok "incognito instance running (pid $(pgrep -f "$INCOGNITO_PROFILE" | head -1))"
+        fi
     elif browser_running; then
         ok "browser started (pid $bpid)"
         # Record what this launch applied, so status can tell a browser we
@@ -665,11 +810,13 @@ case "${1:-status}" in
              cmd_stop; cmd_start; echo; wait_for_chain ;;
     status)  cmd_status ;;
     browser) shift; cmd_browser "$@" ;;
+    config)  cmd_config ;;
     bench)   cmd_bench ;;
     *)
         echo "usage: vpnchain {start|restart} [chained|direct]"
         echo "       vpnchain {stop|status|bench}"
-        echo "       vpnchain browser [upstream-only] [with-webrtc]"
+        echo "       vpnchain browser [incognito] [with-webrtc]"
+        echo "       vpnchain config"
         exit 1
         ;;
 esac
