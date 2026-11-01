@@ -12,21 +12,29 @@
 # deliberately outside this repo. See the template printed by this script when
 # that file is missing.
 #
-#   on       enable the system proxy (GUI traffic rides the chain)
-#   off      disable it - direct connection, no restrictions
-#   status   show every link in the chain and what the outside world sees
-#   start    load the sing-box agent
-#   stop     unload the sing-box agent (turns the proxy off first, so the
-#            system is never left pointing at a dead port)
-#   restart  reload sing-box
+#   on [mode]       enable the system proxy (GUI traffic rides the chain)
+#   off             disable it - direct connection, no restrictions
+#   start [mode]    load the sing-box agent without touching the proxy
+#   stop            unload the agent (turns the proxy off first, so the system
+#                   is never left pointing at a dead port)
+#   restart [mode]  reload sing-box
+#   status          show every link in the chain and what the outside sees
+#
+# The optional [mode] on on/start/restart is one of:
+#
+#   chained  the WireGuard endpoint dials through the upstream SOCKS proxy, so
+#            only ordinary TLS leaves the machine and the tunnel survives
+#            censorship. Costs a hop and carries UDP over TCP.
+#   direct   the endpoint dials its peer itself. One hop shorter, but plainly
+#            a VPN on the wire and dead where UDP or VPNs are filtered.
+#
+# Omit it to keep whatever the config already has. status reports the active
+# mode, so there is no separate command to query it.
+#
 #   webrtc   block|allow|status - control whether the browser may use
 #            non-proxied UDP. A SOCKS proxy cannot carry UDP, so WebRTC
 #            would otherwise reach the network directly and expose the real
 #            address regardless of everything else here.
-#   mode     chained|direct|status - whether the WireGuard endpoint dials
-#            through the upstream proxy or straight at its peer. chained hides
-#            that a VPN is in use at all; direct is a hop shorter and carries
-#            UDP as UDP, but is trivially identifiable as a VPN.
 #   browser  quit and relaunch the browser from this shell with SPOOF_TZ set.
 #            Both the timezone and the WebRTC policy are read only at startup,
 #            so applying either one means a full restart - closing windows is
@@ -211,25 +219,43 @@ webrtc_state() {
 # quit-wait loop below never finish.
 browser_running() { pgrep -f "$BROWSER_BIN" >/dev/null 2>&1; }
 
-cmd_mode() {
-    local want="${1:-status}" cur
+# The tunnel needs time to hand shake after the agent restarts, and until it
+# does, everything through the proxy fails. A fixed sleep either wastes time or
+# lies, so poll until traffic actually flows.
+wait_for_chain() {
+    local i=0
+    while [ "$i" -lt 12 ]; do
+        if curl -s -m 4 --socks5-hostname "$PROXY_HOST:$PROXY_PORT" \
+                -o /dev/null https://api.ipify.org 2>/dev/null; then
+            ok "tunnel is carrying traffic"
+            return 0
+        fi
+        sleep 2
+        i=$((i + 1))
+    done
+    bad "tunnel is up but not carrying traffic after ~25s"
+    echo "         check: tail ~/.config/sing-box/sing-box.err.log"
+    return 1
+}
+
+# Switch the config between chained and direct. Returns 0 if it changed.
+# Does not restart on its own; callers that already restart handle that.
+switch_mode() {
+    local want="$1" cur
     cur=$(singbox_mode)
 
-    if [ "$want" = status ]; then
-        echo "mode: $cur"
-        return
-    fi
-    if [ "$want" != chained ] && [ "$want" != direct ]; then
-        echo "usage: vpnchain mode {chained|direct|status}" >&2
-        exit 1
-    fi
+    case "$want" in
+        chained|direct) ;;
+        *) echo "vpnchain: unknown mode '$want' (expected chained or direct)" >&2
+           exit 1 ;;
+    esac
     if [ "$cur" = unknown ]; then
         bad "could not read a wireguard endpoint from $SINGBOX_CONFIG"
         exit 1
     fi
     if [ "$cur" = "$want" ]; then
         ok "already in $want mode"
-        return
+        return 1
     fi
 
     # Edit in place rather than keeping two config files, so the keys and the
@@ -257,16 +283,23 @@ PY
     rm -f "$SINGBOX_CONFIG.bak"
     ok "config switched to $want mode"
 
-    launchctl kickstart -k "gui/$(id -u)/$SINGBOX_AGENT" 2>/dev/null \
-        || { cmd_stop >/dev/null 2>&1; cmd_start >/dev/null 2>&1; }
-    sleep 3
-    agent_running && ok "sing-box restarted" || bad "sing-box did not come back"
-
     if [ "$want" = direct ]; then
-        echo
         warn "the tunnel is now plainly a VPN on the wire: UDP straight to the"
         warn "peer address, with none of the upstream's cover traffic"
         warn "it will also fail outright on networks that block UDP or VPNs"
+    fi
+    return 0
+}
+
+# Optional [chained|direct] argument on the lifecycle verbs. A mode change
+# needs the agent reloaded, so if it is already running, restart it here -
+# otherwise cmd_start would see a live agent and leave the old config loaded.
+maybe_switch_mode() {
+    [ -z "${1:-}" ] && return 0
+    if switch_mode "$1" && agent_running; then
+        launchctl kickstart -k "gui/$(id -u)/$SINGBOX_AGENT" 2>/dev/null \
+            || { cmd_stop >/dev/null 2>&1; cmd_start >/dev/null 2>&1; }
+        ok "sing-box reloaded for the new mode"
     fi
 }
 
@@ -500,19 +533,23 @@ cmd_status() {
 }
 
 case "${1:-status}" in
-    on)      cmd_start; proxy_on; echo; cmd_status ;;
-    off)     proxy_off; echo; warn "sing-box still running; 'vpnchain stop' to shut it down too" ;;
-    start)   cmd_start ;;
+    on)      maybe_switch_mode "${2:-}"; cmd_start; proxy_on
+             echo; wait_for_chain; echo; cmd_status ;;
+    off)     proxy_off; echo
+             warn "sing-box still running; 'vpnchain stop' to shut it down too" ;;
+    start)   maybe_switch_mode "${2:-}"; cmd_start; wait_for_chain ;;
     stop)    cmd_stop ;;
-    restart) cmd_stop; cmd_start; proxy_on ;;
+             # switch_mode, not maybe_switch_mode: this verb restarts the agent
+             # itself, so reloading inside the switch would do it twice.
+    restart) if [ -n "${2:-}" ]; then switch_mode "$2" || true; fi
+             cmd_stop; cmd_start; proxy_on; echo; wait_for_chain ;;
     status)  cmd_status ;;
     webrtc)  cmd_webrtc "${2:-status}" ;;
     browser) cmd_browser ;;
-    mode)    cmd_mode "${2:-status}" ;;
     *)
-        echo "usage: vpnchain {on|off|start|stop|restart|status}"
+        echo "usage: vpnchain {on|start|restart} [chained|direct]"
+        echo "       vpnchain {off|stop|status}"
         echo "       vpnchain webrtc {block|allow|status}"
-        echo "       vpnchain mode {chained|direct|status}"
         echo "       vpnchain browser"
         exit 1
         ;;
