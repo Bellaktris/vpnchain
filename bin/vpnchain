@@ -494,8 +494,10 @@ cmd_status() {
 
     if [ "$mode" = direct ]; then
         warn "upstream hop DISABLED - WireGuard dials its peer directly"
-        echo "         faster, but the link is plainly a VPN on the wire"
-        echo "         re-enable with: vpnchain mode chained"
+        echo "         plainly a VPN on the wire, and measured slower and"
+        echo "         more variable than chained - not a speed win"
+        echo "         this persists across reboots until changed back"
+        echo "         restore with: vpnchain restart chained"
     else
         if pgrep -f "$UPSTREAM_PROCESS" >/dev/null 2>&1; then
             local pid started
