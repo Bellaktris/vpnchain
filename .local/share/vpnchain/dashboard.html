@@ -52,13 +52,14 @@
     font: 15px/1.55 ui-sans-serif, -apple-system, system-ui, sans-serif;
   }
   .wrap { max-width: 56rem; margin: 0 auto; }
-  .verdict-actions { display: flex; justify-content: flex-end; margin-top: .6rem; }
+  .verdict-actions { position: absolute; right: 1.1rem; bottom: .8rem; }
   h1 { font-size: 1.3rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
   .sub { color: var(--dim); font-size: .85rem; margin-bottom: 1.5rem; }
   .verdict {
+    position: relative;
     border: 1px solid var(--line); border-left: 3px solid var(--dim);
     background: var(--panel); border-radius: 6px;
-    padding: .9rem 1.1rem; margin-bottom: 1.5rem; font-weight: 600;
+    padding: .9rem 1.1rem; margin-bottom: 1rem; font-weight: 600;
   }
   .verdict.ok   { border-left-color: var(--ok); }
   .verdict.warn { border-left-color: var(--warn); }
@@ -79,6 +80,10 @@
   @media (max-width: 34rem) {
     ul.checks li { grid-template-columns: 1.4rem 1fr; }
     ul.checks .detail { grid-column: 2; }
+    /* Narrow enough that an overlaid button could sit on top of the last
+       check's detail text, so put it back in the flow. */
+    .verdict-actions { position: static; display: flex;
+                       justify-content: flex-end; margin-top: .6rem; }
   }
   details.sect {
     background: var(--panel); border: 1px solid var(--line);
