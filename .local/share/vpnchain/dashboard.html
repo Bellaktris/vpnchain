@@ -52,6 +52,7 @@
     font: 15px/1.55 ui-sans-serif, -apple-system, system-ui, sans-serif;
   }
   .wrap { max-width: 56rem; margin: 0 auto; }
+  .topbar { display: flex; justify-content: flex-end; margin-bottom: .6rem; }
   h1 { font-size: 1.3rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
   .sub { color: var(--dim); font-size: .85rem; margin-bottom: 1.5rem; }
   .verdict {
@@ -62,7 +63,23 @@
   .verdict.ok   { border-left-color: var(--ok); }
   .verdict.warn { border-left-color: var(--warn); }
   .verdict.bad  { border-left-color: var(--bad); }
-  .verdict small { display: block; font-weight: 400; color: var(--dim); margin-top: .3rem; }
+  .verdict .headline { display: block; }
+  ul.checks { list-style: none; margin: .7rem 0 0; padding: 0;
+              font-weight: 400; font-size: .88rem; }
+  ul.checks li { display: grid; grid-template-columns: 1.4rem 11rem 1fr;
+                 gap: .5rem; padding: .18rem 0; align-items: baseline; }
+  ul.checks .mark { font-weight: 700; text-align: center; }
+  ul.checks .mark.pass { color: var(--ok); }
+  ul.checks .mark.fail { color: var(--bad); }
+  ul.checks .mark.warn { color: var(--warn); }
+  ul.checks .mark.pend { color: var(--dim); }
+  ul.checks .what { color: var(--fg); }
+  ul.checks .detail { color: var(--dim); font-family: var(--mono);
+                      font-size: .82rem; word-break: break-word; }
+  @media (max-width: 34rem) {
+    ul.checks li { grid-template-columns: 1.4rem 1fr; }
+    ul.checks .detail { grid-column: 2; }
+  }
   section {
     background: var(--panel); border: 1px solid var(--line);
     border-radius: 6px; margin-bottom: 1rem; overflow: hidden;
@@ -81,7 +98,14 @@
   .row dt { color: var(--dim); font-size: .85rem; }
   .row dd { margin: 0; font-family: var(--mono); font-size: .85rem; word-break: break-word; }
   .note { grid-column: 1 / -1; color: var(--dim); font-size: .8rem;
-          font-family: inherit; padding-top: .15rem; }
+          font-family: inherit; padding-top: .2rem; }
+  .note summary { cursor: pointer; list-style: none; width: max-content;
+                  color: var(--dim); font-size: .75rem; opacity: .75; }
+  .note summary::-webkit-details-marker { display: none; }
+  .note summary::before { content: "+ "; font-family: var(--mono); }
+  .note[open] summary::before { content: "- "; }
+  .note summary:hover { opacity: 1; color: var(--accent); }
+  .note[open] { padding-bottom: .35rem; }
   .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
   .pend { color: var(--dim); font-style: italic; }
   .scroll { overflow-x: auto; }
@@ -102,13 +126,14 @@
 <body>
 <div class="wrap">
 
-<h1>vpnchain dashboard</h1>
-<p class="sub">
-  Measured from inside this browser. Values the shell cannot see:
-  the timezone this process was launched with, and what WebRTC really does.
-</p>
+<div class="topbar">
+  <button onclick="location.reload()">Re-run</button>
+</div>
 
-<div class="verdict" id="verdict">Measuring<small id="verdict-why">one moment</small></div>
+<div class="verdict" id="verdict">
+  <span class="headline" id="verdict-headline">Measuring</span>
+  <ul class="checks" id="checks"></ul>
+</div>
 
 <section>
   <h2>Exit</h2>
@@ -118,6 +143,10 @@
     <div class="row"><dt>Geolocation</dt><dd id="exit-geo" class="pend">checking</dd></div>
     <div class="row"><dt>Network</dt><dd id="exit-org" class="pend">checking</dd></div>
     <div class="row"><dt>Approx. location</dt><dd id="exit-where" class="pend">checking</dd></div>
+    <div class="row"><dt>Round trip observed</dt><dd id="exit-rtt" class="pend">checking</dd>
+      <details class="note"><summary>why this matters</summary>Time for this browser to complete one request through
+        the chain. Useful as a health reading, not a safety one.</details>
+    </div>
   </dl>
 </section>
 
@@ -129,9 +158,9 @@
     <div class="row"><dt>Iframe</dt><dd id="tz-iframe" class="pend">checking</dd></div>
     <div class="row"><dt>UTC offset</dt><dd id="tz-offset" class="pend">checking</dd></div>
     <div class="row"><dt>Consistency</dt><dd id="tz-consistent" class="pend">checking</dd>
-      <div class="note">A scope that disagrees means a spoof applied only to
+      <details class="note"><summary>why this matters</summary>A scope that disagrees means a spoof applied only to
         page scripts. That inconsistency is itself a stronger signal than the
-        original mismatch, and the Worker is where it shows up.</div>
+        original mismatch, and the Worker is where it shows up.</details>
     </div>
     <div class="row"><dt>Clock vs exit region</dt><dd id="tz-vsgeo" class="pend">checking</dd></div>
   </dl>
@@ -142,11 +171,11 @@
   <dl>
     <div class="row"><dt>Verdict</dt><dd id="rtc-verdict" class="pend">gathering</dd></div>
     <div class="row"><dt>Candidate types</dt><dd id="rtc-types" class="pend">gathering</dd>
-      <div class="note">A SOCKS proxy cannot carry UDP, so any
+      <details class="note"><summary>why this matters</summary>A SOCKS proxy cannot carry UDP, so any
         <code>srflx</code> or <code>host</code> address here reached the
         network outside the proxy - that is a real leak, not a policy setting.
         No candidates at all means UDP is blocked, which also breaks calls
-        without a TURN relay.</div>
+        without a TURN relay.</details>
     </div>
   </dl>
   <div class="scroll">
@@ -155,19 +184,6 @@
       <tbody id="rtc-rows"><tr><td colspan="3" class="pend">gathering</td></tr></tbody>
     </table>
   </div>
-</section>
-
-<section>
-  <h2>Transport</h2>
-  <dl>
-    <div class="row"><dt>Negotiated protocol</dt><dd id="tr-proto" class="pend">checking</dd>
-      <div class="note"><code>h2</code> or <code>http/1.1</code> is expected
-        behind a SOCKS proxy: Chrome disables QUIC when one is configured,
-        because it cannot tunnel UDP. Seeing <code>h3</code> means this
-        request went around the proxy.</div>
-    </div>
-    <div class="row"><dt>Request timing</dt><dd id="tr-timing" class="pend">checking</dd></div>
-  </dl>
 </section>
 
 <section>
@@ -181,14 +197,6 @@
     <div class="row"><dt>User agent</dt><dd id="env-ua" class="pend">-</dd></div>
   </dl>
 </section>
-
-<footer>
-  <button onclick="location.reload()">Re-run</button>
-  <span style="margin-left:.75rem">
-    Expected address comes from the URL fragment:
-    <code>#expect=&lt;address&gt;</code>
-  </span>
-</footer>
 
 </div>
 <script>
@@ -318,7 +326,7 @@ function checkExit() {
       put("exit-org", d.org || "not reported");
       put("exit-where", [d.loc, d.postal].filter(Boolean).join("  ") || "-");
 
-      describeTransport(t0, "ipinfo");
+      put("exit-rtt", Math.round(performance.now() - t0) + " ms");
       compareClockToRegion();
     })
     .catch(function (e) {
@@ -328,6 +336,7 @@ function checkExit() {
       put("exit-geo", "unavailable (" + e.message + ")", "warn");
       put("exit-org", "-");
       put("exit-where", "-");
+      put("exit-rtt", "-");
       fetch("https://api.ipify.org?format=json")
         .then(function (r) { return r.json(); })
         .then(function (d) {
@@ -335,14 +344,13 @@ function checkExit() {
           var match = expected ? d.ip === expected : null;
           put("exit-ip", d.ip, match === null ? "" : (match ? "ok" : "bad"));
           put("exit-expect", expected || "not supplied", expected ? (match ? "ok" : "bad") : "pend");
-          describeTransport(t0, "ipify");
+          put("exit-rtt", Math.round(performance.now() - t0) + " ms");
           compareClockToRegion();
         })
         .catch(function (e2) {
           put("exit-ip", "unreachable: " + e2.message, "bad");
           put("exit-expect", expected || "not supplied", "warn");
-          put("tr-proto", "no request completed", "bad");
-          put("tr-timing", "-");
+          put("exit-rtt", "no request completed", "bad");
           settle("exit");
         });
     });
@@ -359,26 +367,6 @@ function compareClockToRegion() {
   settle("exit");
 }
 
-/* --------------------------------------------------------------- transport */
-
-function describeTransport(t0, host) {
-  var ms = Math.round(performance.now() - t0);
-  put("tr-timing", ms + " ms for the address lookup");
-  var hop = null;
-  try {
-    var entries = performance.getEntriesByType("resource");
-    for (var i = entries.length - 1; i >= 0; i--) {
-      if (entries[i].name.indexOf(host) !== -1 && entries[i].nextHopProtocol) {
-        hop = entries[i].nextHopProtocol; break;
-      }
-    }
-  } catch (e) { /* timing API unavailable */ }
-  if (!hop) {
-    put("tr-proto", "not reported (cross-origin timing withheld)", "warn");
-  } else {
-    put("tr-proto", hop, hop === "h3" ? "warn" : "ok");
-  }
-}
 
 /* ------------------------------------------------------------------ webrtc */
 
@@ -487,53 +475,106 @@ function describeEnvironment() {
 
 /* ----------------------------------------------------------------- verdict */
 
+function renderChecks(items) {
+  var ul = $("checks");
+  ul.innerHTML = "";
+  items.forEach(function (it) {
+    var li = document.createElement("li");
+    var glyph = it.state === "pass" ? "\u2713"
+              : it.state === "fail" ? "\u2717"
+              : it.state === "warn" ? "!" : "\u00b7";
+    [["mark " + it.state, glyph], ["what", it.label], ["detail", it.detail]]
+      .forEach(function (pair) {
+        var sp = document.createElement("span");
+        sp.className = pair[0];
+        sp.textContent = pair[1];
+        li.appendChild(sp);
+      });
+    ul.appendChild(li);
+  });
+}
+
 function conclude() {
   var outstanding = Object.keys(pending);
-  var el = $("verdict");
+  var checks = [];
 
-  if (outstanding.length) {
-    el.className = "verdict";
-    el.firstChild.textContent = "Measuring";
-    $("verdict-why").textContent = "waiting on: " + outstanding.join(", ");
-    return;
+  // Exit. An unmeasured exit is a failure, never a pass - concluding from a
+  // partial picture is what made an earlier version announce "exit matches"
+  // while the address was still unknown.
+  if (pending.exit) {
+    checks.push({ state: "pend", label: "Exit address", detail: "measuring" });
+  } else if (!findings.exitIp) {
+    checks.push({ state: "fail", label: "Exit address",
+                  detail: "could not be determined" });
+  } else if (!expected) {
+    checks.push({ state: "warn", label: "Exit address",
+                  detail: findings.exitIp + " - nothing to compare against" });
+  } else if (findings.exitIp === expected) {
+    checks.push({ state: "pass", label: "Exit address",
+                  detail: findings.exitIp });
+  } else {
+    checks.push({ state: "fail", label: "Exit address",
+                  detail: findings.exitIp + ", expected " + expected });
   }
 
-  var problems = [], cautions = [];
-
-  // An unmeasured exit is never a pass. Saying nothing here is what let the
-  // old logic claim a match it had not checked.
-  if (!findings.exitIp) {
-    problems.push("could not determine the exit address");
-  }
-
-  if (findings.rtcLeak) problems.push("WebRTC is exposing a direct address");
-  if (expected && findings.exitIp && findings.exitIp !== expected) {
-    problems.push("exit address is " + findings.exitIp +
-                  ", not the expected " + expected);
-  }
+  // Timezone agreement across scopes.
   var seen = [findings.tzMain, findings.tzWorker, findings.tzIframe]
              .filter(Boolean);
-  if (seen.length > 1 && seen.some(function (v) { return v !== seen[0]; })) {
-    problems.push("timezone differs between scopes");
-  }
-  if (!expected) cautions.push("no expected address given, so the exit is unverified");
-  if (findings.exitTz && findings.tzMain && findings.exitTz !== findings.tzMain) {
-    cautions.push("clock region disagrees with the exit region");
+  if (pending.timezone) {
+    checks.push({ state: "pend", label: "Timezone scopes", detail: "measuring" });
+  } else if (seen.length < 2) {
+    checks.push({ state: "warn", label: "Timezone scopes",
+                  detail: "only one scope could be read" });
+  } else if (seen.every(function (v) { return v === seen[0]; })) {
+    checks.push({ state: "pass", label: "Timezone scopes",
+                  detail: seen[0] + " in all " + seen.length });
+  } else {
+    checks.push({ state: "fail", label: "Timezone scopes",
+                  detail: "disagree: " + seen.join(" / ") });
   }
 
-  if (problems.length) {
+  // Clock against where the exit actually is.
+  if (pending.exit || pending.timezone) {
+    checks.push({ state: "pend", label: "Clock vs exit", detail: "measuring" });
+  } else if (!findings.exitTz) {
+    checks.push({ state: "warn", label: "Clock vs exit",
+                  detail: "exit region unknown" });
+  } else if (findings.exitTz === findings.tzMain) {
+    checks.push({ state: "pass", label: "Clock vs exit", detail: findings.exitTz });
+  } else {
+    checks.push({ state: "warn", label: "Clock vs exit",
+                  detail: findings.tzMain + " vs " + findings.exitTz });
+  }
+
+  // WebRTC.
+  if (pending.webrtc) {
+    checks.push({ state: "pend", label: "WebRTC", detail: "gathering" });
+  } else if (findings.rtcLeak) {
+    checks.push({ state: "fail", label: "WebRTC",
+                  detail: "direct address exposed" });
+  } else if (!findings.rtcCount) {
+    checks.push({ state: "pass", label: "WebRTC",
+                  detail: "no UDP - nothing to leak" });
+  } else {
+    checks.push({ state: "pass", label: "WebRTC", detail: "relay only" });
+  }
+
+  renderChecks(checks);
+
+  var el = $("verdict");
+  var head = $("verdict-headline");
+  if (outstanding.length) {
+    el.className = "verdict";
+    head.textContent = "Measuring";
+  } else if (checks.some(function (c) { return c.state === "fail"; })) {
     el.className = "verdict bad";
-    el.firstChild.textContent = "Problems found";
-    $("verdict-why").textContent = problems.join(" - ");
-  } else if (cautions.length) {
+    head.textContent = "Problems found";
+  } else if (checks.some(function (c) { return c.state === "warn"; })) {
     el.className = "verdict warn";
-    el.firstChild.textContent = "Looks right, with caveats";
-    $("verdict-why").textContent = cautions.join(" - ");
+    head.textContent = "Looks right, with caveats";
   } else {
     el.className = "verdict ok";
-    el.firstChild.textContent = "Nothing exposed";
-    $("verdict-why").textContent =
-      "exit matches, timezone consistent across scopes, no direct WebRTC address";
+    head.textContent = "Nothing exposed";
   }
 }
 
