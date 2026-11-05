@@ -186,6 +186,8 @@
     <div class="row"><dt>HTTPS-only</dt><dd id="p-https" class="pend">checking</dd></div>
     <div class="row"><dt>Vendor telemetry</dt><dd id="p-telemetry" class="pend">checking</dd></div>
     <div class="row"><dt>Notifications</dt><dd id="p-notify" class="pend">checking</dd></div>
+    <div class="row"><dt>Background mode</dt><dd id="p-background" class="pend">checking</dd></div>
+    <div class="row"><dt>Downloads</dt><dd id="p-downloads" class="pend">checking</dd></div>
   </dl>
   <details class="note"><summary>why this matters</summary>These are
     CONFIGURED values, read at browser startup - so they describe what the
@@ -572,6 +574,15 @@ function checkHost() {
             : "sites may prompt",
           bp.notificationsBlocked ? "ok" : "warn");
 
+      put("p-background",
+          bp.backgroundMode === "0" ? "off - closing the last window quits"
+                                    : "on - the browser keeps running",
+          bp.backgroundMode === "0" ? "ok" : "warn");
+      put("p-downloads",
+          bp.downloadPrompt === "1" ? "prompt for a location"
+                                    : "save silently to Downloads",
+          bp.downloadPrompt === "1" ? "ok" : "warn");
+
       var sp = d.systemProxy || {};
       // Not managed any more, so a value here means something else set it and
       // other applications are silently riding the chain.
@@ -581,7 +592,8 @@ function checkHost() {
     .catch(function () {
       ["h-mode", "h-upstream", "h-singbox", "h-pinned", "h-incognito",
        "h-incexit", "h-sysproxy", "p-cookies", "p-webrtc", "p-incognito",
-       "p-devices", "p-https", "p-telemetry", "p-notify"]
+       "p-devices", "p-https", "p-telemetry", "p-notify",
+       "p-background", "p-downloads"]
         .forEach(function (id) {
         put(id, "no status server", "pend");
       });

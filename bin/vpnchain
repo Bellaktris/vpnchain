@@ -63,8 +63,15 @@
 #            denied (neither browser ever shipped them), HTTPS-only mode on,
 #            and vendor telemetry reduced - URL-keyed collection and metrics
 #            off, Safe Browsing at Standard rather than Enhanced so visited
-#            URLs are not sent for real-time checking. These are never
-#            relaxed, so unlike the two below there is nothing to restore.
+#            URLs are not sent for real-time checking. Notification prompts
+#            are blocked except for NOTIFY_ALLOW. Background mode is off so
+#            closing the last window really quits - this one is load-bearing,
+#            since every policy is read at startup and a browser that will
+#            not reliably quit cannot be relaunched to apply them. Downloads
+#            prompt for a location rather than landing silently.
+#
+#            These are never relaxed, so unlike the two below there is
+#            nothing to restore.
 #
 #            Third-party cookies are blocked by default too - they are the
 #            cross-site join key, and the browser does not block them on its
@@ -225,6 +232,16 @@ HTTPS_ONLY_KEY=HttpsOnlyMode
 # heavily restrict them, with an allowlist for the handful of sites where
 # notifications are the point. The list is personal, so it lives in the env
 # file; empty means block everything.
+# Chrome can keep running after its last window closes, which makes "quit"
+# non-deterministic - and every policy here is read at startup, so a launch
+# that cannot reliably restart the browser cannot apply anything. Neither
+# Safari nor Firefox persists this way.
+BACKGROUND_MODE_KEY=BackgroundModeEnabled
+
+# Chrome saves to Downloads without asking. Being asked means a drive-by
+# download cannot land unnoticed.
+DOWNLOAD_PROMPT_KEY=PromptForDownloadLocation
+
 NOTIFY_DEFAULT_KEY=DefaultNotificationsSetting
 NOTIFY_ALLOW_KEY=NotificationsAllowedForUrls
 NOTIFY_ALLOW="${NOTIFY_ALLOW:-}"
@@ -429,6 +446,9 @@ set_hardening_policies() {
     # 2 = block. The allowlist is rewritten wholesale each launch so removing
     # an entry from the env file actually removes it, rather than leaving a
     # stale permission behind.
+    defaults write "$BROWSER_DOMAIN" "$BACKGROUND_MODE_KEY" -bool false
+    defaults write "$BROWSER_DOMAIN" "$DOWNLOAD_PROMPT_KEY" -bool true
+
     defaults write "$BROWSER_DOMAIN" "$NOTIFY_DEFAULT_KEY" -int 2
     defaults delete "$BROWSER_DOMAIN" "$NOTIFY_ALLOW_KEY" 2>/dev/null
     if [ -n "$NOTIFY_ALLOW" ]; then
@@ -727,6 +747,7 @@ cmd_browser() {
 
     set_hardening_policies
     ok "device APIs denied, HTTPS-only on, vendor telemetry reduced"
+    ok "background mode off, downloads prompt for a location"
     if [ -n "$NOTIFY_ALLOW" ]; then
         ok "notifications blocked except $(printf '%s' "$NOTIFY_ALLOW" | wc -w | tr -d ' ') allowed site(s)"
     else

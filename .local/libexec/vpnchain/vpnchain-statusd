@@ -163,6 +163,8 @@ def browser_policy():
         "httpsOnly": read("HttpsOnlyMode"),
         "telemetryReduced": telemetry_off,
         "safeBrowsing": read("SafeBrowsingProtectionLevel"),
+        "backgroundMode": read("BackgroundModeEnabled"),
+        "downloadPrompt": read("PromptForDownloadLocation"),
         "notificationsBlocked": read("DefaultNotificationsSetting") == "2",
         # The value is a plist array; counting quoted entries is enough for a
         # summary and avoids dragging in a plist parser for one number.
