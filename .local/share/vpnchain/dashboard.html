@@ -52,7 +52,7 @@
     font: 15px/1.55 ui-sans-serif, -apple-system, system-ui, sans-serif;
   }
   .wrap { max-width: 56rem; margin: 0 auto; }
-  .topbar { display: flex; justify-content: flex-end; margin-bottom: .6rem; }
+  .verdict-actions { display: flex; justify-content: flex-end; margin-top: .6rem; }
   h1 { font-size: 1.3rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
   .sub { color: var(--dim); font-size: .85rem; margin-bottom: 1.5rem; }
   .verdict {
@@ -80,15 +80,20 @@
     ul.checks li { grid-template-columns: 1.4rem 1fr; }
     ul.checks .detail { grid-column: 2; }
   }
-  section {
+  details.sect {
     background: var(--panel); border: 1px solid var(--line);
-    border-radius: 6px; margin-bottom: 1rem; overflow: hidden;
+    border-radius: 6px; margin-bottom: .6rem; overflow: hidden;
   }
-  h2 {
+  details.sect > summary {
     font-size: .72rem; text-transform: uppercase; letter-spacing: .08em;
-    color: var(--dim); margin: 0; padding: .7rem 1.1rem;
-    border-bottom: 1px solid var(--line); font-weight: 600;
+    color: var(--dim); padding: .7rem 1.1rem; font-weight: 600;
+    cursor: pointer; list-style: none;
   }
+  details.sect > summary::-webkit-details-marker { display: none; }
+  details.sect > summary::before { content: "+ "; font-family: var(--mono); }
+  details.sect[open] > summary::before { content: "- "; }
+  details.sect[open] > summary { border-bottom: 1px solid var(--line); }
+  details.sect > summary:hover { color: var(--accent); }
   .row {
     display: grid; grid-template-columns: 13rem 1fr; gap: .75rem;
     padding: .5rem 1.1rem; border-bottom: 1px solid var(--line);
@@ -126,17 +131,16 @@
 <body>
 <div class="wrap">
 
-<div class="topbar">
-  <button onclick="location.reload()">Re-run</button>
-</div>
-
 <div class="verdict" id="verdict">
   <span class="headline" id="verdict-headline">Measuring</span>
   <ul class="checks" id="checks"></ul>
+  <div class="verdict-actions">
+    <button onclick="location.reload()">Re-run</button>
+  </div>
 </div>
 
-<section>
-  <h2>Exit</h2>
+<details class="sect">
+  <summary>Exit</summary>
   <dl>
     <div class="row"><dt>Address seen by sites</dt><dd id="exit-ip" class="pend">checking</dd></div>
     <div class="row"><dt>Expected</dt><dd id="exit-expect" class="pend">-</dd></div>
@@ -148,10 +152,10 @@
         the chain. Useful as a health reading, not a safety one.</details>
     </div>
   </dl>
-</section>
+</details>
 
-<section>
-  <h2>Timezone</h2>
+<details class="sect">
+  <summary>Timezone</summary>
   <dl>
     <div class="row"><dt>Main thread</dt><dd id="tz-main" class="pend">checking</dd></div>
     <div class="row"><dt>Web Worker</dt><dd id="tz-worker" class="pend">checking</dd></div>
@@ -164,10 +168,10 @@
     </div>
     <div class="row"><dt>Clock vs exit region</dt><dd id="tz-vsgeo" class="pend">checking</dd></div>
   </dl>
-</section>
+</details>
 
-<section>
-  <h2>WebRTC</h2>
+<details class="sect">
+  <summary>WebRTC</summary>
   <dl>
     <div class="row"><dt>Verdict</dt><dd id="rtc-verdict" class="pend">gathering</dd></div>
     <div class="row"><dt>Candidate types</dt><dd id="rtc-types" class="pend">gathering</dd>
@@ -184,10 +188,10 @@
       <tbody id="rtc-rows"><tr><td colspan="3" class="pend">gathering</td></tr></tbody>
     </table>
   </div>
-</section>
+</details>
 
-<section>
-  <h2>Environment</h2>
+<details class="sect">
+  <summary>Environment</summary>
   <dl>
     <div class="row"><dt>Languages</dt><dd id="env-lang" class="pend">-</dd></div>
     <div class="row"><dt>Platform</dt><dd id="env-plat" class="pend">-</dd></div>
@@ -196,7 +200,7 @@
     <div class="row"><dt>WebGL renderer</dt><dd id="env-gl" class="pend">-</dd></div>
     <div class="row"><dt>User agent</dt><dd id="env-ua" class="pend">-</dd></div>
   </dl>
-</section>
+</details>
 
 </div>
 <script>
