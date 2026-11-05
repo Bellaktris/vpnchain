@@ -169,6 +169,7 @@
     <div class="row"><dt>Incognito inbound</dt><dd id="h-incognito" class="pend">checking</dd></div>
     <div class="row"><dt>Incognito exit</dt><dd id="h-incexit" class="pend">checking</dd></div>
     <div class="row"><dt>System proxy</dt><dd id="h-sysproxy" class="pend">checking</dd></div>
+    <div class="row"><dt>Tracker blocking</dt><dd id="h-blocklist" class="pend">checking</dd></div>
   </dl>
   <details class="note"><summary>why this matters</summary>None of this is
     visible to a page on its own - it comes from the status server that serves
@@ -183,6 +184,7 @@
     <div class="row"><dt>WebRTC</dt><dd id="p-webrtc" class="pend">checking</dd></div>
     <div class="row"><dt>Incognito</dt><dd id="p-incognito" class="pend">checking</dd></div>
     <div class="row"><dt>Device APIs</dt><dd id="p-devices" class="pend">checking</dd></div>
+    <div class="row"><dt>Ad topics &amp; measurement</dt><dd id="p-adprivacy" class="pend">checking</dd></div>
     <div class="row"><dt>HTTPS-only</dt><dd id="p-https" class="pend">checking</dd></div>
     <div class="row"><dt>Vendor telemetry</dt><dd id="p-telemetry" class="pend">checking</dd></div>
     <div class="row"><dt>Notifications</dt><dd id="p-notify" class="pend">checking</dd></div>
@@ -557,8 +559,12 @@ function checkHost() {
 
       put("p-devices",
           bp.deviceApisDenied + " of " + bp.deviceApisTotal +
-          " denied (USB, Bluetooth, Serial, HID)",
+          " denied (USB, Bluetooth, Serial, HID, fonts, screens, sensors, sockets)",
           bp.deviceApisDenied === bp.deviceApisTotal ? "ok" : "warn");
+      put("p-adprivacy",
+          bp.adPrivacyOff + " of " + bp.adPrivacyTotal +
+          " off (topics, auctions, measurement)",
+          bp.adPrivacyOff === bp.adPrivacyTotal ? "ok" : "warn");
       put("p-https",
           bp.httpsOnly === "force_enabled" ? "forced" : (bp.httpsOnly || "not set"),
           bp.httpsOnly === "force_enabled" ? "ok" : "warn");
@@ -588,12 +594,32 @@ function checkHost() {
       // other applications are silently riding the chain.
       put("h-sysproxy", sp.set ? "SET -> " + sp.host + ":" + sp.port
                                : "not set", sp.set ? "warn" : "ok");
+
+      // 'referenced' is the load-bearing field. A list can be installed and
+      // current while the running config still predates it, in which case
+      // nothing is blocked - and a page cannot tell that apart from a list
+      // that simply matches nothing, because a rejected request and an
+      // unblocked one that merely failed look identical from in here.
+      var bl = d.blocklist || {};
+      if (!bl.configured) {
+        put("h-blocklist", "no list configured", "warn");
+      } else if (!bl.present) {
+        put("h-blocklist", "configured but not fetched - run: vpnchain blocklist",
+            "bad");
+      } else if (!bl.referenced) {
+        put("h-blocklist", "installed but NOT in the live config - run: " +
+            "vpnchain config && vpnchain restart", "bad");
+      } else {
+        put("h-blocklist", "active, " +
+            Math.round(bl.bytes / 1024) + " KB, updated " +
+            new Date(bl.updatedAt * 1000).toISOString().slice(0, 10), "ok");
+      }
     })
     .catch(function () {
       ["h-mode", "h-upstream", "h-singbox", "h-pinned", "h-incognito",
-       "h-incexit", "h-sysproxy", "p-cookies", "p-webrtc", "p-incognito",
-       "p-devices", "p-https", "p-telemetry", "p-notify",
-       "p-background", "p-downloads"]
+       "h-incexit", "h-sysproxy", "h-blocklist", "p-cookies", "p-webrtc",
+       "p-incognito", "p-devices", "p-adprivacy", "p-https", "p-telemetry",
+       "p-notify", "p-background", "p-downloads"]
         .forEach(function (id) {
         put(id, "no status server", "pend");
       });
@@ -727,15 +753,22 @@ function describeEnvironment() {
       (navigator.deviceMemory || navigator.deviceMemory === 0
         ? navigator.deviceMemory + " GB" : "memory not reported"));
   put("env-ua", navigator.userAgent);
+  put("env-gl", glRenderer() || "not exposed");
+}
+
+// Returns null when the
+// renderer string is not available - either because WebGL is off, or because
+// the debug extension that exposes the real adapter name is absent.
+function glRenderer() {
   try {
     var cv = document.createElement("canvas");
     var gl = cv.getContext("webgl") || cv.getContext("experimental-webgl");
-    var dbg = gl && gl.getExtension("WEBGL_debug_renderer_info");
-    put("env-gl", dbg
-      ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) + " / " +
-        gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
-      : "not exposed");
-  } catch (e) { put("env-gl", "unavailable"); }
+    if (!gl) return null;
+    var dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    if (!dbg) return null;
+    return gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) + " / " +
+           gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+  } catch (e) { return null; }
 }
 
 /* ----------------------------------------------------------------- verdict */

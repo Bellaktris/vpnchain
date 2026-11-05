@@ -56,7 +56,13 @@ def read_env(path):
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, _, v = line.partition("=")
-                out[k.strip()] = v.strip().strip('"').strip("'")
+                v = v.strip().strip('"').strip("'")
+                # The env file is SOURCED by the shell script, so writing a
+                # path as $HOME/... is correct there and arrives here as a
+                # literal. Expanding both forms keeps the two readers agreeing;
+                # without it a perfectly good path silently reads as absent,
+                # which the dashboard would report as "no list installed".
+                out[k.strip()] = os.path.expanduser(os.path.expandvars(v))
     except OSError:
         pass
     return out
@@ -111,11 +117,42 @@ def exit_through(port):
     return out if re.match(r"^[0-9a-fA-F:.]+$", out or "") else None
 
 
-def singbox_mode():
-    path = env("SINGBOX_CONFIG",
+def singbox_config_path():
+    return env("SINGBOX_CONFIG",
                os.path.expanduser("~/.config/sing-box/config.json"))
+
+
+def blocklist():
+    """Tracker rejection happens in the chain, so this is one of the few facts
+    the dashboard genuinely cannot measure for itself: a blocked request looks
+    to a page exactly like a network failure, which is the property that makes
+    the approach unattributable in the first place.
+
+    'referenced' is the one that matters. A list can be installed and current
+    while the live config still predates it, in which case nothing is being
+    blocked - and from inside the browser that is indistinguishable from a list
+    that simply does not match much."""
+    path = env("BLOCKLIST_PATH",
+               os.path.expanduser("~/.config/sing-box/blocklist.srs"))
+    configured = bool(env("BLOCKLIST_URL"))
     try:
-        with open(path) as f:
+        st = os.stat(path)
+    except OSError:
+        return {"configured": configured, "present": False, "referenced": False}
+    referenced = False
+    try:
+        with open(singbox_config_path()) as f:
+            referenced = path in f.read()
+    except OSError:
+        pass
+    return {"configured": configured, "present": True,
+            "bytes": st.st_size, "updatedAt": int(st.st_mtime),
+            "referenced": referenced, "active": referenced and configured}
+
+
+def singbox_mode():
+    try:
+        with open(singbox_config_path()) as f:
             cfg = json.load(f)
     except Exception:
         return None
@@ -153,13 +190,31 @@ def browser_policy():
     cookies = read("BlockThirdPartyCookies")
 
     device_keys = ["DefaultWebUsbGuardSetting", "DefaultWebBluetoothGuardSetting",
-                   "DefaultSerialGuardSetting", "DefaultWebHidGuardSetting"]
+                   "DefaultSerialGuardSetting", "DefaultWebHidGuardSetting",
+                   "DefaultLocalFontsSetting", "DefaultWindowManagementSetting",
+                   "DefaultSensorsSetting", "DefaultDirectSocketsSetting"]
     denied = sum(1 for k in device_keys if read(k) == "2")
     telemetry_off = (read("UrlKeyedAnonymizedDataCollectionEnabled") == "0"
                      and read("MetricsReportingEnabled") == "0")
+
+    # Reported separately from the count above because the dashboard can
+    # actually CHECK these two from inside the browser - queryLocalFonts and
+    # getScreenDetails either exist and throw or do not exist. For the rest
+    # the configured value is all anyone has.
+    fonts_denied = read("DefaultLocalFontsSetting") == "2"
+    screens_denied = read("DefaultWindowManagementSetting") == "2"
+
+    ad_keys = ["PrivacySandboxAdTopicsEnabled",
+               "PrivacySandboxSiteEnabledAdsEnabled",
+               "PrivacySandboxAdMeasurementEnabled"]
+    ad_off = sum(1 for k in ad_keys if read(k) == "0")
     return {
         "deviceApisDenied": denied,
         "deviceApisTotal": len(device_keys),
+        "localFontsDenied": fonts_denied,
+        "windowManagementDenied": screens_denied,
+        "adPrivacyOff": ad_off,
+        "adPrivacyTotal": len(ad_keys),
         "httpsOnly": read("HttpsOnlyMode"),
         "telemetryReduced": telemetry_off,
         "safeBrowsing": read("SafeBrowsingProtectionLevel"),
@@ -186,7 +241,10 @@ def collect():
     pinned = env("PROXY_PORT", "1080")
     incog = env("INCOGNITO_PORT", "1081")
     up_host = env("UPSTREAM_HOST", "127.0.0.1")
-    up_port = env("UPSTREAM_PORT", "20170")
+    # No default, for the same reason UPSTREAM_PROCESS has none below: a port
+    # identifies the upstream stack as surely as its process name does, and
+    # this file is in a public repository. The env file always supplies it.
+    up_port = env("UPSTREAM_PORT")
 
     pinned_up = port_open(host, pinned)
     incog_up = port_open(host, incog)
@@ -197,12 +255,14 @@ def collect():
         # stack in a public repo, and the env file always supplies it.
         "upstream": dict(process_info(env("UPSTREAM_PROCESS", "")) if env("UPSTREAM_PROCESS")
                          else {"running": None},
-                         port=int(up_port), listening=port_open(up_host, up_port)),
+                         port=int(up_port) if up_port else None,
+                         listening=port_open(up_host, up_port) if up_port else False),
         "singbox": dict(process_info("sing-box run"),
                         pinnedPort=int(pinned), pinnedListening=pinned_up,
                         incognitoPort=int(incog), incognitoListening=incog_up),
         "systemProxy": system_proxy(),
         "browserPolicy": browser_policy(),
+        "blocklist": blocklist(),
         "exits": {
             "expected": env("EXPECTED_EXIT_IP"),
             # Measured, not pattern-matched: the upstream exit rotates with the

@@ -47,6 +47,15 @@
 #            databases, so expect CAPTCHAs - the trade is that the session is
 #            not linked to the pinned address.
 #
+#            Its timezone is not configured but MEASURED: the upstream selects
+#            nodes by latency, so the exit country changes between launches and
+#            any fixed value would end up contradicting the address. The zone
+#            is read through that exit at launch and applied to it, so the
+#            clock agrees with wherever the session actually comes out.
+#
+#            It also takes INCOGNITO_FLAGS, for capability this instance can
+#            afford to lose and the main browser cannot.
+#
 #            A SOCKS proxy cannot carry UDP, so WebRTC would otherwise reach
 #            the network directly and expose the real address regardless of
 #            everything else here. The default launch prevents that.
@@ -97,6 +106,41 @@
 #            describes without writing anything. It is the one check the status
 #            server does not do, since a second copy of the generator there
 #            would be two things to hold in sync.
+#
+#   blocklist
+#            fetch the tracker lists named by BLOCKLIST_URL, convert them to a
+#            sing-box rule-set and install it at BLOCKLIST_PATH. Rejection then
+#            happens INSIDE the chain rather than in the browser, which is the
+#            whole point: it sits below the JS layer, so it covers Web Workers,
+#            service workers, prefetches and beacons uniformly, applies to both
+#            inbounds at once, and adds no extension for a page to detect.
+#
+#            An extension cannot match that. Content scripts cannot be injected
+#            into worker scope at all, so anything they hide on the main thread
+#            a worker still sees - which turns the measure into a signal. The
+#            network layer has no such split.
+#
+#            Several URLs may be given, space-separated; AdGuard's DNS filter
+#            format is line-based, so they are concatenated before conversion
+#            and the result is the union. The default pairing was chosen by
+#            measurement, not reputation - see the env file template.
+#
+#            The converted set is smoke-tested before it is installed: a few
+#            known trackers must match and a few domains that must keep working
+#            must not. A list that fails is discarded rather than installed,
+#            since a rule-set that blocks sign-in would be discovered as
+#            mysterious breakage long after the fetch that caused it.
+#
+#            Blocking is engaged only when the file exists AND BLOCKLIST_URL is
+#            set; sing-box refuses to start on a missing local rule-set path, so
+#            'vpnchain config' is safe to run before the first fetch.
+#
+#            Unlike an extension this has no per-site off switch - rejection is
+#            all or nothing. Blocked ads do, however, leave their bait elements
+#            visible, so the common anti-adblock test of measuring a decoy div's
+#            height sees nothing amiss; what a page can observe is that a
+#            request failed, which is indistinguishable from a firewall or a
+#            dead ad server. Unattributable, not undetectable.
 #
 # There is no 'status' verb. The dashboard is the status view - it reports the
 # chain AND what the browser actually does, which no shell command can see. In
@@ -217,9 +261,65 @@ COOKIE_KEY=BlockThirdPartyCookies
 # WebHID, having declined on security and privacy grounds, so denying them
 # here just matches their behaviour. They also enumerate hardware, which is
 # fingerprinting surface.
+#
+# The second group is enumeration surface specifically. Every one of them hands
+# a page a LIST rather than a single value, which is what makes them worth more
+# to a fingerprinter than the hardware facts they sit next to:
+#
+#   LocalFonts       queryLocalFonts() returns every installed font. The set of
+#                    fonts on a machine is close to unique, and it is the single
+#                    highest-entropy thing a browser will volunteer in one call.
+#   WindowManagement getScreenDetails() returns monitor count, sizes and
+#                    arrangement - strictly more identifying than the single
+#                    screen size it is usually lumped in with.
+#   Sensors          motion and orientation, meaningless on a desktop and free
+#                    to refuse there.
+#   DirectSockets    raw TCP/UDP from a page; nothing here should want it.
+#
+# All four are denials, never substitutions. That distinction is the whole
+# reason this is worth doing while spoofing is not: a refused API looks exactly
+# like a browser that never implemented it, whereas a faked value can be caught
+# disagreeing with itself - most cheaply by asking a Web Worker, which no
+# extension can reach.
+#
+# What this does NOT buy: fonts stay detectable by measurement. Rendering text
+# in a candidate font and comparing measureText() against the fallback needs no
+# API and no permission, and document.fonts.check() is the same story. Firefox's
+# resistFingerprinting answers that with a standard font allowlist; Chrome has
+# no equivalent and no policy that approximates one. So the gain is that a
+# script can no longer ask once and get everything - it has to probe candidates
+# it already knows to guess. Lower entropy and far more effort, not zero.
+#
+# Measured, that residue is small: Cover Your Tracks scored the recovered font
+# list at 3.49 bits, one browser in 11, near the BOTTOM of its table - while
+# the WebGL rows it sat next to scored 9.29 and 8.87. So this group is worth
+# far less than its length suggests, and the honest reading is that fonts were
+# the wrong thing to spend a pass on.
+#
+# Fonts are the only entry here with a fallback channel at all. The other seven
+# have no alternative route: refuse getScreenDetails and the monitor layout is
+# simply gone, since screen.width only ever describes the current display.
+#
+# That fallback is weaker than it looks, though, and the 3.49 bits above
+# understate what the denial is worth. Measurement RECALL IS BOUNDED BY THE
+# PROBE LIST - a script can only detect faces whose names it already thought to
+# try, while queryLocalFonts() has perfect recall and returns names nobody
+# would guess. Measured on this machine: Cover Your Tracks reported 27 fonts
+# while vpnchain-dashboard.html found 37 of its 53 candidates, same machine,
+# the whole difference being that one list includes developer faces and the
+# other does not.
+#
+# So the value of this denial scales with how unusual the installed set is. A
+# font that is uncommon but POPULAR - Adobe's library, Office fonts, the
+# well-known monospace families - appears in somebody's probe list and gets
+# measured regardless. A genuinely obscure or licensed face does not, and
+# enumeration is the only thing that would ever surface it. Keep this denied,
+# and keep it denied harder the more such fonts get installed.
 #   2 = deny, 3 = ask
 DEVICE_API_KEYS=(DefaultWebUsbGuardSetting DefaultWebBluetoothGuardSetting
-                 DefaultSerialGuardSetting DefaultWebHidGuardSetting)
+                 DefaultSerialGuardSetting DefaultWebHidGuardSetting
+                 DefaultLocalFontsSetting DefaultWindowManagementSetting
+                 DefaultSensorsSetting DefaultDirectSocketsSetting)
 
 # Plaintext over a shared exit is readable by whoever runs it, which makes
 # this worth more here than on an ordinary connection.
@@ -250,6 +350,23 @@ TELEMETRY_OFF_KEYS=(UrlKeyedAnonymizedDataCollectionEnabled MetricsReportingEnab
 SAFE_BROWSING_KEY=SafeBrowsingProtectionLevel
 SAFE_BROWSING_STANDARD=1
 
+# Topics, Protected Audience and Attribution Reporting: the in-browser ad
+# targeting and measurement APIs that were meant to replace third-party
+# cookies. Blocking the cookies without these would close the old cross-site
+# join key and leave its intended replacement wide open.
+#
+# The Privacy Sandbox programme was retired in October 2025 and third-party
+# cookies were kept instead, so this is now the worst of both arrangements -
+# the old mechanism survived AND the new one shipped. The policies outlived the
+# programme, which is what makes turning them off still possible.
+#
+# The prompt key is included so disabling the APIs does not leave a consent
+# dialog asking about features that are already off.
+AD_PRIVACY_OFF_KEYS=(PrivacySandboxAdTopicsEnabled
+                     PrivacySandboxSiteEnabledAdsEnabled
+                     PrivacySandboxAdMeasurementEnabled
+                     PrivacySandboxPromptEnabled)
+
 BROWSER_APP="${BROWSER_APP:-/Applications/Google Chrome.app}"
 BROWSER_BIN="$BROWSER_APP/Contents/MacOS/$(basename "${BROWSER_APP%.app}")"
 
@@ -271,10 +388,53 @@ SPOOF_TZ="${SPOOF_TZ:-}"
 # picking a port, and both can be in use at once.
 INCOGNITO_PORT="${INCOGNITO_PORT:-1081}"
 
-# That exit is a shared datacenter address, so UTC is the better timezone for
-# it: it is what Tor Browser and Firefox resistFingerprinting report, which
-# puts the instance in a large set rather than making it distinctive.
-INCOGNITO_TZ="${INCOGNITO_TZ:-UTC}"
+# This used to default to UTC, on the theory that reporting what Tor Browser
+# and Firefox resistFingerprinting report puts the instance in a large set.
+# Measuring it against Cover Your Tracks disproved that: UTC scored 6.78 bits,
+# one browser in 110 - worse than a populous real zone, and among a population
+# of privacy testers where UTC should have been OVER-represented if the theory
+# held. Do not restore it on that reasoning.
+#
+# Matching the zone to the exit is the right answer, but the upstream node is
+# chosen by latency, so this exit's country changes between launches - no
+# static value can stay consistent with it. It is therefore DERIVED at launch
+# from the exit actually in use (see incognito_tz), and this is only the
+# fallback for when that lookup fails.
+#
+# The fallback is a populous zone rather than UTC because when the exit is
+# unknown, consistency is not achievable and the only remaining goal is to
+# spend few bits. Deliberately not the pinned instance's zone either: the whole
+# purpose of this exit is to be unlinkable from that one, and a shared timezone
+# is a signal handed over for nothing.
+INCOGNITO_TZ="${INCOGNITO_TZ:-America/New_York}"
+
+# Set to 0 to pin INCOGNITO_TZ verbatim instead of following the exit. Exists
+# because the two are not obviously ordered: following the exit scores far
+# better on the timezone row itself - a populous real zone measured 3.85 bits
+# against UTC's 6.78 on Cover Your Tracks - and it is the only way the
+# dashboard's clock-vs-exit check can pass. Against that, a real zone paired
+# with an en-US language header is an odd COMBINATION, and joint uniqueness is
+# not what per-row bits measure. Tested: pinning UTC left the joint result
+# unique either way, so the combination was not the cause and the per-row
+# improvement stands unopposed.
+INCOGNITO_TZ_FOLLOW_EXIT="${INCOGNITO_TZ_FOLLOW_EXIT:-1}"
+
+# Extra flags for the incognito instance only. The measured case for
+# --disable-webgl: on Cover Your Tracks the WebGL hash scored 9.29 bits and the
+# vendor/renderer string 8.87, the two largest removable rows by a wide margin,
+# and one flag removes both. It is a denial rather than a substitution, and it
+# reaches Web Workers too because it disables the implementation rather than
+# patching the API - so OffscreenCanvas in a worker gets no context either.
+#
+# Not applied to the pinned instance: that one is for ordinary browsing, where
+# losing WebGL breaks maps and anything 3D, and where the dedicated residential
+# address identifies you far more precisely than any fingerprint anyway.
+#
+# Avoid --force-device-scale-factor=1 here. It was measured and it does change
+# devicePixelRatio, but it leaves screen=1512x982 at dpr=1, which is not a
+# combination real hardware produces - and an implausible pair is more
+# identifying than the honest one it replaced.
+INCOGNITO_FLAGS="${INCOGNITO_FLAGS:-}"
 
 # Only needed to force a SEPARATE browser process, which is what lets this
 # instance hold a different proxy. The session itself runs --incognito, so no
@@ -288,6 +448,20 @@ SINGBOX_CONFIG="${SINGBOX_CONFIG:-$HOME/.config/sing-box/config.json}"
 # so it must match the tag actually used in SINGBOX_CONFIG. Override in the
 # env file if yours differs.
 UPSTREAM_TAG="${UPSTREAM_TAG:-upstream}"
+
+# Tracker rejection, done in the chain rather than the browser. Space-separated
+# AdGuard-format DNS filter URLs; empty disables the feature entirely.
+BLOCKLIST_URL="${BLOCKLIST_URL:-}"
+BLOCKLIST_PATH="${BLOCKLIST_PATH:-$HOME/.config/sing-box/blocklist.srs}"
+
+# Installed only if the converted set still blocks what it should and still
+# lets through what it must. A bad list is not a cosmetic problem: it presents
+# as sign-in or payment pages mysteriously failing, days after the fetch that
+# caused it, with nothing pointing back here. Cheaper to refuse up front.
+BLOCKLIST_MUST_BLOCK=(www.google-analytics.com doubleclick.net
+                      b.scorecardresearch.com)
+BLOCKLIST_MUST_PASS=(github.com accounts.google.com fonts.gstatic.com
+                     mail.google.com cdn.jsdelivr.net)
 
 
 # The only difference between the modes in the config is whether the WireGuard
@@ -442,6 +616,9 @@ set_hardening_policies() {
         defaults write "$BROWSER_DOMAIN" "$k" -bool false
     done
     defaults write "$BROWSER_DOMAIN" "$SAFE_BROWSING_KEY" -int "$SAFE_BROWSING_STANDARD"
+    for k in "${AD_PRIVACY_OFF_KEYS[@]}"; do
+        defaults write "$BROWSER_DOMAIN" "$k" -bool false
+    done
 
     # 2 = block. The allowlist is rewritten wholesale each launch so removing
     # an entry from the env file actually removes it, rather than leaving a
@@ -504,6 +681,34 @@ wait_for_chain() {
     bad "tunnel is up but not carrying traffic after ~25s"
     echo "         check: tail ~/.config/sing-box/sing-box.err.log"
     return 1
+}
+
+# The zone the incognito exit sits in, read through that exit itself so the
+# answer describes the node actually in use. The upstream picks nodes by
+# latency, so this changes between launches and no configured value could keep
+# up; deriving it is what makes the clock agree with the address instead of
+# contradicting it.
+#
+# Prints nothing when it cannot be determined, leaving the caller to fall back.
+incognito_tz() {
+    local body tz
+    body=$(curl -s -m 10 --socks5-hostname "$PROXY_HOST:$INCOGNITO_PORT" \
+           https://ipinfo.io/json 2>/dev/null)
+    [ -z "$body" ] && return 0
+    tz=$(printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("timezone") or "")
+except Exception:
+    print("")
+' 2>/dev/null)
+    # Two checks, because a malformed TZ fails SILENTLY: the C library falls
+    # back to UTC rather than erroring, so a bad value would present as a
+    # working spoof that reports the wrong zone - the failure mode hardest to
+    # notice. Shape first, then confirm the zone actually exists on this host.
+    case "$tz" in
+        */*) [ -f "/usr/share/zoneinfo/$tz" ] && printf '%s\n' "$tz" ;;
+    esac
 }
 
 # Switch the config between chained and direct. Returns 0 if it changed.
@@ -574,6 +779,105 @@ maybe_switch_mode() {
 
 
 
+# Blocking is engaged only when a list is configured AND the converted set is
+# actually on disk. sing-box refuses to start if a local rule-set path is
+# missing, so conditioning on the file is what keeps 'vpnchain config' safe to
+# run before the first fetch - and what makes deleting the file a complete
+# off switch after the next regenerate.
+blocklist_active() { [ -n "$BLOCKLIST_URL" ] && [ -s "$BLOCKLIST_PATH" ]; }
+
+# sing-box prints the matching rule on STDERR and exits 0 whether or not
+# anything matched, so neither the exit status nor stdout distinguishes a hit
+# from a miss. The log line is the only signal.
+blocklist_blocks() {
+    case "$(sing-box rule-set match -f binary "$1" "$2" 2>&1)" in
+        *"match rules"*) return 0 ;;
+        *)               return 1 ;;
+    esac
+}
+
+# Fetch, convert, verify, install - in that order, and nothing is installed
+# until the verify passes.
+cmd_blocklist() {
+    if [ -z "$BLOCKLIST_URL" ]; then
+        bad "BLOCKLIST_URL is not set in $CONFIG - nothing to fetch"
+        echo "         set it to one or more space-separated AdGuard-format DNS"
+        echo "         filter URLs. That format is line-based, so several are"
+        echo "         concatenated and the rule-set is their union."
+        exit 1
+    fi
+    if ! command -v sing-box >/dev/null 2>&1; then
+        bad "sing-box not found - it does the conversion"
+        exit 1
+    fi
+
+    local tmp src srs u parsed d n=0 fail=0
+    tmp=$(mktemp -d -t vpnchain-blocklist) || exit 1
+    src="$tmp/source.txt"
+    srs="$tmp/blocklist.srs"
+    : > "$src"
+
+    # Deliberately unquoted: the value is a list of URLs, not one URL.
+    # shellcheck disable=SC2086
+    for u in $BLOCKLIST_URL; do
+        if ! curl -fsSL -m 180 "$u" >> "$src"; then
+            bad "could not fetch $u"
+            bad "the installed list is untouched"
+            rm -rf "$tmp"
+            exit 1
+        fi
+        # Lists do not reliably end in a newline. Without this the last rule of
+        # one would be glued to the first rule of the next and both would be
+        # silently lost - a failure that would only show as two missing entries
+        # out of two hundred thousand.
+        printf '\n' >> "$src"
+        n=$((n + 1))
+        ok "fetched $u"
+    done
+    ok "$(wc -l <"$src" | tr -d ' ') lines from $n list(s)"
+
+    parsed=$(sing-box rule-set convert -t adguard -o "$srs" "$src" 2>&1 \
+             | sed -n 's/.*parsed rules: \([0-9]*\).*/\1/p' | tail -1)
+    if [ ! -s "$srs" ]; then
+        bad "conversion produced no rule-set"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    ok "converted ${parsed:-?} rules"
+
+    for d in "${BLOCKLIST_MUST_BLOCK[@]}"; do
+        blocklist_blocks "$srs" "$d" || { bad "smoke test: $d is NOT blocked"; fail=1; }
+    done
+    for d in "${BLOCKLIST_MUST_PASS[@]}"; do
+        if blocklist_blocks "$srs" "$d"; then
+            bad "smoke test: $d WOULD be blocked"
+            fail=1
+        fi
+    done
+    if [ "$fail" = 1 ]; then
+        bad "discarding this rule-set; the installed one is untouched"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    ok "smoke test passed: ${#BLOCKLIST_MUST_BLOCK[@]} blocked, ${#BLOCKLIST_MUST_PASS[@]} reachable"
+
+    mkdir -p "$(dirname "$BLOCKLIST_PATH")"
+    if ! mv "$srs" "$BLOCKLIST_PATH"; then
+        bad "could not install $BLOCKLIST_PATH"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    rm -rf "$tmp"
+    ok "installed $BLOCKLIST_PATH ($(wc -c <"$BLOCKLIST_PATH" | tr -d ' ') bytes)"
+
+    if ! grep -q 'blocklist' "$SINGBOX_CONFIG" 2>/dev/null; then
+        warn "the live config does not reference it yet - regenerate and reload:"
+        echo "           vpnchain config && vpnchain restart"
+    elif agent_running; then
+        echo "         load the updated list with: vpnchain restart"
+    fi
+}
+
 # Any failure after the backup is taken must put the old config back, or a
 # half-written one is left in place for the next start to trip over.
 restore_config_backup() {
@@ -639,6 +943,7 @@ generate_config() {
     WG_PRIVATE_KEY="$WG_PRIVATE_KEY" WG_ADDRESS="$WG_ADDRESS" \
     WG_PEER_PUBLIC_KEY="$WG_PEER_PUBLIC_KEY" \
     WG_PEER_HOST="$WG_PEER_HOST" WG_PEER_PORT="$WG_PEER_PORT" \
+    BL="$(blocklist_active && echo "$BLOCKLIST_PATH")" \
     OUT="$out" \
     python3 - <<'PY' || { restore_config_backup; bad "generation failed"; exit 1; }
 import json, os
@@ -694,6 +999,22 @@ cfg = {
     },
 }
 
+# Tracker rejection, when a converted list is installed. Both rules go FIRST:
+# the DNS rules that follow pick a server per inbound, and the route rules that
+# follow pick an outbound per inbound, so a reject placed after either would
+# only cover one of the two exits. Placed first, it covers both.
+#
+# Rejecting in DNS alone would be enough almost always, since a name that does
+# not resolve is never dialled. The route rule covers what DNS cannot: a
+# cached answer, a literal address, or an HTTP/3 alt-svc target the browser
+# already holds. Two cheap rules, no ordering subtlety between them.
+bl = e.get("BL") or ""
+if bl:
+    cfg["dns"]["rules"].insert(0, {"rule_set": "blocklist", "action": "reject"})
+    cfg["route"]["rule_set"] = [{"type": "local", "tag": "blocklist",
+                                 "format": "binary", "path": bl}]
+    cfg["route"]["rules"].insert(0, {"rule_set": "blocklist", "action": "reject"})
+
 out = e["OUT"]
 with open(out, "w") as f:
     json.dump(cfg, f, indent=2)
@@ -747,6 +1068,8 @@ cmd_browser() {
 
     set_hardening_policies
     ok "device APIs denied, HTTPS-only on, vendor telemetry reduced"
+    ok "font, screen-layout and sensor enumeration denied"
+    ok "ad topics, ad auctions and ad measurement off"
     ok "background mode off, downloads prompt for a location"
     if [ -n "$NOTIFY_ALLOW" ]; then
         ok "notifications blocked except $(printf '%s' "$NOTIFY_ALLOW" | wc -w | tr -d ' ') allowed site(s)"
@@ -764,17 +1087,35 @@ cmd_browser() {
         # proxy, so this has to be a SEPARATE instance with its own profile -
         # it coexists with the main one rather than replacing it.
         port="$INCOGNITO_PORT"
-        tz="$INCOGNITO_TZ"
+        # Derived from the exit rather than configured - see incognito_tz.
+        if [ "$INCOGNITO_TZ_FOLLOW_EXIT" = 1 ]; then
+            tz="$(incognito_tz)"
+            if [ -n "$tz" ]; then
+                ok "timezone matched to this exit: $tz"
+            else
+                tz="$INCOGNITO_TZ"
+                warn "could not read the exit's zone - using fallback $tz"
+                warn "the clock will not match the address this session"
+            fi
+        else
+            tz="$INCOGNITO_TZ"
+            ok "timezone pinned to $tz (not following the exit)"
+            warn "the clock will not match the exit address"
+        fi
         # --incognito does the cleanup for us: nothing is persisted, so the
         # profile dir needs no wiping. --user-data-dir is still required -
         # without it --incognito just opens a window in the EXISTING browser,
         # which carries the main instance's proxy rather than this one.
         profile_args=(--user-data-dir="$INCOGNITO_PROFILE" --incognito
                       --no-first-run --no-default-browser-check)
+        # Deliberately unquoted: the value is a list of flags, not one flag.
+        # shellcheck disable=SC2206
+        [ -n "$INCOGNITO_FLAGS" ] && profile_args+=($INCOGNITO_FLAGS)
         # Remember whether one was already up: a second launch hands off to
         # it and this invocation's flags are silently discarded.
         pgrep -f "$INCOGNITO_PROFILE" >/dev/null 2>&1 && already_up=1
         ok "separate incognito instance (nothing persisted)"
+        [ -n "$INCOGNITO_FLAGS" ] && ok "extra flags: $INCOGNITO_FLAGS"
         warn "this exit is flagged as a proxy by IP databases - expect CAPTCHAs"
     else
         port="$PROXY_PORT"
@@ -956,11 +1297,13 @@ case "${1:-status}" in
              cmd_stop; cmd_start; echo; wait_for_chain ;;
     browser) shift; cmd_browser "$@" ;;
     config)  [ "${2:-}" = check ] && cmd_config_check || cmd_config ;;
+    blocklist) cmd_blocklist ;;
     *)
         echo "usage: vpnchain {start|restart} [chained|direct]"
         echo "       vpnchain stop"
         echo "       vpnchain browser [incognito|with-webrtc] [with-cookies]"
         echo "       vpnchain config [check]"
+        echo "       vpnchain blocklist"
         exit 1
         ;;
 esac
