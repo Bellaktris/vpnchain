@@ -138,6 +138,29 @@ def system_proxy():
             "port": int(port.group(1)) if port else None}
 
 
+def browser_policy():
+    """Configured, not measured. Policies are read at browser startup, so this
+    says what the NEXT launch gets - the dashboard measures what the current
+    one actually does, which is a different question."""
+    dom = env("BROWSER_DOMAIN", "com.google.Chrome")
+
+    def read(key):
+        out = run(["defaults", "read", dom, key], timeout=5)
+        return out if out else None
+
+    webrtc = read("WebRtcIPHandling") or read("WebRtcIPHandlingPolicy")
+    incog = read("IncognitoModeAvailability")
+    cookies = read("BlockThirdPartyCookies")
+    return {
+        "webrtc": webrtc,
+        "webrtcBlocked": webrtc == "disable_non_proxied_udp",
+        "incognito": incog,
+        "incognitoDisabled": incog in ("1", "2"),
+        "thirdPartyCookies": cookies,
+        "thirdPartyCookiesBlocked": cookies == "1",
+    }
+
+
 def collect():
     refresh_env()
     host = env("PROXY_HOST", "127.0.0.1")
@@ -160,6 +183,7 @@ def collect():
                         pinnedPort=int(pinned), pinnedListening=pinned_up,
                         incognitoPort=int(incog), incognitoListening=incog_up),
         "systemProxy": system_proxy(),
+        "browserPolicy": browser_policy(),
         "exits": {
             "expected": env("EXPECTED_EXIT_IP"),
             # Measured, not pattern-matched: the upstream exit rotates with the
@@ -209,6 +233,21 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, f.read(), "text/html; charset=utf-8")
             except OSError as e:
                 return self._send(500, str(e).encode(), "text/plain")
+        if path == "/cookie-probe":
+            # Served so the dashboard can embed it from the OTHER loopback
+            # name - 127.0.0.1 and localhost are different sites to the
+            # browser, so this frame is genuinely third-party and can measure
+            # whether unpartitioned cookie access is granted. Reading the
+            # policy would only say what was configured.
+            body = (b"<!doctype html><meta charset=utf-8><script>\n"
+                    b"document.cookie='probe=1;SameSite=None;Secure;path=/';\n"
+                    b"var readBack = document.cookie.indexOf('probe=1') !== -1;\n"
+                    b"function send(granted){parent.postMessage(\n"
+                    b"  {vpnchainCookieProbe:true,granted:granted,readBack:readBack},'*');}\n"
+                    b"if (document.hasStorageAccess) {\n"
+                    b"  document.hasStorageAccess().then(send).catch(function(){send(null);});\n"
+                    b"} else { send(null); }\n</script>")
+            return self._send(200, body, "text/html; charset=utf-8")
         if path == "/status.json":
             body = json.dumps(cached(), indent=2).encode()
             return self._send(200, body, "application/json")

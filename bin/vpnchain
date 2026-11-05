@@ -33,7 +33,7 @@
 # Omit it to keep whatever the config already has; the dashboard reports the
 # active mode, so there is no separate command to query it.
 #
-#   browser [incognito|with-webrtc]
+#   browser [incognito|with-webrtc] [with-cookies]
 #            quit and relaunch the browser from this shell with SPOOF_TZ and
 #            the WebRTC policy applied. Both are read only at startup, which
 #            is why this is a restart - closing windows is not enough.
@@ -57,6 +57,12 @@
 #            looks anonymous while being nothing of the sort. The incognito
 #            instance, which does change the exit, forces incognito for itself
 #            and the setting is put back immediately after it launches.
+#
+#            Third-party cookies are blocked by default too - they are the
+#            cross-site join key, and the browser does not block them on its
+#            own since that phase-out was reversed. with-cookies relaxes that
+#            for one launch and restores blocking straight afterwards, for the
+#            embedded sign-in and payment flows that need them.
 #
 #            Pass with-webrtc to relax the policy for the launch; block is
 #            restored on disk immediately afterwards. The running browser
@@ -180,6 +186,13 @@ WEBRTC_BLOCK_VALUE=disable_non_proxied_udp
 INCOGNITO_KEY=IncognitoModeAvailability
 INCOGNITO_OFF=1
 INCOGNITO_FORCED=2
+
+# Third-party cookies are the cross-site join key: the same embedded domain
+# appears on thousands of sites and recognises its own cookie each time. The
+# browser does not block them by default - that phase-out was reversed - so we
+# do it per launch. Breaks some embedded sign-in and payment flows, which is
+# what 'with-cookies' is for.
+COOKIE_KEY=BlockThirdPartyCookies
 
 BROWSER_APP="${BROWSER_APP:-/Applications/Google Chrome.app}"
 BROWSER_BIN="$BROWSER_APP/Contents/MacOS/$(basename "${BROWSER_APP%.app}")"
@@ -356,12 +369,17 @@ set_incognito_policy() {
     defaults write "$BROWSER_DOMAIN" "$INCOGNITO_KEY" -int "$1"
 }
 
+set_cookie_policy() {
+    defaults write "$BROWSER_DOMAIN" "$COOKIE_KEY" -bool "$1"
+}
+
 # The resting state both policies should be left in. Called on the normal path
 # and from a trap, so an interrupted launch cannot strand the browser with
 # incognito forced or WebRTC allowed.
 restore_policies() {
     set_webrtc block
     set_incognito_policy "$INCOGNITO_OFF"
+    set_cookie_policy true
 }
 
 set_webrtc() {
@@ -612,13 +630,14 @@ have_wg_creds() {
 cmd_browser() {
     # Flags name what you opt INTO, so the bare command cannot accidentally
     # mean "expose my real address" or "use the unlinked exit".
-    local want=block exit_kind=pinned already_up=0 a
+    local want=block exit_kind=pinned cookies=block already_up=0 a
     for a in "$@"; do
         case "$a" in
             "")             ;;
             with-webrtc)    want=allow ;;
+            with-cookies)   cookies=allow ;;
             incognito)  exit_kind=upstream ;;
-            *) echo "usage: vpnchain browser [incognito|with-webrtc]" >&2
+            *) echo "usage: vpnchain browser [incognito|with-webrtc] [with-cookies]" >&2
                exit 1 ;;
         esac
     done
@@ -694,6 +713,14 @@ cmd_browser() {
     [ "$want" = block ] && ok "webrtc policy set to block" \
                         || warn "webrtc policy relaxed for this launch"
 
+    if [ "$cookies" = block ]; then
+        set_cookie_policy true
+        ok "third-party cookies blocked"
+    else
+        set_cookie_policy false
+        warn "third-party cookies allowed for this launch"
+    fi
+
     if [ "$exit_kind" = upstream ]; then
         set_incognito_policy "$INCOGNITO_FORCED"
         ok "incognito forced for this launch"
@@ -753,6 +780,13 @@ cmd_browser() {
         echo "         this instance stays incognito for its lifetime"
     fi
 
+    if [ "$cookies" = allow ]; then
+        set_cookie_policy true
+        echo
+        ok "cookie policy restored to blocking"
+        echo "         this browser keeps them until you quit it"
+    fi
+
     if [ "$want" = allow ]; then
         set_webrtc block
         echo
@@ -769,6 +803,8 @@ cmd_browser() {
                                 || ok "exit: the pinned address"
     [ "$exit_kind" = upstream ] && ok "incognito: forced" \
                                 || ok "incognito: unavailable in this browser"
+    [ "$cookies" = block ] && ok "third-party cookies: blocked" \
+                           || bad "third-party cookies: ALLOWED - cross-site linking possible"
     if [ "$want" = block ]; then
         ok "webrtc: BLOCKED"
     else
@@ -830,7 +866,7 @@ case "${1:-status}" in
     *)
         echo "usage: vpnchain {start|restart} [chained|direct]"
         echo "       vpnchain stop"
-        echo "       vpnchain browser [incognito|with-webrtc]"
+        echo "       vpnchain browser [incognito|with-webrtc] [with-cookies]"
         echo "       vpnchain config [check]"
         exit 1
         ;;

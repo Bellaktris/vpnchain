@@ -177,6 +177,22 @@
 </details>
 
 <details class="sect">
+  <summary>Browser policy</summary>
+  <dl>
+    <div class="row"><dt>Third-party cookies</dt><dd id="p-cookies" class="pend">checking</dd></div>
+    <div class="row"><dt>WebRTC</dt><dd id="p-webrtc" class="pend">checking</dd></div>
+    <div class="row"><dt>Incognito</dt><dd id="p-incognito" class="pend">checking</dd></div>
+  </dl>
+  <details class="note"><summary>why this matters</summary>These are
+    CONFIGURED values, read at browser startup - so they describe what the
+    next launch gets, not what this browser is doing. The summary measures the
+    running browser instead, which is why cookies and WebRTC appear in both
+    places and can disagree: a policy changed since launch has not reached the
+    browser yet. Incognito is the only one with no measurable equivalent from
+    a page, so the configured value is all there is.</details>
+</details>
+
+<details class="sect">
   <summary>Exit</summary>
   <dl>
     <div class="row"><dt>Address seen by sites</dt><dd id="exit-ip" class="pend">checking</dd></div>
@@ -223,7 +239,7 @@
         network rather than the operator's head office.</details>
 </details>
 
-<details class="sect">
+<details class="sect" id="rtc-sect" hidden>
   <summary>WebRTC</summary>
   <dl>
     <div class="row"><dt>Verdict</dt><dd id="rtc-verdict" class="pend">gathering</dd></div>
@@ -302,7 +318,7 @@ var findings = { exitIp: null, exitTz: null, exitCountry: null,
 // alone concluded "exit matches" while the exit was still unknown, which is
 // the worst failure mode a tool like this can have: false reassurance.
 var pending = { timezone: true, exit: true, webrtc: true, dns: true,
-                host: true };
+                host: true, cookies: true };
 function settle(name) {
   delete pending[name];
   conclude();
@@ -439,6 +455,50 @@ function compareClockToRegion() {
 }
 
 
+/* ------------------------------------------------------------ cookie probe */
+
+// Embed a frame from the OTHER loopback name. 127.0.0.1 and localhost are
+// different sites, so the frame is genuinely third-party and can ask whether
+// it has unpartitioned cookie access. This measures the browser rather than
+// reading what was configured - the same reason WebRTC is tested with real
+// ICE gathering instead of a policy read.
+var cookieResult = "";
+
+function checkCookies() {
+  var done = false;
+  function settleOnce(text) {
+    if (done) return;
+    done = true;
+    cookieResult = text;
+    settle("cookies");
+  }
+
+  window.addEventListener("message", function (e) {
+    var d = e.data;
+    if (!d || !d.vpnchainCookieProbe) return;
+    if (d.granted === true || d.readBack === true) {
+      settleOnce("HAS access");
+    } else if (d.granted === false) {
+      settleOnce("denied");
+    } else {
+      settleOnce("inconclusive - browser did not report");
+    }
+  });
+
+  try {
+    var f = document.createElement("iframe");
+    f.style.display = "none";
+    // Deliberately the other name for this same server, to be cross-site.
+    f.src = location.origin.indexOf("127.0.0.1") !== -1
+          ? location.origin.replace("127.0.0.1", "localhost") + "/cookie-probe"
+          : location.origin.replace("localhost", "127.0.0.1") + "/cookie-probe";
+    document.body.appendChild(f);
+  } catch (e) {
+    settleOnce("could not embed the probe");
+  }
+  setTimeout(function () { settleOnce("no response from the probe"); }, 7000);
+}
+
 /* -------------------------------------------------------------------- host */
 
 // Served alongside this page by vpnchain-statusd. Same origin, so no CORS is
@@ -476,6 +536,19 @@ function checkHost() {
       put("h-incexit", ex.incognito || "unreachable",
           ex.incognito ? "" : "warn");
 
+      var bp = d.browserPolicy || {};
+      put("p-cookies",
+          bp.thirdPartyCookies === null ? "not set - the browser allows them"
+                                        : (bp.thirdPartyCookiesBlocked ? "blocked" : "allowed"),
+          bp.thirdPartyCookiesBlocked ? "ok" : "bad");
+      put("p-webrtc", bp.webrtc || "not set",
+          bp.webrtcBlocked ? "ok" : "bad");
+      put("p-incognito",
+          bp.incognito === "2" ? "forced" :
+          bp.incognito === "1" ? "disabled" :
+          bp.incognito === null ? "not set - available" : bp.incognito,
+          bp.incognitoDisabled ? "ok" : "warn");
+
       var sp = d.systemProxy || {};
       // Not managed any more, so a value here means something else set it and
       // other applications are silently riding the chain.
@@ -484,7 +557,8 @@ function checkHost() {
     })
     .catch(function () {
       ["h-mode", "h-upstream", "h-singbox", "h-pinned", "h-incognito",
-       "h-incexit", "h-sysproxy"].forEach(function (id) {
+       "h-incexit", "h-sysproxy", "p-cookies", "p-webrtc", "p-incognito"]
+        .forEach(function (id) {
         put(id, "no status server", "pend");
       });
     })
@@ -544,6 +618,10 @@ function checkWebRTC() {
     var names = Object.keys(types);
 
     $("rtc-rows").innerHTML = "";
+    // Shown only when there are candidates. With none - the healthy case for
+    // a correctly configured browser - everything here repeats the summary
+    // line, so the section would be noise.
+    $("rtc-sect").hidden = !rows.length;
     $("rtc-table").hidden = !rows.length;
     if (rows.length) {
       rows.forEach(function (r) {
@@ -759,6 +837,22 @@ function conclude() {
     put("dns-vs", findings.dnsCountry + " vs exit " + findings.exitCountry, "warn");
   }
 
+  // Third-party cookies, measured rather than read from policy.
+  if (pending.cookies) {
+    checks.push({ state: "pend", label: "3rd-party cookies", detail: "measuring" });
+  } else {
+    var m = cookieResult;
+    if (m.indexOf("denied") !== -1) {
+      checks.push({ state: "pass", label: "3rd-party cookies",
+                    detail: "blocked - no cross-site join key" });
+    } else if (m.indexOf("HAS") !== -1) {
+      checks.push({ state: "fail", label: "3rd-party cookies",
+                    detail: "allowed - sites can link you across the web" });
+    } else {
+      checks.push({ state: "warn", label: "3rd-party cookies", detail: m });
+    }
+  }
+
   // WebRTC.
   if (pending.webrtc) {
     checks.push({ state: "pend", label: "WebRTC", detail: "gathering" });
@@ -792,6 +886,7 @@ function conclude() {
 }
 
 checkHost();
+checkCookies();
 checkDns();
 readTimezone();
 describeEnvironment();
