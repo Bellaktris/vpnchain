@@ -62,7 +62,17 @@ def read_env(path):
     return out
 
 
-ENV = read_env(CONFIG)
+# Re-read per measurement rather than once at import. Read at import, a change
+# to the env file - a new expected address, a different port - would be
+# invisible until the daemon was restarted, and the dashboard would go on
+# confidently comparing against a stale expectation. The file is small and a
+# measurement already costs two network round trips.
+ENV = {}
+
+
+def refresh_env():
+    global ENV
+    ENV = read_env(CONFIG)
 
 
 def env(name, default=None):
@@ -129,6 +139,7 @@ def system_proxy():
 
 
 def collect():
+    refresh_env()
     host = env("PROXY_HOST", "127.0.0.1")
     pinned = env("PROXY_PORT", "1080")
     incog = env("INCOGNITO_PORT", "1081")
@@ -205,7 +216,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    refresh_env()
     host = "127.0.0.1"
+    # The port is the one value a reload cannot pick up, since the socket is
+    # already bound; changing it needs a restart either way.
     port = int(env("STATUS_PORT", "8787"))
     try:
         srv = HTTPServer((host, port), Handler)
