@@ -26,18 +26,14 @@
 #            plainly a VPN on the wire and dead where UDP or VPNs are filtered.
 #
 # Latency is identical between them - same peer, same ocean crossing, both
-# measured ~1.8x the bare connection. Throughput was too noisy across repeated
-# runs to call a winner; the medians favoured chained but the ranges overlap.
-# Choose on concealment, not speed. Use 'bench' with a raised BENCH_RUNS if
-# you want a defensible answer on your own link.
+# measured ~1.8x the bare connection. Throughput measurements were too noisy
+# across repeated runs to call a winner, which is why the benchmark that
+# produced them was removed rather than kept and distrusted. Choose on
+# concealment, not speed.
 #
 # Omit it to keep whatever the config already has. status reports the active
 # mode, so there is no separate command to query it.
 #
-#   bench    measure throughput layer by layer: no proxy, upstream only, and
-#            the full chain. Every listener involved is already running, so
-#            nothing is switched or restarted and this is safe to run while
-#            browsing. Override with BENCH_URL / BENCH_BYTES / BENCH_RUNS.
 #   browser [incognito|with-webrtc]
 #            quit and relaunch the browser from this shell with SPOOF_TZ and
 #            the WebRTC policy applied. Both are read only at startup, which
@@ -151,6 +147,14 @@ done
 
 PLIST="$HOME/Library/LaunchAgents/$SINGBOX_AGENT.plist"
 
+# Optional status server, started and stopped with the chain. It serves the
+# dashboard together with the host-side facts a page cannot see for itself.
+# Leave STATUSD_AGENT unset in the env file to do without it.
+STATUSD_AGENT="${STATUSD_AGENT:-}"
+STATUSD_PLIST="$HOME/Library/LaunchAgents/$STATUSD_AGENT.plist"
+STATUS_PORT="${STATUS_PORT:-8787}"
+STATUSD_BIN="$(cd "$(dirname "$0")" && pwd)/vpnchain-statusd"
+
 # Chromium-family preference domain whose WebRTC policy we toggle.
 # Override in the env file for Brave, Edge, Chromium, etc.
 BROWSER_DOMAIN="${BROWSER_DOMAIN:-com.google.Chrome}"
@@ -207,13 +211,6 @@ SINGBOX_CONFIG="${SINGBOX_CONFIG:-$HOME/.config/sing-box/config.json}"
 # env file if yours differs.
 UPSTREAM_TAG="${UPSTREAM_TAG:-upstream}"
 
-# Range-request a prefix of a large file rather than downloading something
-# whole, so the sample size is controlled. Keep it big enough that TCP slow
-# start and tunnel ramp-up do not dominate - at 2 MB the ramp swamps the
-# steady-state rate and every mode looks equally slow.
-BENCH_URL="${BENCH_URL:-https://ash-speed.hetzner.com/100MB.bin}"
-BENCH_BYTES="${BENCH_BYTES:-5000000}"
-BENCH_RUNS="${BENCH_RUNS:-2}"
 
 # The only difference between the modes in the config is whether the WireGuard
 # endpoint carries a "detour" key.
@@ -258,6 +255,7 @@ cmd_start() {
 
     if agent_running; then
         ok "sing-box already running"
+        start_statusd
         return
     fi
     launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
@@ -268,9 +266,68 @@ cmd_start() {
     else
         bad "sing-box failed to start - check its stderr log"
     fi
+    start_statusd
+}
+
+statusd_running() { pgrep -f 'vpnchain-statusd' >/dev/null 2>&1; }
+
+# Written on first use rather than shipped, since it has to carry absolute
+# paths for this machine. Writing a file that does not exist cannot lose
+# anything, which is the same reasoning as generating a missing config.
+ensure_statusd_plist() {
+    [ -f "$STATUSD_PLIST" ] && return 0
+    cat > "$STATUSD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$STATUSD_AGENT</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>$STATUSD_BIN</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict><key>STATUS_PORT</key><string>$STATUS_PORT</string></dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>$HOME/.config/vpnchain/statusd.log</string>
+    <key>StandardErrorPath</key><string>$HOME/.config/vpnchain/statusd.err.log</string>
+    <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+PLIST
+    ok "wrote $STATUSD_PLIST"
+}
+
+start_statusd() {
+    [ -z "$STATUSD_AGENT" ] && return 0
+    if [ ! -x "$STATUSD_BIN" ]; then
+        warn "status server not found at $STATUSD_BIN - skipping"
+        return 0
+    fi
+    ensure_statusd_plist
+    if statusd_running; then
+        ok "status server already running"
+    else
+        launchctl bootstrap "gui/$(id -u)" "$STATUSD_PLIST" 2>/dev/null \
+            || launchctl load -w "$STATUSD_PLIST" 2>/dev/null
+        sleep 1
+        statusd_running && ok "status server on http://127.0.0.1:$STATUS_PORT/" \
+                        || bad "status server did not start - see statusd.err.log"
+    fi
+}
+
+stop_statusd() {
+    [ -z "$STATUSD_AGENT" ] && return 0
+    launchctl bootout "gui/$(id -u)/$STATUSD_AGENT" 2>/dev/null \
+        || launchctl unload -w "$STATUSD_PLIST" 2>/dev/null
+    ok "status server stopped"
 }
 
 cmd_stop() {
+    stop_statusd
     launchctl bootout "gui/$(id -u)/$SINGBOX_AGENT" 2>/dev/null \
         || launchctl unload -w "$PLIST" 2>/dev/null
     ok "sing-box stopped"
@@ -403,59 +460,8 @@ maybe_switch_mode() {
     fi
 }
 
-# One timed transfer through a given layer. Every listener involved is already
-# running, so nothing has to be reconfigured or restarted to measure them.
-bench_one() {
-    case "$1" in
-        chain)    curl -s -m 120 --socks5-hostname "$PROXY_HOST:$PROXY_PORT" \
-                       -o /dev/null -r "0-$BENCH_BYTES" -w '%{speed_download}' \
-                       "$BENCH_URL" 2>/dev/null ;;
-        upstream) curl -s -m 120 --socks5-hostname "$UPSTREAM_HOST:$UPSTREAM_PORT" \
-                       -o /dev/null -r "0-$BENCH_BYTES" -w '%{speed_download}' \
-                       "$BENCH_URL" 2>/dev/null ;;
-        bare)     curl -s -m 120 -o /dev/null -r "0-$BENCH_BYTES" \
-                       -w '%{speed_download}' "$BENCH_URL" 2>/dev/null ;;
-    esac
-}
 
-bench_row() {
-    local label="$1" kind="$2" i v
-    printf '  %-12s' "$label"
-    for ((i = 0; i < BENCH_RUNS; i++)); do
-        v=$(bench_one "$kind")
-        if [ -z "$v" ] || [ "${v%%.*}" -lt 1000 ] 2>/dev/null; then
-            printf ' %12s' "failed"
-        else
-            printf ' %8s MB/s' "$(awk -v b="$v" 'BEGIN{printf "%.2f", b/1000000}')"
-        fi
-    done
-    echo
-}
 
-# Measures the layers as they already exist. Nothing is switched, restarted or
-# restored, so this is safe to run mid-session - including while browsing.
-cmd_bench() {
-    bold "throughput  ($((BENCH_BYTES / 1000000)) MB prefix, $BENCH_RUNS runs)"
-    echo "  target: $BENCH_URL"
-    echo "  the full chain is currently in $(singbox_mode) mode"
-    echo
-    bench_row "no proxy"   bare
-    bench_row "upstream"   upstream
-    bench_row "full chain" chain
-    echo
-    echo "  no proxy   your connection, for scale"
-    echo "  upstream   through the upstream proxy only, no WireGuard - so the"
-    echo "             gap to 'no proxy' is what the upstream hop costs"
-    echo "  full chain upstream plus the WireGuard endpoint, which is what the"
-    echo "             browser actually uses"
-    echo
-    echo "  runs vary a lot - a single slow one usually means the far end"
-    echo "  throttled a repeated range request, not that the layer is slow."
-    echo "  Compare the consistent runs, or raise BENCH_RUNS."
-    echo
-    echo "  to compare modes, switch explicitly and re-run:"
-    echo "    vpnchain restart direct && vpnchain bench"
-}
 
 # Any failure after the backup is taken must put the old config back, or a
 # half-written one is left in place for the next start to trip over.
@@ -884,10 +890,9 @@ case "${1:-status}" in
     status)  cmd_status ;;
     browser) shift; cmd_browser "$@" ;;
     config)  cmd_config ;;
-    bench)   cmd_bench ;;
     *)
         echo "usage: vpnchain {start|restart} [chained|direct]"
-        echo "       vpnchain {stop|status|bench}"
+        echo "       vpnchain {stop|status}"
         echo "       vpnchain browser [incognito|with-webrtc]"
         echo "       vpnchain config"
         exit 1

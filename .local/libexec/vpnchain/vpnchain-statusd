@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Serve the vpnchain dashboard together with the host-side status it cannot
+measure for itself.
+
+The page running in a browser can only observe what that browser's own traffic
+reveals. Process state, listening ports, the active mode and the OTHER exit are
+all out of its reach. This serves both halves from one origin.
+
+SECURITY - the three properties that make this safe, in order of importance:
+
+  1. Strictly read-only. No endpoint performs an action. An endpoint that
+     launched browsers or restarted agents would be a genuine local privilege
+     escalation surface, because CORS prevents a malicious page from READING a
+     response but not from SENDING the request. Nothing here acts, so a request
+     forged by another page accomplishes nothing.
+
+  2. No CORS headers, ever. The dashboard is served from this same origin, so
+     it needs none. Adding "Access-Control-Allow-Origin: *" would let any site
+     you visit read your exit address and chain state.
+
+  3. Bound to loopback, and the real address is deliberately NOT reported.
+     Nothing here needs it, and not collecting it means it cannot leak.
+
+Config drift against the env file stays a CLI concern: checking it means
+rendering the generated config, and keeping a second copy of the generator
+here would be two things to hold in sync.
+"""
+
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PAGE = os.path.join(HERE, "vpnchain-dashboard.html")
+CONFIG = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "vpnchain", "env")
+
+CACHE_TTL = 15          # exits need a request each; do not re-measure per reload
+PROBE_URL = "https://api.ipify.org"
+
+
+def read_env(path):
+    """Shell-style KEY=VALUE, which is what the env file is."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+ENV = read_env(CONFIG)
+
+
+def env(name, default=None):
+    return ENV.get(name, default)
+
+
+def port_open(host, port, timeout=1.0):
+    try:
+        with socket.create_connection((host, int(port)), timeout):
+            return True
+    except OSError:
+        return False
+
+
+def run(cmd, timeout=20):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.stdout.strip()
+    except Exception:
+        return ""
+
+
+def process_info(pattern):
+    pid = run(["pgrep", "-f", pattern]).split("\n")[0].strip()
+    if not pid:
+        return {"running": False}
+    started = run(["ps", "-o", "lstart=", "-p", pid])
+    return {"running": True, "pid": int(pid),
+            "since": re.sub(r"\s+", " ", started) or None}
+
+
+def exit_through(port):
+    """The address a request leaving by this inbound presents."""
+    out = run(["curl", "-s", "-m", "12", "--socks5-hostname",
+               "%s:%s" % (env("PROXY_HOST", "127.0.0.1"), port), PROBE_URL])
+    return out if re.match(r"^[0-9a-fA-F:.]+$", out or "") else None
+
+
+def singbox_mode():
+    path = env("SINGBOX_CONFIG",
+               os.path.expanduser("~/.config/sing-box/config.json"))
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    wg = next((e for e in cfg.get("endpoints", [])
+               if e.get("type") == "wireguard"), None)
+    if wg is None:
+        return None
+    return "chained" if wg.get("detour") else "direct"
+
+
+def system_proxy():
+    out = run(["scutil", "--proxy"])
+    enabled = re.search(r"SOCKSEnable\s*:\s*(\d+)", out)
+    if not enabled or enabled.group(1) != "1":
+        return {"set": False}
+    host = re.search(r"SOCKSProxy\s*:\s*(\S+)", out)
+    port = re.search(r"SOCKSPort\s*:\s*(\d+)", out)
+    return {"set": True,
+            "host": host.group(1) if host else None,
+            "port": int(port.group(1)) if port else None}
+
+
+def collect():
+    host = env("PROXY_HOST", "127.0.0.1")
+    pinned = env("PROXY_PORT", "1080")
+    incog = env("INCOGNITO_PORT", "1081")
+    up_host = env("UPSTREAM_HOST", "127.0.0.1")
+    up_port = env("UPSTREAM_PORT", "20170")
+
+    pinned_up = port_open(host, pinned)
+    incog_up = port_open(host, incog)
+
+    return {
+        "mode": singbox_mode(),
+        "upstream": dict(process_info(env("UPSTREAM_PROCESS", "v2raya_core")),
+                         port=int(up_port), listening=port_open(up_host, up_port)),
+        "singbox": dict(process_info("sing-box run"),
+                        pinnedPort=int(pinned), pinnedListening=pinned_up,
+                        incognitoPort=int(incog), incognitoListening=incog_up),
+        "systemProxy": system_proxy(),
+        "exits": {
+            "expected": env("EXPECTED_EXIT_IP"),
+            # Measured, not pattern-matched: the upstream exit rotates with the
+            # node, so a prefix would go stale.
+            "pinned": exit_through(pinned) if pinned_up else None,
+            "incognito": exit_through(incog) if incog_up else None,
+        },
+        "measuredAt": int(time.time()),
+    }
+
+
+_cache = {"at": 0, "data": None}
+_lock = threading.Lock()
+
+
+def cached():
+    with _lock:
+        if _cache["data"] and time.time() - _cache["at"] < CACHE_TTL:
+            return _cache["data"]
+    data = collect()
+    with _lock:
+        _cache.update(at=time.time(), data=data)
+    return data
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "vpnchain-statusd"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        # Deliberately no Access-Control-Allow-Origin. The dashboard is served
+        # from here, so it is same-origin; anything else must not read this.
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
+            try:
+                with open(PAGE, "rb") as f:
+                    return self._send(200, f.read(), "text/html; charset=utf-8")
+            except OSError as e:
+                return self._send(500, str(e).encode(), "text/plain")
+        if path == "/status.json":
+            body = json.dumps(cached(), indent=2).encode()
+            return self._send(200, body, "application/json")
+        self._send(404, b"not found", "text/plain")
+
+
+def main():
+    host = "127.0.0.1"
+    port = int(env("STATUS_PORT", "8787"))
+    try:
+        srv = HTTPServer((host, port), Handler)
+    except OSError as e:
+        print("vpnchain-statusd: cannot bind %s:%s - %s" % (host, port, e),
+              file=sys.stderr)
+        return 1
+    print("vpnchain-statusd: http://%s:%s/" % (host, port), flush=True)
+    srv.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

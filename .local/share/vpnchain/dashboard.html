@@ -25,11 +25,9 @@
 
       vpnchain-dashboard.html#expect=203.0.113.9
 
-  The incognito instance exits elsewhere on purpose, and that address rotates
-  with the upstream node, so give it a prefix and it is reported rather than
-  flagged:
-
-      ...#expect=203.0.113.9&incognito=198.51.100.
+  Served by vpnchain-statusd the expectation comes from the env file instead,
+  and that host-side status - mode, ports, process state, the other exit -
+  fills the Chain section. The fragment still wins when given.
 
   Fragments are never sent anywhere, and here there is no server to send them
   to. Keep it in a bookmark.
@@ -162,6 +160,23 @@
 </div>
 
 <details class="sect">
+  <summary>Chain</summary>
+  <dl>
+    <div class="row"><dt>Mode</dt><dd id="h-mode" class="pend">checking</dd></div>
+    <div class="row"><dt>Upstream proxy</dt><dd id="h-upstream" class="pend">checking</dd></div>
+    <div class="row"><dt>sing-box</dt><dd id="h-singbox" class="pend">checking</dd></div>
+    <div class="row"><dt>Pinned inbound</dt><dd id="h-pinned" class="pend">checking</dd></div>
+    <div class="row"><dt>Incognito inbound</dt><dd id="h-incognito" class="pend">checking</dd></div>
+    <div class="row"><dt>Incognito exit</dt><dd id="h-incexit" class="pend">checking</dd></div>
+    <div class="row"><dt>System proxy</dt><dd id="h-sysproxy" class="pend">checking</dd></div>
+  </dl>
+  <details class="note"><summary>why this matters</summary>None of this is
+    visible to a page on its own - it comes from the status server that serves
+    this file. Opened as a bare file with no server running, this section is
+    empty and the rest still works.</details>
+</details>
+
+<details class="sect">
   <summary>Exit</summary>
   <dl>
     <div class="row"><dt>Address seen by sites</dt><dd id="exit-ip" class="pend">checking</dd></div>
@@ -259,17 +274,21 @@ function fragment(name) {
   return m ? decodeURIComponent(m[1]) : null;
 }
 
-var expected = fragment("expect");
+// Fragment wins when given, so a bookmark can pin an expectation without the
+// server; otherwise the server supplies it from the env file.
+var expectedFragment = fragment("expect");
 
-// The incognito instance exits elsewhere by design, and its address rotates
-// with the upstream node - so this matches on a prefix. Without it the page
-// cries "wrong exit" at a browser behaving exactly as intended.
-var expectedIncognito = fragment("incognito");
+function effectiveExpected() {
+  if (expectedFragment) return expectedFragment;
+  return (hostData && hostData.exits && hostData.exits.expected) || null;
+}
 
-function addressMatches(addr, pattern) {
-  if (!addr || !pattern) return false;
-  return pattern.slice(-1) === "." ? addr.indexOf(pattern) === 0
-                                   : addr === pattern;
+// The incognito instance exits elsewhere on purpose and its address rotates
+// with the upstream node, so this is MEASURED by the server rather than
+// pattern-matched. Without it the page cries "wrong exit" at a browser
+// behaving exactly as intended.
+function effectiveIncognito() {
+  return (hostData && hostData.exits && hostData.exits.incognito) || null;
 }
 
 var findings = { exitIp: null, exitTz: null, exitCountry: null,
@@ -282,7 +301,8 @@ var findings = { exitIp: null, exitTz: null, exitCountry: null,
 // "Measuring" until all of them have. Without this gate the timezone check
 // alone concluded "exit matches" while the exit was still unknown, which is
 // the worst failure mode a tool like this can have: false reassurance.
-var pending = { timezone: true, exit: true, webrtc: true, dns: true };
+var pending = { timezone: true, exit: true, webrtc: true, dns: true,
+                host: true };
 function settle(name) {
   delete pending[name];
   conclude();
@@ -374,11 +394,7 @@ function checkExit() {
       findings.exitTz = d.timezone || null;
       findings.exitCountry = d.country || null;
 
-      var match = expected ? d.ip === expected : null;
-      put("exit-ip", d.ip, match === null ? "" : (match ? "ok" : "bad"));
-      put("exit-expect",
-          expected || "not supplied (add #expect=<address>)",
-          expected ? (match ? "ok" : "bad") : "pend");
+      put("exit-ip", d.ip);
       put("exit-geo", [d.city, d.region, d.country].filter(Boolean).join(", ")
                       || "not reported");
       put("exit-org", d.org || "not reported");
@@ -399,15 +415,12 @@ function checkExit() {
         .then(function (r) { return r.json(); })
         .then(function (d) {
           findings.exitIp = d.ip;
-          var match = expected ? d.ip === expected : null;
-          put("exit-ip", d.ip, match === null ? "" : (match ? "ok" : "bad"));
-          put("exit-expect", expected || "not supplied", expected ? (match ? "ok" : "bad") : "pend");
+          put("exit-ip", d.ip);
           put("exit-rtt", Math.round(performance.now() - t0) + " ms");
           compareClockToRegion();
         })
         .catch(function (e2) {
           put("exit-ip", "unreachable: " + e2.message, "bad");
-          put("exit-expect", expected || "not supplied", "warn");
           put("exit-rtt", "no request completed", "bad");
           settle("exit");
         });
@@ -425,6 +438,58 @@ function compareClockToRegion() {
   settle("exit");
 }
 
+
+/* -------------------------------------------------------------------- host */
+
+// Served alongside this page by vpnchain-statusd. Same origin, so no CORS is
+// involved; opened as a bare file the fetch simply fails and the section says
+// so rather than the page breaking.
+var hostData = null;
+
+function checkHost() {
+  fetch("/status.json", { cache: "no-store" })
+    .then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    })
+    .then(function (d) {
+      hostData = d;
+      put("h-mode", d.mode || "unknown", d.mode ? "" : "warn");
+
+      var u = d.upstream || {};
+      put("h-upstream", u.running
+            ? "running, pid " + u.pid + ", port " + u.port +
+              (u.listening ? "" : " NOT listening")
+            : "not running",
+          u.running && u.listening ? "ok" : "bad");
+
+      var b = d.singbox || {};
+      put("h-singbox", b.running ? "running, pid " + b.pid : "not running",
+          b.running ? "ok" : "bad");
+      put("h-pinned", b.pinnedPort + (b.pinnedListening ? " listening" : " NOT listening"),
+          b.pinnedListening ? "ok" : "bad");
+      put("h-incognito", b.incognitoPort +
+            (b.incognitoListening ? " listening" : " NOT listening"),
+          b.incognitoListening ? "ok" : "warn");
+
+      var ex = d.exits || {};
+      put("h-incexit", ex.incognito || "unreachable",
+          ex.incognito ? "" : "warn");
+
+      var sp = d.systemProxy || {};
+      // Not managed any more, so a value here means something else set it and
+      // other applications are silently riding the chain.
+      put("h-sysproxy", sp.set ? "SET -> " + sp.host + ":" + sp.port
+                               : "not set", sp.set ? "warn" : "ok");
+    })
+    .catch(function () {
+      ["h-mode", "h-upstream", "h-singbox", "h-pinned", "h-incognito",
+       "h-incexit", "h-sysproxy"].forEach(function (id) {
+        put(id, "no status server", "pend");
+      });
+    })
+    .then(function () { settle("host"); });
+}
 
 /* --------------------------------------------------------------------- dns */
 
@@ -583,22 +648,34 @@ function renderChecks(items) {
 function conclude() {
   var outstanding = Object.keys(pending);
   var checks = [];
+  var exp = effectiveExpected();
+  var inc = effectiveIncognito();
+
+  // Render the Exit rows here rather than in the probe: the expectation can
+  // arrive from the status server after the address has been measured.
+  if (!pending.exit && !pending.host) {
+    var cls = !findings.exitIp ? "bad"
+            : (exp && findings.exitIp === exp) ? "ok"
+            : (inc && findings.exitIp === inc) ? "warn" : "bad";
+    if (findings.exitIp) put("exit-ip", findings.exitIp, cls);
+    put("exit-expect", exp || "not supplied", exp ? cls : "pend");
+  }
 
   // Exit. An unmeasured exit is a failure, never a pass - concluding from a
   // partial picture is what made an earlier version announce "exit matches"
   // while the address was still unknown.
-  if (pending.exit) {
+  if (pending.exit || pending.host) {
     checks.push({ state: "pend", label: "Exit address", detail: "measuring" });
   } else if (!findings.exitIp) {
     checks.push({ state: "fail", label: "Exit address",
                   detail: "could not be determined" });
-  } else if (!expected && !expectedIncognito) {
+  } else if (!exp && !inc) {
     checks.push({ state: "warn", label: "Exit address",
                   detail: findings.exitIp + " - nothing to compare against" });
-  } else if (addressMatches(findings.exitIp, expected)) {
+  } else if (exp && findings.exitIp === exp) {
     checks.push({ state: "pass", label: "Exit address",
                   detail: findings.exitIp + " - pinned exit" });
-  } else if (addressMatches(findings.exitIp, expectedIncognito)) {
+  } else if (inc && findings.exitIp === inc) {
     // A known exit, just not the pinned one. Correct in the incognito
     // instance, wrong in the everyday one - and the page cannot tell which it
     // is running in, so it reports rather than judges.
@@ -606,8 +683,7 @@ function conclude() {
                   detail: findings.exitIp + " - incognito exit" });
   } else {
     checks.push({ state: "fail", label: "Exit address",
-                  detail: findings.exitIp + ", expected " +
-                          (expected || expectedIncognito) });
+                  detail: findings.exitIp + ", expected " + (exp || inc) });
   }
 
   // Timezone agreement across scopes.
@@ -637,6 +713,26 @@ function conclude() {
   } else {
     checks.push({ state: "warn", label: "Clock vs exit",
                   detail: findings.tzMain + " vs " + findings.exitTz });
+  }
+
+  // Chain components, when a status server is there to report them.
+  if (pending.host) {
+    checks.push({ state: "pend", label: "Chain", detail: "measuring" });
+  } else if (!hostData) {
+    checks.push({ state: "warn", label: "Chain",
+                  detail: "no status server - host state unknown" });
+  } else {
+    var up = hostData.upstream || {}, sb = hostData.singbox || {};
+    var broken = [];
+    if (!up.running || !up.listening) broken.push("upstream");
+    if (!sb.running || !sb.pinnedListening) broken.push("sing-box");
+    if (broken.length) {
+      checks.push({ state: "fail", label: "Chain",
+                    detail: broken.join(" and ") + " not healthy" });
+    } else {
+      checks.push({ state: "pass", label: "Chain",
+                    detail: (hostData.mode || "?") + " mode, all links up" });
+    }
   }
 
   // DNS. Anycast makes a mismatch suggestive rather than conclusive, so a
@@ -695,6 +791,7 @@ function conclude() {
   }
 }
 
+checkHost();
 checkDns();
 readTimezone();
 describeEnvironment();
