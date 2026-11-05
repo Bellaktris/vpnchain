@@ -102,10 +102,13 @@
   .row {
     display: grid; grid-template-columns: 13rem 1fr; gap: .75rem;
     padding: .5rem 1.1rem; border-bottom: 1px solid var(--line);
-    align-items: baseline;
+    /* stretch, not baseline, so the label's right border spans the full row
+       height instead of being a stub the height of one line of text */
+    align-items: stretch;
   }
   .row:last-child { border-bottom: 0; }
-  .row dt { color: var(--dim); font-size: .85rem; text-align: right; }
+  .row dt { color: var(--dim); font-size: .85rem; text-align: right;
+            border-right: 1px solid var(--line); padding-right: .75rem; }
   .row dd { margin: 0; font-family: var(--mono); font-size: .85rem;
             word-break: break-word; text-align: center; }
   .note { grid-column: 1 / -1; color: var(--dim); font-size: .8rem;
@@ -137,6 +140,7 @@
        their values. */
     .row { grid-template-columns: 1fr; gap: .1rem; }
     .row dt, .row dd { text-align: left; }
+    .row dt { border-right: 0; padding-right: 0; }
   }
 </style>
 </head>
@@ -194,10 +198,10 @@
         without a TURN relay.</details>
     </div>
   </dl>
-  <div class="scroll">
+  <div class="scroll" id="rtc-table" hidden>
     <table>
-      <thead><tr><th>type</th><th>address</th><th>protocol</th></tr></thead>
-      <tbody id="rtc-rows"><tr><td colspan="3" class="pend">gathering</td></tr></tbody>
+      <thead id="rtc-head" hidden><tr><th>type</th><th>address</th><th>protocol</th></tr></thead>
+      <tbody id="rtc-rows"></tbody>
     </table>
   </div>
 </details>
@@ -407,10 +411,8 @@ function checkWebRTC() {
     var names = Object.keys(types);
 
     $("rtc-rows").innerHTML = "";
-    if (!rows.length) {
-      $("rtc-rows").innerHTML =
-        '<tr><td colspan="3">no candidates gathered</td></tr>';
-    } else {
+    $("rtc-table").hidden = !rows.length;
+    if (rows.length) {
       rows.forEach(function (r) {
         var tr = document.createElement("tr");
         [r.type, r.address, r.protocol].forEach(function (v) {
