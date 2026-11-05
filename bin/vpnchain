@@ -78,19 +78,26 @@
 #
 # The trade is that this fails OPEN, not safe: a browser started from the Dock
 # or Spotlight carries no proxy flag and browses on your real address. Nothing
-# prevents that; status reports it, which is detection rather than prevention.
+# prevents that.
+#
+# Browser-side facts are NOT reported here. The shell cannot see them: macOS
+# hides other processes' environments, so the timezone a running browser was
+# launched with is unreadable, and no process inspection reveals whether
+# WebRTC is actually leaking. vpnchain-dashboard.html, alongside this script,
+# measures all of it from inside the browser - open it as a plain file in the
+# browser you want to inspect:
+#
+#     file://<this directory>/vpnchain-dashboard.html#expect=<exit address>
+#
+# Worth setting as the browser's startup page. Then any launch, including one
+# from the Dock that carries no proxy flag, shows you immediately whether you
+# are on the expected address - which restores passive detection in the only
+# place that can actually observe it.
 
 set -uo pipefail
 
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/env"
 
-# What `vpnchain browser` launched the browser with. macOS hides other
-# processes' environments, so the running browser's timezone cannot be read
-# back - the alternative would be a remote-debugging port, which lets any
-# local process drive the browser. Recording provenance instead keeps that
-# attack surface closed, at the cost of only knowing about browsers this
-# script started.
-STATE="${CONFIG%/env}/browser.state"
 
 if [ ! -r "$CONFIG" ]; then
     cat >&2 <<EOF
@@ -658,9 +665,6 @@ cmd_browser() {
     sleep 3
 
     if [ "$exit_kind" = upstream ]; then
-        # Deliberately not recorded in STATE: that tracks the main browser, and
-        # overwriting it would make status report the throwaway instance as if
-        # it were your everyday one.
         # Not the launcher pid: if an instance with this profile is already
         # running, the launch hands off to it and the launcher exits at once,
         # which would read as a failure. Ask whether the instance exists.
@@ -676,18 +680,8 @@ cmd_browser() {
         fi
     elif browser_running; then
         ok "browser started (pid $bpid)"
-        # Record what this launch applied, so status can tell a browser we
-        # configured from one started some other way - and so the on-disk
-        # policy being restored below does not make status lie about what
-        # the running browser is actually doing.
-        printf 'PID=%s
-TZ=%s
-WEBRTC=%s
-' "$bpid" "$tz" \
-            "$([ "$want" = block ] && echo blocked || echo allowed)" > "$STATE"
     else
         bad "browser did not come up"
-        rm -f "$STATE"
     fi
 
     # Put the protective policy back immediately. The running browser already
@@ -715,8 +709,9 @@ WEBRTC=%s
     fi
     if [ -n "$tz" ]; then
         ok "timezone: $tz"
-        echo "         verify in the console:"
-        echo "         Intl.DateTimeFormat().resolvedOptions().timeZone"
+        echo "         confirm with vpnchain-dashboard.html - it measures the"
+        echo "         main thread, a Worker and an iframe, which is what"
+        echo "         distinguishes a real spoof from a cosmetic one"
     else
         warn "timezone: system default"
     fi
@@ -792,63 +787,6 @@ cmd_status() {
         echo "         clear it in System Settings > Network > Proxies"
     else
         ok "not set - only browsers launched by vpnchain are proxied"
-    fi
-
-    echo
-    # One section, not two. The configured values are only interesting as
-    # PENDING state - once a browser is running, what it actually got is what
-    # matters, and printing both invites reading the wrong one.
-    local cur_webrtc s_pid s_tz s_webrtc
-    cur_webrtc=$(webrtc_state)
-    s_pid=""; s_tz=""; s_webrtc=""
-    if [ -r "$STATE" ]; then
-        s_pid=$(sed -n 's/^PID=//p'       "$STATE")
-        s_tz=$(sed -n  's/^TZ=//p'        "$STATE")
-        s_webrtc=$(sed -n 's/^WEBRTC=//p' "$STATE")
-    fi
-
-    # A recorded pid only means something if it is still alive AND still the
-    # browser - pids get recycled.
-    if [ -n "$s_pid" ] && kill -0 "$s_pid" 2>/dev/null \
-       && ps -p "$s_pid" -o command= 2>/dev/null | grep -qF "$BROWSER_BIN"; then
-        bold "browser (pid $s_pid, started by vpnchain)"
-
-        if [ "$s_webrtc" = "$cur_webrtc" ]; then
-            [ "$s_webrtc" = blocked ] \
-                && ok "webrtc: blocked from non-proxied UDP" \
-                || bad "webrtc: ALLOWED - any page can read your real address"
-        else
-            bad "webrtc: $s_webrtc in this session, config now $cur_webrtc"
-            echo "         the policy is read at startup only"
-            echo "         restart to apply: vpnchain browser"
-        fi
-
-        if [ "$s_tz" = "$SPOOF_TZ" ]; then
-            [ -n "$s_tz" ] && ok "timezone: $s_tz" \
-                           || warn "timezone: system default"
-        else
-            bad "timezone: ${s_tz:-system default} in this session, config now ${SPOOF_TZ:-unset}"
-            echo "         restart to apply: vpnchain browser"
-        fi
-
-    elif browser_running; then
-        bold "browser (running, NOT started by vpnchain)"
-        bad "nothing from this config is applied to it"
-        echo "         no timezone spoof, no proxy flag - it is browsing on"
-        echo "         your real address - and its webrtc policy may predate"
-        echo "         your last change"
-        echo "         relaunch with: vpnchain browser"
-
-    else
-        bold "browser (not running)"
-        if [ "$cur_webrtc" = blocked ]; then
-            ok "next launch: webrtc blocked, exit $PROXY_HOST:$PROXY_PORT"
-        else
-            bad "next launch: webrtc ALLOWED - real address would be exposed"
-            echo "         fix with: vpnchain browser   (sets block, then launches)"
-        fi
-        [ -n "$SPOOF_TZ" ] && ok "next launch: timezone $SPOOF_TZ" \
-                           || warn "next launch: system timezone (SPOOF_TZ unset)"
     fi
 
     echo

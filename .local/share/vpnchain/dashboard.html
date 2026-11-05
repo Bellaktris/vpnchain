@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vpnchain dashboard</title>
+<!--
+  Reports what THIS browser actually does, measured from inside it.
+
+  Open it as a plain file - file:///path/to/vpnchain-dashboard.html - in the
+  browser you want to inspect. No server and no helper process: Chrome treats
+  file:// as a secure context, so blob Workers, RTCPeerConnection and
+  cross-origin requests to CORS-* endpoints all work from here. Verified, not
+  assumed.
+
+  This exists because the shell cannot see these things. macOS hides other
+  processes' environments, so `vpnchain status` cannot read the timezone a
+  running browser was launched with, and no amount of process inspection
+  reveals whether WebRTC is actually leaking. A page running in the browser
+  measures all of it directly - including in a Web Worker, which is the scope
+  extension-based spoofers cannot reach and therefore the one that catches a
+  cosmetic timezone spoof.
+
+  Deliberately free of site-specific values so it can live in a public repo.
+  Pass the address you expect to see as a fragment:
+
+      vpnchain-dashboard.html#expect=203.0.113.9
+
+  Fragments are never sent anywhere, and here there is no server to send them
+  to. Keep it in a bookmark.
+-->
+<style>
+  :root {
+    --bg: #fbfbfa; --panel: #fff; --fg: #1a1a1a; --dim: #6b6b6b;
+    --line: #e4e4e1; --ok: #15803d; --warn: #a16207; --bad: #b91c1c;
+    --accent: #1d4ed8; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161a; --panel: #1b1e24; --fg: #e8e8e6; --dim: #9aa0a8;
+      --line: #2b3038; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+      --accent: #7aa2f7;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14161a; --panel: #1b1e24; --fg: #e8e8e6; --dim: #9aa0a8;
+    --line: #2b3038; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+    --accent: #7aa2f7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1.25rem 4rem; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 ui-sans-serif, -apple-system, system-ui, sans-serif;
+  }
+  .wrap { max-width: 56rem; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  .sub { color: var(--dim); font-size: .85rem; margin-bottom: 1.5rem; }
+  .verdict {
+    border: 1px solid var(--line); border-left: 3px solid var(--dim);
+    background: var(--panel); border-radius: 6px;
+    padding: .9rem 1.1rem; margin-bottom: 1.5rem; font-weight: 600;
+  }
+  .verdict.ok   { border-left-color: var(--ok); }
+  .verdict.warn { border-left-color: var(--warn); }
+  .verdict.bad  { border-left-color: var(--bad); }
+  .verdict small { display: block; font-weight: 400; color: var(--dim); margin-top: .3rem; }
+  section {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; margin-bottom: 1rem; overflow: hidden;
+  }
+  h2 {
+    font-size: .72rem; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); margin: 0; padding: .7rem 1.1rem;
+    border-bottom: 1px solid var(--line); font-weight: 600;
+  }
+  .row {
+    display: grid; grid-template-columns: 13rem 1fr; gap: .75rem;
+    padding: .5rem 1.1rem; border-bottom: 1px solid var(--line);
+    align-items: baseline;
+  }
+  .row:last-child { border-bottom: 0; }
+  .row dt { color: var(--dim); font-size: .85rem; }
+  .row dd { margin: 0; font-family: var(--mono); font-size: .85rem; word-break: break-word; }
+  .note { grid-column: 1 / -1; color: var(--dim); font-size: .8rem;
+          font-family: inherit; padding-top: .15rem; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .pend { color: var(--dim); font-style: italic; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .8rem; }
+  th, td { text-align: left; padding: .35rem 1.1rem; font-family: var(--mono); }
+  th { color: var(--dim); font-weight: 600; font-family: inherit; font-size: .75rem; }
+  tbody tr { border-top: 1px solid var(--line); }
+  button {
+    font: inherit; font-size: .85rem; padding: .35rem .8rem; cursor: pointer;
+    background: transparent; color: var(--accent);
+    border: 1px solid var(--line); border-radius: 5px;
+  }
+  footer { color: var(--dim); font-size: .8rem; margin-top: 1.5rem; }
+  code { font-family: var(--mono); font-size: .85em; }
+  @media (max-width: 34rem) { .row { grid-template-columns: 1fr; gap: .1rem; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>vpnchain dashboard</h1>
+<p class="sub">
+  Measured from inside this browser. Values the shell cannot see:
+  the timezone this process was launched with, and what WebRTC really does.
+</p>
+
+<div class="verdict" id="verdict">Measuring<small id="verdict-why">one moment</small></div>
+
+<section>
+  <h2>Exit</h2>
+  <dl>
+    <div class="row"><dt>Address seen by sites</dt><dd id="exit-ip" class="pend">checking</dd></div>
+    <div class="row"><dt>Expected</dt><dd id="exit-expect" class="pend">-</dd></div>
+    <div class="row"><dt>Geolocation</dt><dd id="exit-geo" class="pend">checking</dd></div>
+    <div class="row"><dt>Network</dt><dd id="exit-org" class="pend">checking</dd></div>
+    <div class="row"><dt>Approx. location</dt><dd id="exit-where" class="pend">checking</dd></div>
+  </dl>
+</section>
+
+<section>
+  <h2>Timezone</h2>
+  <dl>
+    <div class="row"><dt>Main thread</dt><dd id="tz-main" class="pend">checking</dd></div>
+    <div class="row"><dt>Web Worker</dt><dd id="tz-worker" class="pend">checking</dd></div>
+    <div class="row"><dt>Iframe</dt><dd id="tz-iframe" class="pend">checking</dd></div>
+    <div class="row"><dt>UTC offset</dt><dd id="tz-offset" class="pend">checking</dd></div>
+    <div class="row"><dt>Consistency</dt><dd id="tz-consistent" class="pend">checking</dd>
+      <div class="note">A scope that disagrees means a spoof applied only to
+        page scripts. That inconsistency is itself a stronger signal than the
+        original mismatch, and the Worker is where it shows up.</div>
+    </div>
+    <div class="row"><dt>Clock vs exit region</dt><dd id="tz-vsgeo" class="pend">checking</dd></div>
+  </dl>
+</section>
+
+<section>
+  <h2>WebRTC</h2>
+  <dl>
+    <div class="row"><dt>Verdict</dt><dd id="rtc-verdict" class="pend">gathering</dd></div>
+    <div class="row"><dt>Candidate types</dt><dd id="rtc-types" class="pend">gathering</dd>
+      <div class="note">A SOCKS proxy cannot carry UDP, so any
+        <code>srflx</code> or <code>host</code> address here reached the
+        network outside the proxy - that is a real leak, not a policy setting.
+        No candidates at all means UDP is blocked, which also breaks calls
+        without a TURN relay.</div>
+    </div>
+  </dl>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>type</th><th>address</th><th>protocol</th></tr></thead>
+      <tbody id="rtc-rows"><tr><td colspan="3" class="pend">gathering</td></tr></tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>Transport</h2>
+  <dl>
+    <div class="row"><dt>Negotiated protocol</dt><dd id="tr-proto" class="pend">checking</dd>
+      <div class="note"><code>h2</code> or <code>http/1.1</code> is expected
+        behind a SOCKS proxy: Chrome disables QUIC when one is configured,
+        because it cannot tunnel UDP. Seeing <code>h3</code> means this
+        request went around the proxy.</div>
+    </div>
+    <div class="row"><dt>Request timing</dt><dd id="tr-timing" class="pend">checking</dd></div>
+  </dl>
+</section>
+
+<section>
+  <h2>Environment</h2>
+  <dl>
+    <div class="row"><dt>Languages</dt><dd id="env-lang" class="pend">-</dd></div>
+    <div class="row"><dt>Platform</dt><dd id="env-plat" class="pend">-</dd></div>
+    <div class="row"><dt>Screen</dt><dd id="env-screen" class="pend">-</dd></div>
+    <div class="row"><dt>Cores / memory</dt><dd id="env-hw" class="pend">-</dd></div>
+    <div class="row"><dt>WebGL renderer</dt><dd id="env-gl" class="pend">-</dd></div>
+    <div class="row"><dt>User agent</dt><dd id="env-ua" class="pend">-</dd></div>
+  </dl>
+</section>
+
+<footer>
+  <button onclick="location.reload()">Re-run</button>
+  <span style="margin-left:.75rem">
+    Expected address comes from the URL fragment:
+    <code>#expect=&lt;address&gt;</code>
+  </span>
+</footer>
+
+</div>
+<script>
+"use strict";
+
+var $ = function (id) { return document.getElementById(id); };
+function put(id, text, cls) {
+  var el = $(id);
+  if (!el) return;
+  el.textContent = text;
+  el.className = cls || "";
+}
+
+// Expected exit address, if the bookmark supplies one. Keeps this file free of
+// site-specific values so it can be committed to a public repository.
+var expected = (function () {
+  var m = /(?:^|[#&])expect=([^&]+)/.exec(location.hash || "");
+  return m ? decodeURIComponent(m[1]) : null;
+})();
+
+var findings = { exitIp: null, exitTz: null, tzMain: null, tzWorker: null,
+                 tzIframe: null, rtcLeak: null, rtcCount: 0 };
+
+// The verdict must never render a pass from a partial picture. Each probe
+// settles exactly once - on success OR failure - and the verdict stays
+// "Measuring" until all of them have. Without this gate the timezone check
+// alone concluded "exit matches" while the exit was still unknown, which is
+// the worst failure mode a tool like this can have: false reassurance.
+var pending = { timezone: true, exit: true, webrtc: true };
+function settle(name) {
+  delete pending[name];
+  conclude();
+}
+
+/* ---------------------------------------------------------------- timezone */
+
+function readTimezone() {
+  var opts = Intl.DateTimeFormat().resolvedOptions();
+  findings.tzMain = opts.timeZone;
+  put("tz-main", opts.timeZone);
+  var off = new Date().getTimezoneOffset();
+  put("tz-offset", (off <= 0 ? "+" : "-") +
+      String(Math.floor(Math.abs(off) / 60)).padStart(2, "0") + ":" +
+      String(Math.abs(off) % 60).padStart(2, "0") +
+      "  (getTimezoneOffset " + off + ")");
+
+  // Separate global scope. A content-script spoof cannot reach in here, so a
+  // disagreement with the main thread exposes a cosmetic one.
+  try {
+    var src = "onmessage=function(){postMessage(" +
+              "Intl.DateTimeFormat().resolvedOptions().timeZone)}";
+    var w = new Worker(URL.createObjectURL(
+      new Blob([src], { type: "application/javascript" })));
+    w.onmessage = function (e) {
+      findings.tzWorker = e.data;
+      put("tz-worker", e.data);
+      w.terminate();
+      compareScopes();
+    };
+    w.onerror = function () { put("tz-worker", "unavailable", "warn"); compareScopes(); };
+    w.postMessage("go");
+    // A Worker that never answers must not leave the verdict hanging.
+    setTimeout(function () {
+      if (findings.tzWorker === null) {
+        put("tz-worker", "no response", "warn");
+        compareScopes();
+      }
+    }, 5000);
+  } catch (e) {
+    put("tz-worker", "unavailable: " + e.name, "warn");
+    compareScopes();
+  }
+
+  try {
+    var f = document.createElement("iframe");
+    f.style.display = "none";
+    document.body.appendChild(f);
+    findings.tzIframe =
+      f.contentWindow.Intl.DateTimeFormat().resolvedOptions().timeZone;
+    put("tz-iframe", findings.tzIframe);
+    f.remove();
+  } catch (e) {
+    put("tz-iframe", "unavailable", "warn");
+  }
+
+  put("env-lang", (navigator.languages || []).join(", ") +
+      "   (navigator.language " + navigator.language + ")");
+}
+
+function compareScopes() {
+  var seen = [findings.tzMain, findings.tzWorker, findings.tzIframe]
+             .filter(Boolean);
+  var uniq = seen.filter(function (v, i) { return seen.indexOf(v) === i; });
+  if (uniq.length === 1) {
+    put("tz-consistent", "all scopes agree", "ok");
+  } else {
+    put("tz-consistent", "DISAGREE: " + uniq.join(" vs "), "bad");
+  }
+  settle("timezone");
+}
+
+/* -------------------------------------------------------------------- exit */
+
+// One request covers everything: the address sites see, where databases place
+// it, the network it belongs to, and the timezone that region keeps - which is
+// what the clock comparison needs. An earlier version used two providers and
+// the second one rate-limited constantly.
+function checkExit() {
+  var t0 = performance.now();
+  fetch("https://ipinfo.io/json")
+    .then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    })
+    .then(function (d) {
+      if (!d || !d.ip) throw new Error("no address in response");
+      findings.exitIp = d.ip;
+      findings.exitTz = d.timezone || null;
+
+      var match = expected ? d.ip === expected : null;
+      put("exit-ip", d.ip, match === null ? "" : (match ? "ok" : "bad"));
+      put("exit-expect",
+          expected || "not supplied (add #expect=<address>)",
+          expected ? (match ? "ok" : "bad") : "pend");
+      put("exit-geo", [d.city, d.region, d.country].filter(Boolean).join(", ")
+                      || "not reported");
+      put("exit-org", d.org || "not reported");
+      put("exit-where", [d.loc, d.postal].filter(Boolean).join("  ") || "-");
+
+      describeTransport(t0, "ipinfo");
+      compareClockToRegion();
+    })
+    .catch(function (e) {
+      // Fall back to an address-only lookup. Losing the geolocation is a
+      // nuisance; losing the address would mean the verdict cannot judge the
+      // exit at all, which is the one thing it must not guess at.
+      put("exit-geo", "unavailable (" + e.message + ")", "warn");
+      put("exit-org", "-");
+      put("exit-where", "-");
+      fetch("https://api.ipify.org?format=json")
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          findings.exitIp = d.ip;
+          var match = expected ? d.ip === expected : null;
+          put("exit-ip", d.ip, match === null ? "" : (match ? "ok" : "bad"));
+          put("exit-expect", expected || "not supplied", expected ? (match ? "ok" : "bad") : "pend");
+          describeTransport(t0, "ipify");
+          compareClockToRegion();
+        })
+        .catch(function (e2) {
+          put("exit-ip", "unreachable: " + e2.message, "bad");
+          put("exit-expect", expected || "not supplied", "warn");
+          put("tr-proto", "no request completed", "bad");
+          put("tr-timing", "-");
+          settle("exit");
+        });
+    });
+}
+
+function compareClockToRegion() {
+  if (!findings.exitTz || !findings.tzMain) {
+    put("tz-vsgeo", "cannot compare - exit region unknown", "warn");
+  } else if (findings.exitTz === findings.tzMain) {
+    put("tz-vsgeo", "clock matches the exit region (" + findings.exitTz + ")", "ok");
+  } else {
+    put("tz-vsgeo", findings.tzMain + " vs exit region " + findings.exitTz, "warn");
+  }
+  settle("exit");
+}
+
+/* --------------------------------------------------------------- transport */
+
+function describeTransport(t0, host) {
+  var ms = Math.round(performance.now() - t0);
+  put("tr-timing", ms + " ms for the address lookup");
+  var hop = null;
+  try {
+    var entries = performance.getEntriesByType("resource");
+    for (var i = entries.length - 1; i >= 0; i--) {
+      if (entries[i].name.indexOf(host) !== -1 && entries[i].nextHopProtocol) {
+        hop = entries[i].nextHopProtocol; break;
+      }
+    }
+  } catch (e) { /* timing API unavailable */ }
+  if (!hop) {
+    put("tr-proto", "not reported (cross-origin timing withheld)", "warn");
+  } else {
+    put("tr-proto", hop, hop === "h3" ? "warn" : "ok");
+  }
+}
+
+/* ------------------------------------------------------------------ webrtc */
+
+function checkWebRTC() {
+  var rows = [], done = false;
+  if (typeof RTCPeerConnection !== "function") {
+    put("rtc-verdict", "RTCPeerConnection unavailable", "warn");
+    settle("webrtc");
+    return;
+  }
+  var pc = new RTCPeerConnection({
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+  });
+
+  function finish() {
+    if (done) return;
+    done = true;
+    try { pc.close(); } catch (e) {}
+
+    var types = {};
+    rows.forEach(function (r) { types[r.type] = (types[r.type] || 0) + 1; });
+    var names = Object.keys(types);
+
+    $("rtc-rows").innerHTML = "";
+    if (!rows.length) {
+      $("rtc-rows").innerHTML =
+        '<tr><td colspan="3">no candidates gathered</td></tr>';
+    } else {
+      rows.forEach(function (r) {
+        var tr = document.createElement("tr");
+        [r.type, r.address, r.protocol].forEach(function (v) {
+          var td = document.createElement("td");
+          td.textContent = v;
+          tr.appendChild(td);
+        });
+        $("rtc-rows").appendChild(tr);
+      });
+    }
+
+    findings.rtcCount = rows.length;
+    // host/srflx reached the network directly, since a SOCKS proxy cannot
+    // carry the UDP they are discovered over. mDNS .local hosts are Chrome
+    // obfuscating a LAN address and reveal nothing routable.
+    var leaking = rows.filter(function (r) {
+      return (r.type === "srflx" || r.type === "prflx") ||
+             (r.type === "host" && !/\.local$/.test(r.address));
+    });
+    findings.rtcLeak = leaking.length > 0;
+
+    put("rtc-types", names.length ? names.map(function (n) {
+      return n + " x" + types[n];
+    }).join(", ") : "none");
+
+    if (leaking.length) {
+      put("rtc-verdict",
+          "LEAKING - " + leaking.length + " address(es) reached the network " +
+          "outside the proxy", "bad");
+    } else if (!rows.length) {
+      put("rtc-verdict",
+          "no UDP at all - nothing leaks, and calls need a TURN relay to work",
+          "ok");
+    } else {
+      put("rtc-verdict", "relay only - no direct address exposed", "ok");
+    }
+    settle("webrtc");
+  }
+
+  pc.onicecandidate = function (e) {
+    if (!e.candidate || !e.candidate.candidate) { finish(); return; }
+    var c = e.candidate;
+    var parts = c.candidate.split(" ");
+    rows.push({
+      type: c.type || (/ typ (\w+)/.exec(c.candidate) || [])[1] || "?",
+      address: c.address || parts[4] || "?",
+      protocol: c.protocol || parts[2] || "?"
+    });
+  };
+  pc.createDataChannel("probe");
+  pc.createOffer().then(function (o) { return pc.setLocalDescription(o); })
+                  .catch(finish);
+  setTimeout(finish, 9000);
+}
+
+/* ------------------------------------------------------------- environment */
+
+function describeEnvironment() {
+  put("env-plat", (navigator.platform || "?") + "   " +
+      (navigator.userAgentData ? navigator.userAgentData.platform : ""));
+  put("env-screen", screen.width + "x" + screen.height +
+      " @" + window.devicePixelRatio + "x, " + screen.colorDepth + "-bit" +
+      "   viewport " + innerWidth + "x" + innerHeight);
+  put("env-hw", (navigator.hardwareConcurrency || "?") + " cores, " +
+      (navigator.deviceMemory || navigator.deviceMemory === 0
+        ? navigator.deviceMemory + " GB" : "memory not reported"));
+  put("env-ua", navigator.userAgent);
+  try {
+    var cv = document.createElement("canvas");
+    var gl = cv.getContext("webgl") || cv.getContext("experimental-webgl");
+    var dbg = gl && gl.getExtension("WEBGL_debug_renderer_info");
+    put("env-gl", dbg
+      ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) + " / " +
+        gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+      : "not exposed");
+  } catch (e) { put("env-gl", "unavailable"); }
+}
+
+/* ----------------------------------------------------------------- verdict */
+
+function conclude() {
+  var outstanding = Object.keys(pending);
+  var el = $("verdict");
+
+  if (outstanding.length) {
+    el.className = "verdict";
+    el.firstChild.textContent = "Measuring";
+    $("verdict-why").textContent = "waiting on: " + outstanding.join(", ");
+    return;
+  }
+
+  var problems = [], cautions = [];
+
+  // An unmeasured exit is never a pass. Saying nothing here is what let the
+  // old logic claim a match it had not checked.
+  if (!findings.exitIp) {
+    problems.push("could not determine the exit address");
+  }
+
+  if (findings.rtcLeak) problems.push("WebRTC is exposing a direct address");
+  if (expected && findings.exitIp && findings.exitIp !== expected) {
+    problems.push("exit address is " + findings.exitIp +
+                  ", not the expected " + expected);
+  }
+  var seen = [findings.tzMain, findings.tzWorker, findings.tzIframe]
+             .filter(Boolean);
+  if (seen.length > 1 && seen.some(function (v) { return v !== seen[0]; })) {
+    problems.push("timezone differs between scopes");
+  }
+  if (!expected) cautions.push("no expected address given, so the exit is unverified");
+  if (findings.exitTz && findings.tzMain && findings.exitTz !== findings.tzMain) {
+    cautions.push("clock region disagrees with the exit region");
+  }
+
+  if (problems.length) {
+    el.className = "verdict bad";
+    el.firstChild.textContent = "Problems found";
+    $("verdict-why").textContent = problems.join(" - ");
+  } else if (cautions.length) {
+    el.className = "verdict warn";
+    el.firstChild.textContent = "Looks right, with caveats";
+    $("verdict-why").textContent = cautions.join(" - ");
+  } else {
+    el.className = "verdict ok";
+    el.firstChild.textContent = "Nothing exposed";
+    $("verdict-why").textContent =
+      "exit matches, timezone consistent across scopes, no direct WebRTC address";
+  }
+}
+
+readTimezone();
+describeEnvironment();
+checkExit();
+checkWebRTC();
+</script>
+</body>
+</html>
