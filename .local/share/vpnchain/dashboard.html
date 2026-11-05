@@ -25,6 +25,12 @@
 
       vpnchain-dashboard.html#expect=203.0.113.9
 
+  The incognito instance exits elsewhere on purpose, and that address rotates
+  with the upstream node, so give it a prefix and it is reported rather than
+  flagged:
+
+      ...#expect=203.0.113.9&incognito=198.51.100.
+
   Fragments are never sent anywhere, and here there is no server to send them
   to. Keep it in a bookmark.
 -->
@@ -187,6 +193,22 @@
 </details>
 
 <details class="sect">
+  <summary>DNS</summary>
+  <dl>
+    <div class="row"><dt>Resolver</dt><dd id="dns-ip" class="pend">checking</dd></div>
+    <div class="row"><dt>Resolver location</dt><dd id="dns-geo" class="pend">checking</dd>
+      <details class="note"><summary>why this matters</summary>Names are
+        resolved by whoever the tunnel hands them to. If this sits in your
+        real country while the exit does not, queries are escaping the chain -
+        a leak neither the exit address nor the shell can see. The resolver is
+        anycast, so its apparent location tracks where the query entered the
+        network rather than the operator's head office.</details>
+    </div>
+    <div class="row"><dt>Matches exit country</dt><dd id="dns-vs" class="pend">checking</dd></div>
+  </dl>
+</details>
+
+<details class="sect">
   <summary>WebRTC</summary>
   <dl>
     <div class="row"><dt>Verdict</dt><dd id="rtc-verdict" class="pend">gathering</dd></div>
@@ -232,20 +254,35 @@ function put(id, text, cls) {
 
 // Expected exit address, if the bookmark supplies one. Keeps this file free of
 // site-specific values so it can be committed to a public repository.
-var expected = (function () {
-  var m = /(?:^|[#&])expect=([^&]+)/.exec(location.hash || "");
+function fragment(name) {
+  var m = new RegExp("(?:^|[#&])" + name + "=([^&]+)").exec(location.hash || "");
   return m ? decodeURIComponent(m[1]) : null;
-})();
+}
 
-var findings = { exitIp: null, exitTz: null, tzMain: null, tzWorker: null,
-                 tzIframe: null, rtcLeak: null, rtcCount: 0 };
+var expected = fragment("expect");
+
+// The incognito instance exits elsewhere by design, and its address rotates
+// with the upstream node - so this matches on a prefix. Without it the page
+// cries "wrong exit" at a browser behaving exactly as intended.
+var expectedIncognito = fragment("incognito");
+
+function addressMatches(addr, pattern) {
+  if (!addr || !pattern) return false;
+  return pattern.slice(-1) === "." ? addr.indexOf(pattern) === 0
+                                   : addr === pattern;
+}
+
+var findings = { exitIp: null, exitTz: null, exitCountry: null,
+                 tzMain: null, tzWorker: null, tzIframe: null,
+                 rtcLeak: null, rtcCount: 0,
+                 dnsIp: null, dnsCountry: null };
 
 // The verdict must never render a pass from a partial picture. Each probe
 // settles exactly once - on success OR failure - and the verdict stays
 // "Measuring" until all of them have. Without this gate the timezone check
 // alone concluded "exit matches" while the exit was still unknown, which is
 // the worst failure mode a tool like this can have: false reassurance.
-var pending = { timezone: true, exit: true, webrtc: true };
+var pending = { timezone: true, exit: true, webrtc: true, dns: true };
 function settle(name) {
   delete pending[name];
   conclude();
@@ -335,6 +372,7 @@ function checkExit() {
       if (!d || !d.ip) throw new Error("no address in response");
       findings.exitIp = d.ip;
       findings.exitTz = d.timezone || null;
+      findings.exitCountry = d.country || null;
 
       var match = expected ? d.ip === expected : null;
       put("exit-ip", d.ip, match === null ? "" : (match ? "ok" : "bad"));
@@ -387,6 +425,36 @@ function compareClockToRegion() {
   settle("exit");
 }
 
+
+/* --------------------------------------------------------------------- dns */
+
+// Which resolver actually answered. The endpoint redirects to a unique
+// subdomain; resolving THAT is what reveals the resolver, so the redirect has
+// to be followed - fetch does by default. Geolocating the resolver through the
+// same provider as the exit lets the two be compared on equal terms.
+function checkDns() {
+  fetch("https://edns.ip-api.com/json")
+    .then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    })
+    .then(function (d) {
+      var ip = (d.dns || {}).ip;
+      if (!ip) throw new Error("no resolver reported");
+      findings.dnsIp = ip;
+      put("dns-ip", ip);
+      put("dns-geo", (d.dns || {}).geo || "not reported");
+      return fetch("https://ipinfo.io/" + encodeURIComponent(ip) + "/json")
+        .then(function (r) { return r.json(); })
+        .then(function (g) { findings.dnsCountry = g.country || null; })
+        .catch(function () { findings.dnsCountry = null; });
+    })
+    .catch(function (e) {
+      put("dns-ip", "unavailable (" + e.message + ")", "warn");
+      put("dns-geo", "-");
+    })
+    .then(function () { settle("dns"); });
+}
 
 /* ------------------------------------------------------------------ webrtc */
 
@@ -524,15 +592,22 @@ function conclude() {
   } else if (!findings.exitIp) {
     checks.push({ state: "fail", label: "Exit address",
                   detail: "could not be determined" });
-  } else if (!expected) {
+  } else if (!expected && !expectedIncognito) {
     checks.push({ state: "warn", label: "Exit address",
                   detail: findings.exitIp + " - nothing to compare against" });
-  } else if (findings.exitIp === expected) {
+  } else if (addressMatches(findings.exitIp, expected)) {
     checks.push({ state: "pass", label: "Exit address",
-                  detail: findings.exitIp });
+                  detail: findings.exitIp + " - pinned exit" });
+  } else if (addressMatches(findings.exitIp, expectedIncognito)) {
+    // A known exit, just not the pinned one. Correct in the incognito
+    // instance, wrong in the everyday one - and the page cannot tell which it
+    // is running in, so it reports rather than judges.
+    checks.push({ state: "warn", label: "Exit address",
+                  detail: findings.exitIp + " - incognito exit" });
   } else {
     checks.push({ state: "fail", label: "Exit address",
-                  detail: findings.exitIp + ", expected " + expected });
+                  detail: findings.exitIp + ", expected " +
+                          (expected || expectedIncognito) });
   }
 
   // Timezone agreement across scopes.
@@ -562,6 +637,30 @@ function conclude() {
   } else {
     checks.push({ state: "warn", label: "Clock vs exit",
                   detail: findings.tzMain + " vs " + findings.exitTz });
+  }
+
+  // DNS. Anycast makes a mismatch suggestive rather than conclusive, so a
+  // difference is a caution, not a failure.
+  if (pending.dns || pending.exit) {
+    checks.push({ state: "pend", label: "DNS resolver", detail: "measuring" });
+    put("dns-vs", "checking", "pend");
+  } else if (!findings.dnsIp) {
+    checks.push({ state: "warn", label: "DNS resolver",
+                  detail: "could not be determined" });
+    put("dns-vs", "unknown", "warn");
+  } else if (!findings.dnsCountry || !findings.exitCountry) {
+    checks.push({ state: "warn", label: "DNS resolver",
+                  detail: findings.dnsIp + " - country unknown" });
+    put("dns-vs", "cannot compare", "warn");
+  } else if (findings.dnsCountry === findings.exitCountry) {
+    checks.push({ state: "pass", label: "DNS resolver",
+                  detail: "resolves in " + findings.dnsCountry + ", same as exit" });
+    put("dns-vs", "yes - both " + findings.exitCountry, "ok");
+  } else {
+    checks.push({ state: "warn", label: "DNS resolver",
+                  detail: "resolves in " + findings.dnsCountry +
+                          ", exit is " + findings.exitCountry });
+    put("dns-vs", findings.dnsCountry + " vs exit " + findings.exitCountry, "warn");
   }
 
   // WebRTC.
@@ -596,6 +695,7 @@ function conclude() {
   }
 }
 
+checkDns();
 readTimezone();
 describeEnvironment();
 checkExit();

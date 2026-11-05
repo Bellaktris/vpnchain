@@ -89,6 +89,9 @@
 #
 #     file://<this directory>/vpnchain-dashboard.html#expect=<exit address>
 #
+# Add &incognito=<prefix> so the incognito instance, which exits elsewhere by
+# design, is labelled rather than reported as a wrong address.
+#
 # Worth setting as the browser's startup page. Then any launch, including one
 # from the Dock that carries no proxy flag, shows you immediately whether you
 # are on the expected address - which restores passive detection in the only
