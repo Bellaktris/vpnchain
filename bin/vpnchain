@@ -153,6 +153,9 @@ Optional:
     INCOGNITO_PROFILE=<its throwaway profile dir>
     BROWSER_APP=<path to the browser bundle, defaults to Google Chrome>
     BROWSER_DOMAIN=<its preference domain, for the WebRTC policy>
+    NOTIFY_ALLOW=<space-separated origins allowed to show notifications,
+             e.g. "https://mail.example.com https://chat.example.com";
+             everything else is blocked>
 EOF
     exit 1
 fi
@@ -218,6 +221,14 @@ HTTPS_ONLY_KEY=HttpsOnlyMode
 # What the browser reports back to its vendor. Safe Browsing stays on, just at
 # Standard: Enhanced sends visited URLs and downloads for real-time checking,
 # Standard matches against lists held locally.
+# Notification prompts are blocked by default, as Safari and Firefox both
+# heavily restrict them, with an allowlist for the handful of sites where
+# notifications are the point. The list is personal, so it lives in the env
+# file; empty means block everything.
+NOTIFY_DEFAULT_KEY=DefaultNotificationsSetting
+NOTIFY_ALLOW_KEY=NotificationsAllowedForUrls
+NOTIFY_ALLOW="${NOTIFY_ALLOW:-}"
+
 TELEMETRY_OFF_KEYS=(UrlKeyedAnonymizedDataCollectionEnabled MetricsReportingEnabled)
 SAFE_BROWSING_KEY=SafeBrowsingProtectionLevel
 SAFE_BROWSING_STANDARD=1
@@ -414,6 +425,16 @@ set_hardening_policies() {
         defaults write "$BROWSER_DOMAIN" "$k" -bool false
     done
     defaults write "$BROWSER_DOMAIN" "$SAFE_BROWSING_KEY" -int "$SAFE_BROWSING_STANDARD"
+
+    # 2 = block. The allowlist is rewritten wholesale each launch so removing
+    # an entry from the env file actually removes it, rather than leaving a
+    # stale permission behind.
+    defaults write "$BROWSER_DOMAIN" "$NOTIFY_DEFAULT_KEY" -int 2
+    defaults delete "$BROWSER_DOMAIN" "$NOTIFY_ALLOW_KEY" 2>/dev/null
+    if [ -n "$NOTIFY_ALLOW" ]; then
+        # shellcheck disable=SC2086
+        defaults write "$BROWSER_DOMAIN" "$NOTIFY_ALLOW_KEY" -array $NOTIFY_ALLOW
+    fi
 }
 
 # The resting state both policies should be left in. Called on the normal path
@@ -706,6 +727,11 @@ cmd_browser() {
 
     set_hardening_policies
     ok "device APIs denied, HTTPS-only on, vendor telemetry reduced"
+    if [ -n "$NOTIFY_ALLOW" ]; then
+        ok "notifications blocked except $(printf '%s' "$NOTIFY_ALLOW" | wc -w | tr -d ' ') allowed site(s)"
+    else
+        ok "notifications blocked (no allowlist configured)"
+    fi
 
     # NOTE: expanded as ${profile_args[@]+"${profile_args[@]}"} below, not
     # "${profile_args[@]}" - bash 3.2, which is /bin/bash on macOS, errors on

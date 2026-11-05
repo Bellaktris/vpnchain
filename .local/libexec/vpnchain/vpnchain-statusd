@@ -163,6 +163,12 @@ def browser_policy():
         "httpsOnly": read("HttpsOnlyMode"),
         "telemetryReduced": telemetry_off,
         "safeBrowsing": read("SafeBrowsingProtectionLevel"),
+        "notificationsBlocked": read("DefaultNotificationsSetting") == "2",
+        # The value is a plist array; counting quoted entries is enough for a
+        # summary and avoids dragging in a plist parser for one number.
+        "notificationsAllowed": len(re.findall(
+            r'"[^"]+"', run(["defaults", "read", dom,
+                             "NotificationsAllowedForUrls"], timeout=5) or "")),
         "webrtc": webrtc,
         "webrtcBlocked": webrtc == "disable_non_proxied_udp",
         "incognito": incog,
