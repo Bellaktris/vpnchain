@@ -56,6 +56,13 @@
 #            the network directly and expose the real address regardless of
 #            everything else here. The default launch prevents that.
 #
+#            It also disables incognito in the main browser. An incognito
+#            window there clears cookies and history but keeps the pinned exit
+#            address - the one thing that actually identifies you - so it
+#            looks anonymous while being nothing of the sort. The incognito
+#            instance, which does change the exit, forces incognito for itself
+#            and the setting is put back immediately after it launches.
+#
 #            Pass with-webrtc to relax the policy for the launch; block is
 #            restored on disk immediately afterwards. The running browser
 #            already read the relaxed value and keeps it until it quits, so
@@ -151,6 +158,15 @@ BROWSER_DOMAIN="${BROWSER_DOMAIN:-com.google.Chrome}"
 # Chrome renamed this policy; write and read both so either vintage works.
 WEBRTC_KEYS=(WebRtcIPHandlingPolicy WebRtcIPHandling)
 WEBRTC_BLOCK_VALUE=disable_non_proxied_udp
+
+# Incognito in the MAIN browser clears cookies and history while leaving the
+# exit address untouched - so it looks anonymous while still presenting the
+# one address that identifies you. Disabled by default for that reason; the
+# incognito instance, which actually changes the exit, turns it on for itself.
+#   0 available   1 disabled   2 forced
+INCOGNITO_KEY=IncognitoModeAvailability
+INCOGNITO_OFF=1
+INCOGNITO_FORCED=2
 
 BROWSER_APP="${BROWSER_APP:-/Applications/Google Chrome.app}"
 BROWSER_BIN="$BROWSER_APP/Contents/MacOS/$(basename "${BROWSER_APP%.app}")"
@@ -268,6 +284,18 @@ webrtc_state() {
         [ "$v" = "$WEBRTC_BLOCK_VALUE" ] && { echo blocked; return; }
     done
     echo allowed
+}
+
+set_incognito_policy() {
+    defaults write "$BROWSER_DOMAIN" "$INCOGNITO_KEY" -int "$1"
+}
+
+# The resting state both policies should be left in. Called on the normal path
+# and from a trap, so an interrupted launch cannot strand the browser with
+# incognito forced or WebRTC allowed.
+restore_policies() {
+    set_webrtc block
+    set_incognito_policy "$INCOGNITO_OFF"
 }
 
 set_webrtc() {
@@ -595,6 +623,10 @@ cmd_browser() {
         exit 1
     fi
 
+    # Whatever happens from here, the browser must not be left with incognito
+    # forced or WebRTC allowed. Restoring twice on the normal path is harmless.
+    trap restore_policies EXIT INT TERM
+
     # NOTE: expanded as ${profile_args[@]+"${profile_args[@]}"} below, not
     # "${profile_args[@]}" - bash 3.2, which is /bin/bash on macOS, errors on
     # an empty array under set -u.
@@ -640,12 +672,20 @@ cmd_browser() {
         fi
     fi
 
-    # The policy is read at startup, so it has to be in place before launching.
-    # It is global to the preference domain, so it also governs the separate
-    # instance - which is why it is set here either way.
+    # Policies are read at startup, so they have to be in place before the
+    # launch. Both are global to the preference domain, which is why they are
+    # set here either way and put back immediately afterwards.
     set_webrtc "$want"
     [ "$want" = block ] && ok "webrtc policy set to block" \
                         || warn "webrtc policy relaxed for this launch"
+
+    if [ "$exit_kind" = upstream ]; then
+        set_incognito_policy "$INCOGNITO_FORCED"
+        ok "incognito forced for this launch"
+    else
+        set_incognito_policy "$INCOGNITO_OFF"
+        ok "incognito disabled (it would not change the exit address)"
+    fi
 
     # The proxy is pinned to this launch rather than set system-wide, so the
     # scope is exactly this browser and nothing else on the machine is touched.
@@ -691,6 +731,13 @@ cmd_browser() {
     # read the relaxed one and keeps it for its lifetime, so the exposure is
     # scoped to this session and the next launch is protected by default -
     # no timer, nothing to remember.
+    if [ "$exit_kind" = upstream ]; then
+        set_incognito_policy "$INCOGNITO_OFF"
+        echo
+        ok "incognito policy restored to disabled"
+        echo "         this instance stays incognito for its lifetime"
+    fi
+
     if [ "$want" = allow ]; then
         set_webrtc block
         echo
@@ -705,6 +752,8 @@ cmd_browser() {
     bold "applied at this launch"
     [ "$exit_kind" = upstream ] && warn "exit: upstream only - NOT the pinned address" \
                                 || ok "exit: the pinned address"
+    [ "$exit_kind" = upstream ] && ok "incognito: forced" \
+                                || ok "incognito: unavailable in this browser"
     if [ "$want" = block ]; then
         ok "webrtc: BLOCKED"
     else
