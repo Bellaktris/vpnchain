@@ -15,7 +15,6 @@
 #   start [mode]    load the sing-box agent
 #   stop            unload it
 #   restart [mode]  reload it
-#   status          show every link in the chain and what the outside sees
 #
 # The optional [mode] on start/restart is one of:
 #
@@ -31,8 +30,8 @@
 # produced them was removed rather than kept and distrusted. Choose on
 # concealment, not speed.
 #
-# Omit it to keep whatever the config already has. status reports the active
-# mode, so there is no separate command to query it.
+# Omit it to keep whatever the config already has; the dashboard reports the
+# active mode, so there is no separate command to query it.
 #
 #   browser [incognito|with-webrtc]
 #            quit and relaunch the browser from this shell with SPOOF_TZ and
@@ -66,13 +65,23 @@
 #            protected again - no timer, nothing to remember. Use it when a
 #            call needs to connect.
 #
-#   config   write the sing-box config from the env file, which is the single
+#   config [check]
+#            write the sing-box config from the env file, which is the single
 #            source of truth for it. start does this automatically when no
 #            config exists, since writing a missing file cannot lose anything.
 #            Regenerating an existing one can - hand-added routing rules are
-#            not carried over - so that stays explicit. status compares the
-#            live config against what the env file describes and says so when
-#            they diverge, which is the case the split would otherwise hide.
+#            not carried over - so that stays explicit.
+#
+#            'config check' compares the live config against what the env file
+#            describes without writing anything. It is the one check the status
+#            server does not do, since a second copy of the generator there
+#            would be two things to hold in sync.
+#
+# There is no 'status' verb. The dashboard is the status view - it reports the
+# chain AND what the browser actually does, which no shell command can see. In
+# a terminal, curl the server directly:
+#
+#     curl -s http://127.0.0.1:$STATUS_PORT/status.json
 #
 # NOTE: the proxy is pinned per browser launch rather than set system-wide.
 # The scope is therefore exactly the browsers this script starts - nothing
@@ -776,108 +785,37 @@ cmd_browser() {
 }
 
 
-cmd_status() {
-    local mode
+# Rendering what the env file describes and diffing it is the one check the
+# status server deliberately does not do - a second copy of the generator
+# there would be two things to hold in sync. So it lives with the command that
+# owns the generated file.
+cmd_config_check() {
+    if ! have_wg_creds; then
+        bad "env file lacks the WireGuard values, so there is nothing to compare"
+        exit 1
+    fi
+    if [ ! -f "$SINGBOX_CONFIG" ]; then
+        bad "no config at $SINGBOX_CONFIG - generate one with: vpnchain config"
+        exit 1
+    fi
+    local mode tmpcfg
     mode=$(singbox_mode)
-    bold "chain components  [mode: $mode]"
-
-    if [ "$mode" = direct ]; then
-        warn "upstream hop DISABLED - WireGuard dials its peer directly"
-        echo "         plainly a VPN on the wire - no concealment, and no"
-        echo "         measured speed advantage over chained either"
-        echo "         this persists across reboots until changed back"
-        echo "         restore with: vpnchain restart chained"
-    else
-        if pgrep -f "$UPSTREAM_PROCESS" >/dev/null 2>&1; then
-            local pid started
-            pid=$(pgrep -f "$UPSTREAM_PROCESS" | head -1)
-            started=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/  */ /g')
-            ok "upstream core running (pid $pid, up since$started)"
-            echo "         a changed pid means it restarted - node switch or reboot"
-        else
-            bad "upstream core NOT running - nothing downstream can work"
-        fi
-
-        nc -z -G 2 "$UPSTREAM_HOST" "$UPSTREAM_PORT" >/dev/null 2>&1 \
-            && ok "upstream SOCKS listening on $UPSTREAM_PORT" \
-            || bad "upstream SOCKS $UPSTREAM_PORT not accepting connections"
-    fi
-
-    agent_running \
-        && ok "sing-box running (pid $(pgrep -f 'sing-box run' | head -1))" \
-        || bad "sing-box NOT running - run: vpnchain start"
-
-    nc -z -G 2 "$PROXY_HOST" "$PROXY_PORT" >/dev/null 2>&1 \
-        && ok "sing-box $PROXY_PORT listening (pinned exit)" \
-        || bad "sing-box $PROXY_PORT not accepting connections"
-
-    # Optional: a config predating 'vpnchain config' has only the one inbound,
-    # so a missing second port is a gap to fill rather than a fault.
-    if nc -z -G 2 "$PROXY_HOST" "$INCOGNITO_PORT" >/dev/null 2>&1; then
-        ok "sing-box $INCOGNITO_PORT listening (incognito exit)"
-    else
-        warn "sing-box $INCOGNITO_PORT not listening"
-        echo "         'browser incognito' needs it; add it with: vpnchain config"
-    fi
-
-    if have_wg_creds; then
-        local tmpcfg
-        tmpcfg=$(mktemp -t vpnchain-cfg)
-        if generate_config "$tmpcfg" "$mode" 2>/dev/null \
-           && ! diff -q "$tmpcfg" "$SINGBOX_CONFIG" >/dev/null 2>&1; then
-            warn "live config differs from what the env file describes"
-            echo "         either it was hand-edited, or the env file changed"
-            echo "         since it was generated. Regenerate with:"
-            echo "           vpnchain config   (backs the current one up first)"
-        fi
+    [ "$mode" = unknown ] && mode=chained
+    tmpcfg=$(mktemp -t vpnchain-cfg)
+    if ! generate_config "$tmpcfg" "$mode" 2>/dev/null; then
         rm -f "$tmpcfg"
+        bad "could not render the config implied by the env file"
+        exit 1
     fi
-
-    echo
-    bold "system proxy"
-    local enabled
-    enabled=$(scutil --proxy | awk '/SOCKSEnable/ {print $3}')
-    if [ "${enabled:-0}" = "1" ]; then
-        warn "SET -> $(scutil --proxy | awk '/SOCKSProxy/ {print $3}'):$(scutil --proxy | awk '/SOCKSPort/ {print $3}')"
-        echo "         this script no longer manages it; the proxy is pinned"
-        echo "         per browser launch. A leftover system setting silently"
-        echo "         routes Safari, Mail and others through the chain too."
-        echo "         clear it in System Settings > Network > Proxies"
+    if diff -q "$tmpcfg" "$SINGBOX_CONFIG" >/dev/null 2>&1; then
+        ok "live config matches the env file"
     else
-        ok "not set - only browsers launched by vpnchain are proxied"
+        warn "live config differs from what the env file describes"
+        echo "         either it was hand-edited, or the env file changed"
+        echo "         since it was generated. Regenerate with:"
+        echo "           vpnchain config   (backs the current one up first)"
     fi
-
-    echo
-    # Gather first, then lead with the verdict - the addresses are supporting
-    # detail for it, not the other way round.
-    local direct chain incog=""
-    direct=$(curl -s -m 10 https://api.ipify.org 2>/dev/null)
-    chain=$(curl -s -m 25 --retry 2 --retry-delay 3 \
-        --socks5-hostname "$PROXY_HOST:$PROXY_PORT" https://api.ipify.org 2>/dev/null)
-    if nc -z -G 2 "$PROXY_HOST" "$INCOGNITO_PORT" >/dev/null 2>&1; then
-        incog=$(curl -s -m 25 --socks5-hostname "$PROXY_HOST:$INCOGNITO_PORT" \
-                https://api.ipify.org 2>/dev/null)
-        incog="${incog:-unreachable}"
-    fi
-
-    if [ "$chain" = "$EXPECTED_EXIT_IP" ]; then
-        ok "chain is intact - exiting at the expected address"
-    elif [ -z "$chain" ]; then
-        bad "chain is down - nothing is reaching the pinned exit"
-        echo "         a browser started outside vpnchain is unproxied, so"
-        echo "         ordinary browsing still works meanwhile"
-        echo "         check: tail ~/.config/sing-box/sing-box.err.log"
-    else
-        bad "WRONG EXIT IP: $chain (expected $EXPECTED_EXIT_IP)"
-        echo "         traffic reached the upstream proxy but skipped the"
-        echo "         WireGuard layer - check sing-box's detour setting"
-    fi
-
-    echo
-    bold "what the outside world sees"
-    printf '  %-26s %s\n' "direct (your ISP):" "${direct:-unreachable}"
-    printf '  %-26s %s\n' "pinned exit:" "${chain:-unreachable}"
-    [ -n "$incog" ] && printf '  %-26s %s\n' "incognito exit:" "$incog"
+    rm -f "$tmpcfg"
 }
 
 case "${1:-status}" in
@@ -887,14 +825,13 @@ case "${1:-status}" in
              # itself, so reloading inside the switch would do it twice.
     restart) if [ -n "${2:-}" ]; then switch_mode "$2" || true; fi
              cmd_stop; cmd_start; echo; wait_for_chain ;;
-    status)  cmd_status ;;
     browser) shift; cmd_browser "$@" ;;
-    config)  cmd_config ;;
+    config)  [ "${2:-}" = check ] && cmd_config_check || cmd_config ;;
     *)
         echo "usage: vpnchain {start|restart} [chained|direct]"
-        echo "       vpnchain {stop|status}"
+        echo "       vpnchain stop"
         echo "       vpnchain browser [incognito|with-webrtc]"
-        echo "       vpnchain config"
+        echo "       vpnchain config [check]"
         exit 1
         ;;
 esac
