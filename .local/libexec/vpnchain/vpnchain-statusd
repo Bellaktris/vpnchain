@@ -140,7 +140,10 @@ def collect():
 
     return {
         "mode": singbox_mode(),
-        "upstream": dict(process_info(env("UPSTREAM_PROCESS", "v2raya_core")),
+        # No default: naming a particular upstream here would disclose the
+        # stack in a public repo, and the env file always supplies it.
+        "upstream": dict(process_info(env("UPSTREAM_PROCESS", "")) if env("UPSTREAM_PROCESS")
+                         else {"running": None},
                          port=int(up_port), listening=port_open(up_host, up_port)),
         "singbox": dict(process_info("sing-box run"),
                         pinnedPort=int(pinned), pinnedListening=pinned_up,
