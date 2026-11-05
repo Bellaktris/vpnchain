@@ -151,7 +151,18 @@ def browser_policy():
     webrtc = read("WebRtcIPHandling") or read("WebRtcIPHandlingPolicy")
     incog = read("IncognitoModeAvailability")
     cookies = read("BlockThirdPartyCookies")
+
+    device_keys = ["DefaultWebUsbGuardSetting", "DefaultWebBluetoothGuardSetting",
+                   "DefaultSerialGuardSetting", "DefaultWebHidGuardSetting"]
+    denied = sum(1 for k in device_keys if read(k) == "2")
+    telemetry_off = (read("UrlKeyedAnonymizedDataCollectionEnabled") == "0"
+                     and read("MetricsReportingEnabled") == "0")
     return {
+        "deviceApisDenied": denied,
+        "deviceApisTotal": len(device_keys),
+        "httpsOnly": read("HttpsOnlyMode"),
+        "telemetryReduced": telemetry_off,
+        "safeBrowsing": read("SafeBrowsingProtectionLevel"),
         "webrtc": webrtc,
         "webrtcBlocked": webrtc == "disable_non_proxied_udp",
         "incognito": incog,

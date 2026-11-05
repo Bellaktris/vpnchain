@@ -58,6 +58,14 @@
 #            instance, which does change the exit, forces incognito for itself
 #            and the setting is put back immediately after it launches.
 #
+#            It also applies a set of static hardening policies borrowed from
+#            Safari and Firefox: WebUSB, Web Bluetooth, Web Serial and WebHID
+#            denied (neither browser ever shipped them), HTTPS-only mode on,
+#            and vendor telemetry reduced - URL-keyed collection and metrics
+#            off, Safe Browsing at Standard rather than Enhanced so visited
+#            URLs are not sent for real-time checking. These are never
+#            relaxed, so unlike the two below there is nothing to restore.
+#
 #            Third-party cookies are blocked by default too - they are the
 #            cross-site join key, and the browser does not block them on its
 #            own since that phase-out was reversed. with-cookies relaxes that
@@ -193,6 +201,26 @@ INCOGNITO_FORCED=2
 # do it per launch. Breaks some embedded sign-in and payment flows, which is
 # what 'with-cookies' is for.
 COOKIE_KEY=BlockThirdPartyCookies
+
+# Defaults borrowed from Safari and Firefox. The device APIs are the clearest
+# case: neither browser ever shipped WebUSB, Web Bluetooth, Web Serial or
+# WebHID, having declined on security and privacy grounds, so denying them
+# here just matches their behaviour. They also enumerate hardware, which is
+# fingerprinting surface.
+#   2 = deny, 3 = ask
+DEVICE_API_KEYS=(DefaultWebUsbGuardSetting DefaultWebBluetoothGuardSetting
+                 DefaultSerialGuardSetting DefaultWebHidGuardSetting)
+
+# Plaintext over a shared exit is readable by whoever runs it, which makes
+# this worth more here than on an ordinary connection.
+HTTPS_ONLY_KEY=HttpsOnlyMode
+
+# What the browser reports back to its vendor. Safe Browsing stays on, just at
+# Standard: Enhanced sends visited URLs and downloads for real-time checking,
+# Standard matches against lists held locally.
+TELEMETRY_OFF_KEYS=(UrlKeyedAnonymizedDataCollectionEnabled MetricsReportingEnabled)
+SAFE_BROWSING_KEY=SafeBrowsingProtectionLevel
+SAFE_BROWSING_STANDARD=1
 
 BROWSER_APP="${BROWSER_APP:-/Applications/Google Chrome.app}"
 BROWSER_BIN="$BROWSER_APP/Contents/MacOS/$(basename "${BROWSER_APP%.app}")"
@@ -371,6 +399,21 @@ set_incognito_policy() {
 
 set_cookie_policy() {
     defaults write "$BROWSER_DOMAIN" "$COOKIE_KEY" -bool "$1"
+}
+
+# Static - never relaxed, so unlike the cookie and WebRTC policies there is
+# nothing to restore afterwards. Applied before the quit attempt so an aborted
+# launch still leaves them in place.
+set_hardening_policies() {
+    local k
+    for k in "${DEVICE_API_KEYS[@]}"; do
+        defaults write "$BROWSER_DOMAIN" "$k" -int 2
+    done
+    defaults write "$BROWSER_DOMAIN" "$HTTPS_ONLY_KEY" -string force_enabled
+    for k in "${TELEMETRY_OFF_KEYS[@]}"; do
+        defaults write "$BROWSER_DOMAIN" "$k" -bool false
+    done
+    defaults write "$BROWSER_DOMAIN" "$SAFE_BROWSING_KEY" -int "$SAFE_BROWSING_STANDARD"
 }
 
 # The resting state both policies should be left in. Called on the normal path
@@ -660,6 +703,9 @@ cmd_browser() {
     # Whatever happens from here, the browser must not be left with incognito
     # forced or WebRTC allowed. Restoring twice on the normal path is harmless.
     trap restore_policies EXIT INT TERM
+
+    set_hardening_policies
+    ok "device APIs denied, HTTPS-only on, vendor telemetry reduced"
 
     # NOTE: expanded as ${profile_args[@]+"${profile_args[@]}"} below, not
     # "${profile_args[@]}" - bash 3.2, which is /bin/bash on macOS, errors on
