@@ -105,8 +105,9 @@
     align-items: baseline;
   }
   .row:last-child { border-bottom: 0; }
-  .row dt { color: var(--dim); font-size: .85rem; }
-  .row dd { margin: 0; font-family: var(--mono); font-size: .85rem; word-break: break-word; }
+  .row dt { color: var(--dim); font-size: .85rem; text-align: right; }
+  .row dd { margin: 0; font-family: var(--mono); font-size: .85rem;
+            word-break: break-word; text-align: center; }
   .note { grid-column: 1 / -1; color: var(--dim); font-size: .8rem;
           font-family: inherit; padding-top: .2rem; }
   .note summary { cursor: pointer; list-style: none; width: max-content;
@@ -123,6 +124,7 @@
   th, td { text-align: left; padding: .35rem 1.1rem; font-family: var(--mono); }
   th { color: var(--dim); font-weight: 600; font-family: inherit; font-size: .75rem; }
   tbody tr { border-top: 1px solid var(--line); }
+  tbody td[colspan] { text-align: center; color: var(--dim); }
   button {
     font: inherit; font-size: .85rem; padding: .35rem .8rem; cursor: pointer;
     background: transparent; color: var(--accent);
@@ -130,7 +132,12 @@
   }
   footer { color: var(--dim); font-size: .8rem; margin-top: 1.5rem; }
   code { font-family: var(--mono); font-size: .85em; }
-  @media (max-width: 34rem) { .row { grid-template-columns: 1fr; gap: .1rem; } }
+  @media (max-width: 34rem) {
+    /* Single column here, so right-aligned labels would float away from
+       their values. */
+    .row { grid-template-columns: 1fr; gap: .1rem; }
+    .row dt, .row dd { text-align: left; }
+  }
 </style>
 </head>
 <body>
