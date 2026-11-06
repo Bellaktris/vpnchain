@@ -249,6 +249,10 @@ def collect():
     pinned_up = port_open(host, pinned)
     incog_up = port_open(host, incog)
 
+    real_address = env("REAL_ADDRESS")
+    if real_address == "auto":
+        real_address = None
+
     return {
         "mode": singbox_mode(),
         # No default: naming a particular upstream here would disclose the
@@ -275,7 +279,12 @@ def collect():
             # so the dashboard can recognise the failure that matters - a
             # browser launched without the proxy, browsing on the real
             # address - which it otherwise has nothing to compare against.
-            "real": env("REAL_ADDRESS"),
+            #
+            # "auto" means 'vpnchain browser' measures it per launch and
+            # passes it in the page's fragment; it is a word, not an address,
+            # and reporting it as one would have the page compare the exit
+            # against the string "auto".
+            "real": real_address,
         },
         "measuredAt": int(time.time()),
     }

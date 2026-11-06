@@ -304,11 +304,13 @@ Optional:
              'vpnchain browser'
     INCOGNITO_PORT=<sing-box inbound that bypasses the WireGuard endpoint,
              default 1081; must exist in SINGBOX_CONFIG>
-    REAL_ADDRESS=<the address this machine presents with no proxy>
-             nothing measures it - the point of all this is not to make that
-             request - but given it the dashboard can name the one failure
-             it otherwise cannot see: a browser with no proxy in effect.
-             Update it when the ISP hands you a different one.
+    REAL_ADDRESS=<the address this machine presents with no proxy, or the
+             word "auto" to have 'vpnchain browser' measure it at launch>
+             Given it, the dashboard can name the one failure it otherwise
+             cannot see: a browser with no proxy in effect. A fixed value
+             needs updating when the ISP hands you a different one; "auto"
+             cannot go stale but makes one direct request per launch, which
+             is the request everything else here avoids making.
     INCOGNITO_PROFILE=<throwaway profile dir for the incognito browser>
     INCOGNITO_APP=<bundle of the incognito browser, defaults to
              Mullvad Browser>
@@ -498,6 +500,34 @@ SPOOF_TZ="${SPOOF_TZ:-}"
 # WireGuard endpoint. Same daemon, no reconfiguration - picking an exit is just
 # picking a port, and both can be in use at once.
 INCOGNITO_PORT="${INCOGNITO_PORT:-1081}"
+
+# The address this machine presents with nothing in the way. Configured
+# rather than discovered, because discovering it means making the one request
+# this whole arrangement is arranged to avoid making by accident - so it
+# happens only when the env file says REAL_ADDRESS=auto, only at launch, and
+# it says so on screen when it does.
+#
+# Without it the dashboard cannot tell an upstream node it has not seen
+# before from a browser running with no proxy at all. With it, the check the
+# incognito instance actually needs - not the pinned address, not this one -
+# is one the page can run.
+REAL_ADDRESS="${REAL_ADDRESS:-}"
+
+real_address() {
+    case "$REAL_ADDRESS" in
+        ("")     return 0 ;;
+        (auto)   ;;
+        (*)      printf '%s\n' "$REAL_ADDRESS"; return 0 ;;
+    esac
+    local ip
+    # --noproxy so a proxy in the environment cannot answer for the question
+    # being asked, which is what this machine looks like with none.
+    ip=$(curl -s -m 10 --noproxy '*' https://api.ipify.org 2>/dev/null)
+    case "$ip" in
+        (*[!0-9.:a-fA-F]*|"") return 0 ;;
+        (*)                   printf '%s\n' "$ip" ;;
+    esac
+}
 
 # The browser for that inbound. A Firefox-family bundle, so none of the
 # Chromium machinery above applies to it: no preference domain, no
@@ -1178,15 +1208,30 @@ launch_incognito() {
     #
     # Loopback is exempt from the proxy (and from HTTPS-only), so this is
     # reachable from a browser whose every other request goes to SOCKS.
-    local dash
+    # The fragment rather than the server's copy, so the check survives a
+    # status server that is down, and so REAL_ADDRESS=auto - which only this
+    # launch knows the answer to - reaches the page at all.
+    local dash real frag=
+    real=$(real_address)
+    if [ -n "$real" ]; then
+        frag="#real=$real"
+        [ "$REAL_ADDRESS" = auto ] &&
+            warn "measured this machine's own address directly to pass it on: $real"
+        ok "dashboard will check the exit against $real"
+    else
+        [ -n "$REAL_ADDRESS" ] && warn "could not determine this machine's own address"
+        warn "REAL_ADDRESS unset - the page cannot tell an unproxied browser"
+        warn "from an upstream node it has not seen; set it, or REAL_ADDRESS=auto"
+    fi
+
     if [ -n "$STATUSD_AGENT" ]; then
-        dash="http://127.0.0.1:$STATUS_PORT/"
+        dash="http://127.0.0.1:$STATUS_PORT/$frag"
         statusd_running || warn "status server is not running - the startup page will not load"
     else
         # No server configured, so the page cannot be served and cannot read
         # host status either. The expectation has to come from the fragment,
         # and the Chain section will be empty.
-        dash="file://$DASHBOARD_PAGE#expect=$EXPECTED_EXIT_IP"
+        dash="file://$DASHBOARD_PAGE#expect=$EXPECTED_EXIT_IP${frag:+&real=$real}"
         warn "no STATUSD_AGENT - the startup page cannot show host-side status"
     fi
 
