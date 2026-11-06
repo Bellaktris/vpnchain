@@ -907,10 +907,19 @@ function conclude() {
     checks.push({ state: "warn", label: "Exit address",
                   detail: findings.exitIp + " - unlinked exit, not the pinned one" });
   } else if (sameNetwork(findings.exitIp, inc)) {
+    // Worded as what was actually established. The page did not identify
+    // this as the incognito exit and cannot: all it has is that the address
+    // shares a /16 with the one the server reached through that inbound,
+    // which is 65k addresses and an inference, not a measurement. Saying
+    // "incognito exit" here reads as knowledge the page does not have.
+    // REAL_ADDRESS replaces the guess with a test it can actually run.
     checks.push({ state: "warn", label: "Exit address",
-                  detail: findings.exitIp + " - incognito exit" +
-                          (findings.exitIp === inc ? ""
-                           : " (rotated; host saw " + inc + ")") });
+                  detail: findings.exitIp +
+                          (findings.exitIp === inc
+                           ? " - the exit the host reached through the incognito inbound"
+                           : " - same network as that exit (" + inc + "), so"
+                             + " probably another of its nodes; set"
+                             + " REAL_ADDRESS to stop guessing") });
   } else {
     // Matches nothing on file. Without REAL_ADDRESS that is genuinely
     // ambiguous - an upstream node outside the pool the server saw looks
