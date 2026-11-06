@@ -113,11 +113,14 @@
 #            and restored, nothing has to be put back, and the pinned
 #            browser's settings are left exactly as they were.
 #
-#            The profile is WIPED at every launch rather than reused: the
-#            fingerprint has to be the stock one each time, and nothing from
-#            the last session should be able to link to this one. Within a
-#            session it persists normally, which is what makes extensions and
-#            logins work.
+#            Nothing survives the session. The browser is in permanent
+#            private browsing - its own default, not something set here - so
+#            little reaches the disk in the first place, and the profile is
+#            wiped both before the launch and when the browser quits, so
+#            between sessions there is nothing there to find. The fingerprint
+#            is therefore the stock one every time, and nothing from the last
+#            session can link to this one. Within a session it all persists
+#            normally, which is what makes extensions and logins work.
 #
 #            WebRTC rides the proxy instead of being switched off.
 #            media.peerconnection.ice.proxy_only gathers ICE candidates only
@@ -264,6 +267,12 @@
 # it wrong. Which means that instance wants the SERVED page, not the file -
 # 'browser incognito' sets it as the startup page for exactly that reason.
 #
+# What that instance is checked against is REAL_ADDRESS: not the pinned
+# address and not the real one is the whole requirement, and which node of
+# the upstream it came out at does not matter. Without it the page falls back
+# to comparing networks, which is wrong as soon as the exits span more than
+# one. The file:// form takes it as &real=<address>.
+#
 # Worth setting as the browser's startup page. Then any launch, including one
 # from the Dock that carries no proxy flag, shows you immediately whether you
 # are on the expected address - which restores passive detection in the only
@@ -295,6 +304,11 @@ Optional:
              'vpnchain browser'
     INCOGNITO_PORT=<sing-box inbound that bypasses the WireGuard endpoint,
              default 1081; must exist in SINGBOX_CONFIG>
+    REAL_ADDRESS=<the address this machine presents with no proxy>
+             nothing measures it - the point of all this is not to make that
+             request - but given it the dashboard can name the one failure
+             it otherwise cannot see: a browser with no proxy in effect.
+             Update it when the ISP hands you a different one.
     INCOGNITO_PROFILE=<throwaway profile dir for the incognito browser>
     INCOGNITO_APP=<bundle of the incognito browser, defaults to
              Mullvad Browser>
@@ -514,8 +528,10 @@ unset cand
 
 # Firefox keeps the proxy in prefs rather than on the command line, so this
 # directory is where the proxy for that instance lives - which is why it has
-# to be ours alone. It is wiped at every launch; the marker file is what
-# makes doing that with rm -rf safe, since a mistyped path will not have one.
+# to be ours alone. It is wiped before each launch and again when the browser
+# quits; the marker file is what makes doing that with rm -rf safe, since a
+# mistyped path will not have one. It also carries the launch id, so a
+# watcher from a previous session cannot wipe a newer one's profile.
 # Not the vpnchain-upstream-profile the Chrome instance used: that one may
 # still exist, holds no marker, and would be refused rather than wiped.
 INCOGNITO_PROFILE="${INCOGNITO_PROFILE:-$HOME/.cache/vpnchain-incognito-profile}"
@@ -1148,7 +1164,8 @@ launch_incognito() {
         bad "could not create $INCOGNITO_PROFILE"
         exit 1
     fi
-    : > "$INCOGNITO_PROFILE/$INCOGNITO_MARKER"
+    local launch_id="$$-$(date +%s)"
+    printf '%s\n' "$launch_id" > "$INCOGNITO_PROFILE/$INCOGNITO_MARKER"
     ok "fresh profile: $INCOGNITO_PROFILE"
 
     # The startup page is the dashboard, since the facts that matter for
@@ -1190,13 +1207,21 @@ user_pref("network.proxy.socks_remote_dns", true);
 // as a candidate. SOCKS carries no UDP, which is also why media needs TURN
 // over TCP to connect at all.
 user_pref("media.peerconnection.ice.proxy_only", true);
-// 2 = display in English. Not a preference so much as an answer to the
-// prompt this browser shows on a non-English system ("...has set your
-// display language to English"): leaving it unanswered means the bar comes
-// back at every launch, since the profile is new every time. English is also
-// the answer that keeps the shared fingerprint - the other one makes this
-// browser the rare localised instance.
+// A proxy that refuses one connection must not become a browser that
+// quietly goes direct. Firefox's failover does exactly that - marks the
+// proxy dead and uses the network - which here means browsing on the real
+// address with every indicator still saying the chain is up. Off, so a dead
+// proxy is a dead browser instead of a silent leak.
+user_pref("network.proxy.failover_direct", false);
+// Two different bars, both guaranteed by a profile that is new every launch.
+// This one is the RFP prompt, "do you want English language versions of web
+// pages": 2 answers yes, which is also the answer that keeps the shared
+// fingerprint, since the alternative publishes the real locale.
 user_pref("privacy.spoof_english", 2);
+// This one is the "...has set your display language to..." notice, shown
+// once per profile and recorded by this pref - which a wiped profile loses,
+// so it greeted every launch. Not web-observable either way.
+user_pref("intl.language_notification.shown", true);
 // Not web-observable, so it costs nothing against the shared fingerprint.
 user_pref("browser.startup.page", 1);
 user_pref("browser.startup.homepage", "$dash");
@@ -1221,9 +1246,28 @@ EOF
         exit 1
     fi
 
+    # Wiped when it quits as well as before it starts, so between sessions
+    # there is nothing on disk to find. The browser is in permanent private
+    # browsing, so what lands there is profile scaffolding rather than
+    # browsing data - but "not browsing data" is not the same as nothing.
+    #
+    # The watcher outlives this script. It ignores its own pid, since its
+    # command line names the profile too, and it wipes only while the marker
+    # still holds this launch's id - so a relaunch that beats it to the
+    # directory cannot have the fresh profile deleted underneath it. A
+    # machine that goes down with the browser open leaves the profile for
+    # the next launch to wipe.
+    nohup bash -c '
+        prof="$1"; marker="$2"; token="$3"; me=$$
+        while pgrep -f "$prof" | grep -qv "^${me}$"; do sleep 5; done
+        [ "$(cat "$prof/$marker" 2>/dev/null)" = "$token" ] && rm -rf "$prof"
+    ' _ "$INCOGNITO_PROFILE" "$INCOGNITO_MARKER" "$launch_id" >/dev/null 2>&1 &
+    disown 2>/dev/null
+
     echo
     bold "applied at this launch"
     ok "incognito browser running (pid $pid)"
+    ok "private browsing throughout, and the profile goes when it quits"
     warn "exit: upstream only - NOT the pinned address"
     warn "that exit is flagged as a proxy by IP databases - expect CAPTCHAs"
     ok "profile: wiped at launch, nothing carried over from last time"

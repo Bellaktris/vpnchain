@@ -31,7 +31,13 @@
   Deliberately free of site-specific values so it can live in a public repo.
   Pass the address you expect to see as a fragment:
 
-      vpnchain-dashboard.html#expect=203.0.113.9
+      vpnchain-dashboard.html#expect=203.0.113.9&real=198.51.100.7
+
+  real= is the address this machine presents with NO proxy. The page cannot
+  discover it and never tries; given it, the incognito instance is checked
+  for what it actually requires - an exit that is neither the pinned address
+  nor the real one - instead of guessing which network the exit belongs to.
+  Served by the status server it comes from REAL_ADDRESS in the env file.
 
   Served by vpnchain-statusd the expectation comes from the env file instead,
   and that host-side status - mode, ports, process state, the other exit -
@@ -323,13 +329,29 @@ function effectiveIncognito() {
   return (hostData && hostData.exits && hostData.exits.incognito) || null;
 }
 
-// ...and it rotates between connections, not just between launches: the
-// address the server measured and the one this browser came out at are two
-// different trips through the upstream, so an exact match is a coin flip. It
-// was losing that flip and reporting a red "wrong exit" at an instance doing
-// exactly what it should. The network is the stable part - the upstream's
-// pool - and landing anywhere in it is the thing being checked. An unrelated
-// address, the real one included, still matches nothing.
+// The address this machine presents with no proxy in the way. Supplied, not
+// measured: the page cannot see it, and nothing here should go looking for
+// it. With it the incognito check becomes the one that actually matters -
+// "not this" - rather than a guess at which pool the exit should be in,
+// which breaks as soon as the exits span more than one network.
+//
+// Its absence is why the fallback below exists; its staleness is the one
+// thing to watch, since an old value makes a browser on a NEW real address
+// look unlinked. Update it when the ISP hands you a different one.
+var realFragment = fragment("real");
+
+function effectiveReal() {
+  if (realFragment) return realFragment;
+  return (hostData && hostData.exits && hostData.exits.real) || null;
+}
+
+// Fallback for when no real address is configured: the incognito exit
+// rotates between connections, not just between launches, so comparing the
+// address this browser came out at against the one the server measured is a
+// coin flip - and losing it rendered a red "wrong exit" at an instance doing
+// exactly what it should. Same network is a weaker claim than "not the real
+// address", and wrong if the upstream's nodes span several, which is exactly
+// why it yields to effectiveReal() above.
 function sameNetwork(a, b) {
   if (!a || !b) return false;
   var x = a.split("."), y = b.split(".");
@@ -421,6 +443,27 @@ function compareScopes() {
   settle("timezone");
 }
 
+// Every probe below runs at page load, and this page is a browser's HOME
+// PAGE: at that moment the proxy, the extensions and the network stack are
+// all still coming up, and a request that fails there says nothing about the
+// chain. One failed fetch used to be final - the row settled on "unreachable"
+// and stayed there until a manual reload, so the page reported the state of
+// the first second of the browser's life and called it a verdict.
+//
+// Retries cover only rejected requests, which is what a not-yet-ready proxy
+// produces. An HTTP error is a real answer from a real server and still falls
+// through to the per-probe fallbacks below.
+function fetchRetry(url, opts, tries, gap) {
+  tries = tries === undefined ? 3 : tries;
+  gap = gap === undefined ? 700 : gap;
+  return fetch(url, opts).catch(function (e) {
+    if (tries <= 1) throw e;
+    return new Promise(function (done) { setTimeout(done, gap); })
+      .then(function () { return fetchRetry(url, opts, tries - 1, gap * 2); });
+  });
+}
+
+
 /* -------------------------------------------------------------------- exit */
 
 // One request covers everything: the address sites see, where databases place
@@ -429,7 +472,7 @@ function compareScopes() {
 // the second one rate-limited constantly.
 function checkExit() {
   var t0 = performance.now();
-  fetch("https://ipinfo.io/json")
+  fetchRetry("https://ipinfo.io/json")
     .then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
@@ -457,7 +500,7 @@ function checkExit() {
       put("exit-org", "-");
       put("exit-where", "-");
       put("exit-rtt", "-");
-      fetch("https://api.ipify.org?format=json")
+      fetchRetry("https://api.ipify.org?format=json")
         .then(function (r) { return r.json(); })
         .then(function (d) {
           findings.exitIp = d.ip;
@@ -537,7 +580,7 @@ function checkCookies() {
 var hostData = null;
 
 function checkHost() {
-  fetch("/status.json", { cache: "no-store" })
+  fetchRetry("/status.json", { cache: "no-store" })
     .then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
@@ -656,7 +699,7 @@ function checkHost() {
 // to be followed - fetch does by default. Geolocating the resolver through the
 // same provider as the exit lets the two be compared on equal terms.
 function checkDns() {
-  fetch("https://edns.ip-api.com/json")
+  fetchRetry("https://edns.ip-api.com/json")
     .then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
@@ -667,7 +710,7 @@ function checkDns() {
       findings.dnsIp = ip;
       put("dns-ip", ip);
       put("dns-geo", (d.dns || {}).geo || "not reported");
-      return fetch("https://ipinfo.io/" + encodeURIComponent(ip) + "/json")
+      return fetchRetry("https://ipinfo.io/" + encodeURIComponent(ip) + "/json")
         .then(function (r) { return r.json(); })
         .then(function (g) { findings.dnsCountry = g.country || null; })
         .catch(function () { findings.dnsCountry = null; });
@@ -819,12 +862,15 @@ function conclude() {
   var checks = [];
   var exp = effectiveExpected();
   var inc = effectiveIncognito();
+  var real = effectiveReal();
 
   // Render the Exit rows here rather than in the probe: the expectation can
   // arrive from the status server after the address has been measured.
   if (!pending.exit && !pending.host) {
     var cls = !findings.exitIp ? "bad"
             : (exp && findings.exitIp === exp) ? "ok"
+            : (real && findings.exitIp === real) ? "bad"
+            : real ? "warn"
             : sameNetwork(findings.exitIp, inc) ? "warn" : "bad";
     if (findings.exitIp) put("exit-ip", findings.exitIp, cls);
     put("exit-expect", exp || "not supplied", exp ? cls : "pend");
@@ -844,17 +890,37 @@ function conclude() {
   } else if (exp && findings.exitIp === exp) {
     checks.push({ state: "pass", label: "Exit address",
                   detail: findings.exitIp + " - pinned exit" });
+  } else if (real && findings.exitIp === real) {
+    // The failure the rest of this page is arranged around: a browser with no
+    // proxy in effect, started from the Dock or launched without the flag,
+    // browsing on the address everything else here exists to keep off the
+    // wire. Nothing else is reported in this tone.
+    checks.push({ state: "fail", label: "Exit address",
+                  detail: findings.exitIp + " - YOUR REAL ADDRESS, no proxy" });
+  } else if (real) {
+    // Not the pinned address and not the real one, which is the whole
+    // requirement for the incognito instance: unlinked from both. Which
+    // address inside the upstream is immaterial, and it rotates anyway.
+    // Still a warning rather than a pass, because in the everyday browser the
+    // same reading means the pinned exit is not in effect, and the page
+    // cannot tell which instance it is running in.
+    checks.push({ state: "warn", label: "Exit address",
+                  detail: findings.exitIp + " - unlinked exit, not the pinned one" });
   } else if (sameNetwork(findings.exitIp, inc)) {
-    // A known exit, just not the pinned one. Correct in the incognito
-    // instance, wrong in the everyday one - and the page cannot tell which it
-    // is running in, so it reports rather than judges.
     checks.push({ state: "warn", label: "Exit address",
                   detail: findings.exitIp + " - incognito exit" +
                           (findings.exitIp === inc ? ""
                            : " (rotated; host saw " + inc + ")") });
   } else {
-    checks.push({ state: "fail", label: "Exit address",
-                  detail: findings.exitIp + ", expected " + (exp || inc) });
+    // Matches nothing on file. Without REAL_ADDRESS that is genuinely
+    // ambiguous - an upstream node outside the pool the server saw looks
+    // exactly like a browser with no proxy at all - and announcing either
+    // reading as fact would be the page inventing a verdict it cannot
+    // support. It says what it knows and what it is missing instead.
+    checks.push({ state: "warn", label: "Exit address",
+                  detail: findings.exitIp + " - neither the pinned exit nor" +
+                          " the one the host measured; set REAL_ADDRESS to" +
+                          " tell an unproxied browser from another node" });
   }
 
   // Timezone agreement across scopes.
@@ -985,6 +1051,20 @@ readTimezone();
 describeEnvironment();
 checkExit();
 checkWebRTC();
+
+// Startup is the worst moment to ask a just-opened browser's proxy for
+// anything. Loopback answers at once - the chain and cookie rows fill in
+// immediately - while the probes that leave the machine are still waiting,
+// and whatever they eventually settle on is what the page keeps. The cure
+// was always a manual reload, so the page does the equivalent itself, once,
+// for whichever probes still have nothing to show. The Re-run button remains
+// for the rest.
+setTimeout(function () {
+  var again = false;
+  if (!findings.exitIp) { pending.exit = true; checkExit(); again = true; }
+  if (!findings.dnsIp) { pending.dns = true; checkDns(); again = true; }
+  if (again) conclude();
+}, 6000);
 </script>
 </body>
 </html>

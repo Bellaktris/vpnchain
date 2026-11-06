@@ -269,6 +269,13 @@ def collect():
             # node, so a prefix would go stale.
             "pinned": exit_through(pinned) if pinned_up else None,
             "incognito": exit_through(incog) if incog_up else None,
+            # Configured, never measured. Learning it would mean making an
+            # UNPROXIED request from this daemon, which is the one thing the
+            # whole arrangement exists to avoid doing by accident. It is here
+            # so the dashboard can recognise the failure that matters - a
+            # browser launched without the proxy, browsing on the real
+            # address - which it otherwise has nothing to compare against.
+            "real": env("REAL_ADDRESS"),
         },
         "measuredAt": int(time.time()),
     }
