@@ -2,7 +2,8 @@
 # vpnchain - toggle a chained proxy setup on macOS.
 #
 #   browser, launched by 'vpnchain browser'
-#     -> --proxy-server, pinned to that launch only
+#     -> proxy pinned to that launch alone: a command-line flag for the
+#        pinned browser, a profile pref for the upstream one
 #        -> sing-box: userspace WireGuard endpoint (no tun, no root)
 #           -> detour via an upstream SOCKS proxy
 #              -> upstream transport
@@ -33,41 +34,13 @@
 # Omit it to keep whatever the config already has; the dashboard reports the
 # active mode, so there is no separate command to query it.
 #
-#   browser [incognito|with-webrtc] [with-cookies]
-#            quit and relaunch the browser from this shell with SPOOF_TZ and
-#            the WebRTC policy applied. Both are read only at startup, which
-#            is why this is a restart - closing windows is not enough.
+#   browser [with-webrtc] [with-cookies]
+#            quit and relaunch the PINNED browser from this shell with
+#            SPOOF_TZ and the WebRTC policy applied. Both are read only at
+#            startup, which is why this is a restart - closing windows is not
+#            enough.
 #
-#            incognito opens a SEPARATE incognito instance pointed at the
-#            inbound that bypasses the WireGuard
-#            endpoint - so it changes TWO things at once: nothing persists,
-#            AND it exits at the upstream instead of the pinned address. It coexists with the main browser; a browser can only
-#            hold one proxy, so a second exit means a second instance. That
-#            exit is a shared datacenter address flagged as a proxy by IP
-#            databases, so expect CAPTCHAs - the trade is that the session is
-#            not linked to the pinned address.
-#
-#            Its timezone is not configured but MEASURED: the upstream selects
-#            nodes by latency, so the exit country changes between launches and
-#            any fixed value would end up contradicting the address. The zone
-#            is read through that exit at launch and applied to it, so the
-#            clock agrees with wherever the session actually comes out.
-#
-#            It also takes INCOGNITO_FLAGS, for capability this instance can
-#            afford to lose and the main browser cannot.
-#
-#            A SOCKS proxy cannot carry UDP, so WebRTC would otherwise reach
-#            the network directly and expose the real address regardless of
-#            everything else here. The default launch prevents that.
-#
-#            It also disables incognito in the main browser. An incognito
-#            window there clears cookies and history but keeps the pinned exit
-#            address - the one thing that actually identifies you - so it
-#            looks anonymous while being nothing of the sort. The incognito
-#            instance, which does change the exit, forces incognito for itself
-#            and the setting is put back immediately after it launches.
-#
-#            It also applies a set of static hardening policies borrowed from
+#            It applies a set of static hardening policies borrowed from
 #            Safari and Firefox: WebUSB, Web Bluetooth, Web Serial and WebHID
 #            denied (neither browser ever shipped them), HTTPS-only mode on,
 #            and vendor telemetry reduced - URL-keyed collection and metrics
@@ -82,6 +55,12 @@
 #            These are never relaxed, so unlike the two below there is
 #            nothing to restore.
 #
+#            It also disables incognito HERE. An incognito window in this
+#            browser clears cookies and history but keeps the pinned exit
+#            address - the one thing that actually identifies you - so it
+#            looks anonymous while being nothing of the sort. The unlinked
+#            exit is a separate browser, below, not a window in this one.
+#
 #            Third-party cookies are blocked by default too - they are the
 #            cross-site join key, and the browser does not block them on its
 #            own since that phase-out was reversed. with-cookies relaxes that
@@ -94,6 +73,76 @@
 #            the exposure is scoped to that session and the next launch is
 #            protected again - no timer, nothing to remember. Use it when a
 #            call needs to connect.
+#
+#   browser upstream
+#            launch Mullvad Browser against the inbound that bypasses the
+#            WireGuard endpoint, so the session exits at the upstream instead
+#            of the pinned address. It coexists with the pinned browser: a
+#            browser holds one proxy, so a second exit means a second
+#            browser. That exit is a shared datacenter address flagged as a
+#            proxy by IP databases, so expect CAPTCHAs - the trade is that
+#            the session is not linked to the pinned address.
+#
+#            'incognito' is still accepted as the old name for this verb.
+#
+#            A different browser rather than a second Chrome profile, because
+#            the two sessions want different things. The pinned one wants a
+#            stable identity and working pages. This one wants to be
+#            indistinguishable from other people's sessions, and no amount of
+#            policy gives Chrome that: denying APIs one at a time lowers
+#            entropy per row while RAISING joint uniqueness, since stock
+#            Chrome answers those calls and this one does not - the denial is
+#            itself the distinguishing bit. Mullvad Browser is Firefox with
+#            the Tor uplift (resistFingerprinting, letterboxing, a font
+#            allowlist, canvas readback behind a prompt) and without Tor,
+#            built to sit behind someone else's VPN, which is what this chain
+#            is. The goal is a shared fingerprint, not a rare one.
+#
+#            Tor Browser would be the wrong pick here: Tor over this chain is
+#            slow, and the exit address stops being the chain's, which is the
+#            address the dashboard's #expect= check is about.
+#
+#            Nothing global is touched for this launch. Firefox has no proxy
+#            flag, so the proxy goes in prefs and the prefs go in a throwaway
+#            profile. No preference domain is written, no policy is relaxed
+#            and restored, nothing has to be put back, and the pinned
+#            browser's settings are left exactly as they were.
+#
+#            The profile is WIPED at every launch rather than reused: the
+#            fingerprint has to be the stock one each time, and nothing from
+#            the last session should be able to link to this one. Within a
+#            session it persists normally, which is what makes extensions and
+#            logins work.
+#
+#            WebRTC rides the proxy instead of being switched off.
+#            media.peerconnection.ice.proxy_only gathers ICE candidates only
+#            through the SOCKS inbound, so the real address is never offered
+#            as one. SOCKS carries no UDP, so peer-to-peer media still cannot
+#            work: calls connect where TURN over TCP is offered and fail
+#            where it is not. There is nothing to relax, so with-webrtc does
+#            not apply to this verb.
+#
+#            ONLY the proxy prefs are written. Every pref beyond them moves
+#            this instance off the shared fingerprint and towards a unique
+#            one, which is the opposite of the point - so the flags this
+#            instance used to carry are deliberately not ported:
+#
+#              --disable-webgl and --disable-reading-from-canvas measured
+#              9.29 and 8.87 bits on Cover Your Tracks, the two largest
+#              removable rows in Chrome. resistFingerprinting covers the same
+#              ground - canvas readback prompts, WebGL is normalised - as a
+#              default shared with every other user of this browser rather
+#              than as a deviation from one.
+#
+#              INCOGNITO_TZ and INCOGNITO_TZ_FOLLOW_EXIT are inert here:
+#              resistFingerprinting reports UTC whatever TZ the process was
+#              launched with, so the zone is no longer ours to choose. The
+#              old logic derived it from the exit at launch because UTC
+#              measured 6.78 bits - one browser in 110 - against a populous
+#              real zone's 3.85. That was measured in Chrome, where UTC was
+#              an outlier WITHIN the configuration; here it is the population
+#              default, so the finding does not carry over. Do not
+#              reintroduce TZ handling for this instance: it cannot work.
 #
 #   config [check]
 #            write the sing-box config from the env file, which is the single
@@ -166,7 +215,7 @@
 #
 #     file://<this directory>/vpnchain-dashboard.html#expect=<exit address>
 #
-# Add &incognito=<prefix> so the incognito instance, which exits elsewhere by
+# Add &incognito=<prefix> so the upstream instance, which exits elsewhere by
 # design, is labelled rather than reported as a wrong address.
 #
 # Worth setting as the browser's startup page. Then any launch, including one
@@ -200,9 +249,10 @@ Optional:
              'vpnchain browser'
     INCOGNITO_PORT=<sing-box inbound that bypasses the WireGuard endpoint,
              default 1081; must exist in SINGBOX_CONFIG>
-    INCOGNITO_TZ=<timezone for that instance, default UTC>
-    INCOGNITO_PROFILE=<its throwaway profile dir>
-    BROWSER_APP=<path to the browser bundle, defaults to Google Chrome>
+    INCOGNITO_PROFILE=<throwaway profile dir for the upstream browser>
+    INCOGNITO_APP=<bundle of the upstream browser, defaults to
+             Mullvad Browser>
+    BROWSER_APP=<bundle of the pinned browser, defaults to Google Chrome>
     BROWSER_DOMAIN=<its preference domain, for the WebRTC policy>
     NOTIFY_ALLOW=<space-separated origins allowed to show notifications,
              e.g. "https://mail.example.com https://chat.example.com";
@@ -240,14 +290,14 @@ BROWSER_DOMAIN="${BROWSER_DOMAIN:-com.google.Chrome}"
 WEBRTC_KEYS=(WebRtcIPHandlingPolicy WebRtcIPHandling)
 WEBRTC_BLOCK_VALUE=disable_non_proxied_udp
 
-# Incognito in the MAIN browser clears cookies and history while leaving the
-# exit address untouched - so it looks anonymous while still presenting the
-# one address that identifies you. Disabled by default for that reason; the
-# incognito instance, which actually changes the exit, turns it on for itself.
+# Incognito in the pinned browser clears cookies and history while leaving
+# the exit address untouched - so it looks anonymous while still presenting
+# the one address that identifies you. Disabled for that reason, and never
+# re-enabled: the unlinked exit is 'browser upstream', a different browser
+# altogether, so nothing needs this mode any more.
 #   0 available   1 disabled   2 forced
 INCOGNITO_KEY=IncognitoModeAvailability
 INCOGNITO_OFF=1
-INCOGNITO_FORCED=2
 
 # Third-party cookies are the cross-site join key: the same embedded domain
 # appears on thousands of sites and recognises its own cookie each time. The
@@ -388,58 +438,44 @@ SPOOF_TZ="${SPOOF_TZ:-}"
 # picking a port, and both can be in use at once.
 INCOGNITO_PORT="${INCOGNITO_PORT:-1081}"
 
-# This used to default to UTC, on the theory that reporting what Tor Browser
-# and Firefox resistFingerprinting report puts the instance in a large set.
-# Measuring it against Cover Your Tracks disproved that: UTC scored 6.78 bits,
-# one browser in 110 - worse than a populous real zone, and among a population
-# of privacy testers where UTC should have been OVER-represented if the theory
-# held. Do not restore it on that reasoning.
-#
-# Matching the zone to the exit is the right answer, but the upstream node is
-# chosen by latency, so this exit's country changes between launches - no
-# static value can stay consistent with it. It is therefore DERIVED at launch
-# from the exit actually in use (see incognito_tz), and this is only the
-# fallback for when that lookup fails.
-#
-# The fallback is a populous zone rather than UTC because when the exit is
-# unknown, consistency is not achievable and the only remaining goal is to
-# spend few bits. Deliberately not the pinned instance's zone either: the whole
-# purpose of this exit is to be unlinkable from that one, and a shared timezone
-# is a signal handed over for nothing.
-INCOGNITO_TZ="${INCOGNITO_TZ:-America/New_York}"
+# The browser for that inbound. A Firefox-family bundle, so none of the
+# Chromium machinery above applies to it: no preference domain, no
+# --proxy-server, no --incognito. See the header on why it is a different
+# browser rather than a second profile of the pinned one.
+INCOGNITO_APP="${INCOGNITO_APP:-/Applications/Mullvad Browser.app}"
 
-# Set to 0 to pin INCOGNITO_TZ verbatim instead of following the exit. Exists
-# because the two are not obviously ordered: following the exit scores far
-# better on the timezone row itself - a populous real zone measured 3.85 bits
-# against UTC's 6.78 on Cover Your Tracks - and it is the only way the
-# dashboard's clock-vs-exit check can pass. Against that, a real zone paired
-# with an en-US language header is an odd COMBINATION, and joint uniqueness is
-# not what per-row bits measure. Tested: pinning UTC left the joint result
-# unique either way, so the combination was not the cause and the per-row
-# improvement stands unopposed.
-INCOGNITO_TZ_FOLLOW_EXIT="${INCOGNITO_TZ_FOLLOW_EXIT:-1}"
+# Bundles in this family disagree on the executable name - Tor Browser ships
+# Contents/MacOS/firefox - so ask the bundle rather than guessing: that is
+# exactly what CFBundleExecutable is for. The name list is the fallback for a
+# bundle with no readable Info.plist, and INCOGNITO_BIN overrides both.
+INCOGNITO_BIN="${INCOGNITO_BIN:-}"
+if [ -z "$INCOGNITO_BIN" ] && [ -r "$INCOGNITO_APP/Contents/Info.plist" ]; then
+    cand=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
+           "$INCOGNITO_APP/Contents/Info.plist" 2>/dev/null)
+    [ -n "$cand" ] && [ -x "$INCOGNITO_APP/Contents/MacOS/$cand" ] &&
+        INCOGNITO_BIN="$INCOGNITO_APP/Contents/MacOS/$cand"
+fi
+if [ -z "$INCOGNITO_BIN" ]; then
+    for cand in mullvadbrowser firefox; do
+        if [ -x "$INCOGNITO_APP/Contents/MacOS/$cand" ]; then
+            INCOGNITO_BIN="$INCOGNITO_APP/Contents/MacOS/$cand"
+            break
+        fi
+    done
+fi
+unset cand
 
-# Extra flags for the incognito instance only. The measured case for
-# --disable-webgl: on Cover Your Tracks the WebGL hash scored 9.29 bits and the
-# vendor/renderer string 8.87, the two largest removable rows by a wide margin,
-# and one flag removes both. It is a denial rather than a substitution, and it
-# reaches Web Workers too because it disables the implementation rather than
-# patching the API - so OffscreenCanvas in a worker gets no context either.
-#
-# Not applied to the pinned instance: that one is for ordinary browsing, where
-# losing WebGL breaks maps and anything 3D, and where the dedicated residential
-# address identifies you far more precisely than any fingerprint anyway.
-#
-# Avoid --force-device-scale-factor=1 here. It was measured and it does change
-# devicePixelRatio, but it leaves screen=1512x982 at dpr=1, which is not a
-# combination real hardware produces - and an implausible pair is more
-# identifying than the honest one it replaced.
-INCOGNITO_FLAGS="${INCOGNITO_FLAGS:-}"
-
-# Only needed to force a SEPARATE browser process, which is what lets this
-# instance hold a different proxy. The session itself runs --incognito, so no
-# browsing data lands here and the directory needs no maintenance.
+# Firefox keeps the proxy in prefs rather than on the command line, so this
+# directory is where the proxy for that instance lives - which is why it has
+# to be ours alone. It is wiped at every launch; the marker file is what
+# makes doing that with rm -rf safe, since a mistyped path will not have one.
 INCOGNITO_PROFILE="${INCOGNITO_PROFILE:-$HOME/.cache/vpnchain-upstream-profile}"
+INCOGNITO_MARKER=.vpnchain-profile
+
+# Set by env files written for the Chrome instance this replaced. Warned
+# about rather than silently ignored - each one used to change the session's
+# fingerprint, so a reader is entitled to know it no longer does.
+RETIRED_VARS=(INCOGNITO_TZ INCOGNITO_TZ_FOLLOW_EXIT INCOGNITO_FLAGS)
 
 SINGBOX_CONFIG="${SINGBOX_CONFIG:-$HOME/.config/sing-box/config.json}"
 
@@ -681,34 +717,6 @@ wait_for_chain() {
     bad "tunnel is up but not carrying traffic after ~25s"
     echo "         check: tail ~/.config/sing-box/sing-box.err.log"
     return 1
-}
-
-# The zone the incognito exit sits in, read through that exit itself so the
-# answer describes the node actually in use. The upstream picks nodes by
-# latency, so this changes between launches and no configured value could keep
-# up; deriving it is what makes the clock agree with the address instead of
-# contradicting it.
-#
-# Prints nothing when it cannot be determined, leaving the caller to fall back.
-incognito_tz() {
-    local body tz
-    body=$(curl -s -m 10 --socks5-hostname "$PROXY_HOST:$INCOGNITO_PORT" \
-           https://ipinfo.io/json 2>/dev/null)
-    [ -z "$body" ] && return 0
-    tz=$(printf '%s' "$body" | python3 -c '
-import json, sys
-try:
-    print(json.load(sys.stdin).get("timezone") or "")
-except Exception:
-    print("")
-' 2>/dev/null)
-    # Two checks, because a malformed TZ fails SILENTLY: the C library falls
-    # back to UTC rather than erroring, so a bad value would present as a
-    # working spoof that reports the wrong zone - the failure mode hardest to
-    # notice. Shape first, then confirm the zone actually exists on this host.
-    case "$tz" in
-        */*) [ -f "/usr/share/zoneinfo/$tz" ] && printf '%s\n' "$tz" ;;
-    esac
 }
 
 # Switch the config between chained and direct. Returns 0 if it changed.
@@ -1032,29 +1040,148 @@ have_wg_creds() {
     return 0
 }
 
+# The pid of the upstream browser, or nothing.
+#
+# The profile path is the precise match: only our own launch names it on a
+# command line. The binary is a fallback for the case where the bundle re-execs
+# and the argv we passed does not survive into the running process - a false
+# negative there would report a launch that worked as a failure. It is NOT
+# used for the already-running gate, since it would also match an instance
+# started from the Dock, which holds no proxy and which -no-remote keeps
+# separate from ours anyway.
+upstream_pid() {
+    local pid
+    pid=$(pgrep -f "$INCOGNITO_PROFILE" 2>/dev/null | head -1)
+    [ -z "$pid" ] && pid=$(pgrep -f "$INCOGNITO_BIN" 2>/dev/null | head -1)
+    printf '%s\n' "$pid"
+}
+
+# The upstream-exit browser. Everything this configures lives in the profile
+# it is about to be handed, so unlike the pinned launch there is no global
+# state to relax, no trap, and nothing to put back afterwards.
+launch_upstream() {
+    local v pid
+    for v in "${RETIRED_VARS[@]}"; do
+        [ -n "${!v:-}" ] && warn "$v is set but no longer does anything - see the header"
+    done
+
+    if [ -z "$INCOGNITO_BIN" ] || [ ! -x "$INCOGNITO_BIN" ]; then
+        bad "no browser executable inside $INCOGNITO_APP"
+        echo "         install it:  brew install --cask mullvad-browser"
+        echo "         or point INCOGNITO_APP at the bundle you want"
+        exit 1
+    fi
+
+    # A second launch hands off to the running instance and this one's prefs
+    # are silently discarded, so report that rather than a launch that did
+    # not happen. Wiping the profile under a running instance is also how you
+    # corrupt it.
+    pid=$(pgrep -f "$INCOGNITO_PROFILE" | head -1)
+    if [ -n "$pid" ]; then
+        warn "an instance is ALREADY running on this profile (pid $pid)"
+        warn "it keeps the proxy it started with - quit it and rerun to change"
+        return 0
+    fi
+
+    # Wiped rather than reused: the fingerprint has to be the stock one every
+    # time, and nothing from the last session should be able to link to this
+    # one. The marker is what makes rm -rf safe here - a mistyped path will
+    # not have one, so it is refused instead of erased.
+    if [ -e "$INCOGNITO_PROFILE" ]; then
+        if [ ! -f "$INCOGNITO_PROFILE/$INCOGNITO_MARKER" ]; then
+            bad "$INCOGNITO_PROFILE was not created by vpnchain"
+            echo "         refusing to wipe it - point INCOGNITO_PROFILE elsewhere"
+            exit 1
+        fi
+        rm -rf "$INCOGNITO_PROFILE"
+    fi
+    if ! mkdir -p "$INCOGNITO_PROFILE"; then
+        bad "could not create $INCOGNITO_PROFILE"
+        exit 1
+    fi
+    : > "$INCOGNITO_PROFILE/$INCOGNITO_MARKER"
+    ok "fresh profile: $INCOGNITO_PROFILE"
+
+    # user.js is re-read at every startup, so this file is the entire
+    # configuration of the instance. Only the proxy belongs in it - see the
+    # header on why anything else here is a step backwards.
+    cat > "$INCOGNITO_PROFILE/user.js" <<EOF
+// Written by vpnchain at every launch - the profile is wiped first, so
+// editing this file achieves nothing. Do not add prefs: each one moves this
+// instance off the fingerprint it exists to share.
+user_pref("network.proxy.type", 1);
+user_pref("network.proxy.socks", "$PROXY_HOST");
+user_pref("network.proxy.socks_port", $INCOGNITO_PORT);
+user_pref("network.proxy.socks_version", 5);
+// Hostnames reach the proxy unresolved, so DNS cannot leak locally.
+user_pref("network.proxy.socks_remote_dns", true);
+// ICE gathers through the proxy alone, so the real address is never offered
+// as a candidate. SOCKS carries no UDP, which is also why media needs TURN
+// over TCP to connect at all.
+user_pref("media.peerconnection.ice.proxy_only", true);
+EOF
+    ok "proxy pinned in the profile: $PROXY_HOST:$INCOGNITO_PORT (remote DNS)"
+    ok "webrtc restricted to the proxy - no direct UDP, no host candidate"
+
+    # -no-remote so this cannot hand off to another Firefox-family process
+    # and inherit its proxy; -profile so it uses this profile rather than the
+    # bundle's own.
+    nohup "$INCOGNITO_BIN" -no-remote -profile "$INCOGNITO_PROFILE" \
+        >/dev/null 2>&1 &
+    disown 2>/dev/null
+    sleep 3
+
+    pid=$(upstream_pid)
+    if [ -z "$pid" ]; then
+        bad "upstream browser did not come up"
+        echo "         run it in the foreground to see why:"
+        echo "           '$INCOGNITO_BIN' -no-remote -profile '$INCOGNITO_PROFILE'"
+        exit 1
+    fi
+
+    echo
+    bold "applied at this launch"
+    ok "upstream browser running (pid $pid)"
+    warn "exit: upstream only - NOT the pinned address"
+    warn "that exit is flagged as a proxy by IP databases - expect CAPTCHAs"
+    ok "profile: wiped at launch, nothing carried over from last time"
+    ok "fingerprint: this browser's defaults, unmodified"
+    ok "timezone: UTC, from resistFingerprinting - not ours to set"
+    echo "         the exit and the clock are measurable only from inside the"
+    echo "         browser - open vpnchain-dashboard.html there:"
+    echo "         #expect=<pinned exit>&incognito=<upstream prefix>"
+}
+
 cmd_browser() {
     # Flags name what you opt INTO, so the bare command cannot accidentally
     # mean "expose my real address" or "use the unlinked exit".
-    local want=block exit_kind=pinned cookies=block already_up=0 a
+    local want=block exit_kind=pinned cookies=block a
     for a in "$@"; do
         case "$a" in
             "")             ;;
             with-webrtc)    want=allow ;;
             with-cookies)   cookies=allow ;;
-            incognito)  exit_kind=upstream ;;
-            *) echo "usage: vpnchain browser [incognito|with-webrtc] [with-cookies]" >&2
+            # 'incognito' was this verb's name while the unlinked exit was a
+            # second Chrome running --incognito. It is a different browser
+            # now, and that mode is no longer used at all.
+            upstream|incognito) exit_kind=upstream ;;
+            *) echo "usage: vpnchain browser [with-webrtc] [with-cookies]" >&2
+               echo "       vpnchain browser upstream" >&2
                exit 1 ;;
         esac
     done
 
-    # Refused rather than merely warned about: an unlinked session that is
-    # allowed to use non-proxied UDP leaks the real address into exactly the
-    # session whose whole purpose is not carrying it.
-    if [ "$exit_kind" = upstream ] && [ "$want" = allow ]; then
-        bad "incognito and with-webrtc are mutually exclusive"
-        echo "         WebRTC would expose your real address inside the"
-        echo "         session that exists specifically to avoid that"
-        exit 1
+    # Dispatched before anything below touches a preference domain: launching
+    # the upstream browser must not change the pinned browser's settings.
+    if [ "$exit_kind" = upstream ]; then
+        # Not flags on this launch but on a browser that is not involved, so
+        # they have nothing to act on here.
+        [ "$want" = allow ] && \
+            warn "with-webrtc does not apply - webrtc already rides the proxy there"
+        [ "$cookies" = allow ] && \
+            warn "with-cookies does not apply - that browser keeps its own defaults"
+        launch_upstream
+        return
     fi
 
     if [ ! -x "$BROWSER_BIN" ]; then
@@ -1063,7 +1190,8 @@ cmd_browser() {
     fi
 
     # Whatever happens from here, the browser must not be left with incognito
-    # forced or WebRTC allowed. Restoring twice on the normal path is harmless.
+    # available or WebRTC allowed. Restoring twice on the normal path is
+    # harmless.
     trap restore_policies EXIT INT TERM
 
     set_hardening_policies
@@ -1077,67 +1205,24 @@ cmd_browser() {
         ok "notifications blocked (no allowlist configured)"
     fi
 
-    # NOTE: expanded as ${profile_args[@]+"${profile_args[@]}"} below, not
-    # "${profile_args[@]}" - bash 3.2, which is /bin/bash on macOS, errors on
-    # an empty array under set -u.
-    local port tz profile_args=()
-    if [ "$exit_kind" = upstream ]; then
-        # Bypasses the WireGuard endpoint entirely, so this exits at the
-        # upstream rather than the pinned address. A browser can only hold one
-        # proxy, so this has to be a SEPARATE instance with its own profile -
-        # it coexists with the main one rather than replacing it.
-        port="$INCOGNITO_PORT"
-        # Derived from the exit rather than configured - see incognito_tz.
-        if [ "$INCOGNITO_TZ_FOLLOW_EXIT" = 1 ]; then
-            tz="$(incognito_tz)"
-            if [ -n "$tz" ]; then
-                ok "timezone matched to this exit: $tz"
-            else
-                tz="$INCOGNITO_TZ"
-                warn "could not read the exit's zone - using fallback $tz"
-                warn "the clock will not match the address this session"
-            fi
-        else
-            tz="$INCOGNITO_TZ"
-            ok "timezone pinned to $tz (not following the exit)"
-            warn "the clock will not match the exit address"
-        fi
-        # --incognito does the cleanup for us: nothing is persisted, so the
-        # profile dir needs no wiping. --user-data-dir is still required -
-        # without it --incognito just opens a window in the EXISTING browser,
-        # which carries the main instance's proxy rather than this one.
-        profile_args=(--user-data-dir="$INCOGNITO_PROFILE" --incognito
-                      --no-first-run --no-default-browser-check)
-        # Deliberately unquoted: the value is a list of flags, not one flag.
-        # shellcheck disable=SC2206
-        [ -n "$INCOGNITO_FLAGS" ] && profile_args+=($INCOGNITO_FLAGS)
-        # Remember whether one was already up: a second launch hands off to
-        # it and this invocation's flags are silently discarded.
-        pgrep -f "$INCOGNITO_PROFILE" >/dev/null 2>&1 && already_up=1
-        ok "separate incognito instance (nothing persisted)"
-        [ -n "$INCOGNITO_FLAGS" ] && ok "extra flags: $INCOGNITO_FLAGS"
-        warn "this exit is flagged as a proxy by IP databases - expect CAPTCHAs"
-    else
-        port="$PROXY_PORT"
-        tz="$SPOOF_TZ"
+    local tz="$SPOOF_TZ"
+    if browser_running; then
+        ok "asking the browser to quit (it will restore your session)"
+        osascript -e "quit app \"$(basename "${BROWSER_APP%.app}")\"" >/dev/null 2>&1
+        local i=0
+        while browser_running && [ "$i" -lt 60 ]; do
+            sleep 0.25
+            i=$((i + 1))
+        done
         if browser_running; then
-            ok "asking the browser to quit (it will restore your session)"
-            osascript -e "quit app \"$(basename "${BROWSER_APP%.app}")\"" >/dev/null 2>&1
-            local i=0
-            while browser_running && [ "$i" -lt 60 ]; do
-                sleep 0.25
-                i=$((i + 1))
-            done
-            if browser_running; then
-                bad "browser is still running - it may be holding an unsaved prompt"
-                bad "launching now would just hand off to the existing process and"
-                bad "change nothing, so stopping here. Quit it manually and retry."
-                exit 1
-            fi
-            ok "browser quit"
-        else
-            ok "browser was not running"
+            bad "browser is still running - it may be holding an unsaved prompt"
+            bad "launching now would just hand off to the existing process and"
+            bad "change nothing, so stopping here. Quit it manually and retry."
+            exit 1
         fi
+        ok "browser quit"
+    else
+        ok "browser was not running"
     fi
 
     # Policies are read at startup, so they have to be in place before the
@@ -1155,49 +1240,28 @@ cmd_browser() {
         warn "third-party cookies allowed for this launch"
     fi
 
-    if [ "$exit_kind" = upstream ]; then
-        set_incognito_policy "$INCOGNITO_FORCED"
-        ok "incognito forced for this launch"
-    else
-        set_incognito_policy "$INCOGNITO_OFF"
-        ok "incognito disabled (it would not change the exit address)"
-    fi
+    set_incognito_policy "$INCOGNITO_OFF"
+    ok "incognito disabled (it would not change the exit address)"
 
     # The proxy is pinned to this launch rather than set system-wide, so the
     # scope is exactly this browser and nothing else on the machine is touched.
     # Chrome still hands over hostnames rather than pre-resolving, so remote
     # DNS - and therefore no DNS leak - is preserved.
     local bpid
-    local proxy_flag="--proxy-server=socks5://$PROXY_HOST:$port"
-    ok "proxy pinned to this launch: $PROXY_HOST:$port"
+    local proxy_flag="--proxy-server=socks5://$PROXY_HOST:$PROXY_PORT"
+    ok "proxy pinned to this launch: $PROXY_HOST:$PROXY_PORT"
     if [ -n "$tz" ]; then
         ok "launching with TZ=$tz"
-        TZ="$tz" nohup "$BROWSER_BIN" "$proxy_flag" \
-            ${profile_args[@]+"${profile_args[@]}"} >/dev/null 2>&1 &
+        TZ="$tz" nohup "$BROWSER_BIN" "$proxy_flag" >/dev/null 2>&1 &
     else
         warn "no timezone configured - launching with the system timezone"
-        nohup "$BROWSER_BIN" "$proxy_flag" \
-            ${profile_args[@]+"${profile_args[@]}"} >/dev/null 2>&1 &
+        nohup "$BROWSER_BIN" "$proxy_flag" >/dev/null 2>&1 &
     fi
     bpid=$!
     disown 2>/dev/null
     sleep 3
 
-    if [ "$exit_kind" = upstream ]; then
-        # Not the launcher pid: if an instance with this profile is already
-        # running, the launch hands off to it and the launcher exits at once,
-        # which would read as a failure. Ask whether the instance exists.
-        if ! pgrep -f "$INCOGNITO_PROFILE" >/dev/null 2>&1; then
-            bad "incognito instance did not come up"
-        elif [ "$already_up" = 1 ]; then
-            warn "an instance was ALREADY running - this launch handed off to it"
-            warn "and its flags were discarded. The proxy and timezone in effect"
-            warn "are whatever that instance started with, not what is printed"
-            warn "above. Quit it first if you changed INCOGNITO_PORT or _TZ."
-        else
-            ok "incognito instance running (pid $(pgrep -f "$INCOGNITO_PROFILE" | head -1))"
-        fi
-    elif browser_running; then
+    if browser_running; then
         ok "browser started (pid $bpid)"
     else
         bad "browser did not come up"
@@ -1207,13 +1271,6 @@ cmd_browser() {
     # read the relaxed one and keeps it for its lifetime, so the exposure is
     # scoped to this session and the next launch is protected by default -
     # no timer, nothing to remember.
-    if [ "$exit_kind" = upstream ]; then
-        set_incognito_policy "$INCOGNITO_OFF"
-        echo
-        ok "incognito policy restored to disabled"
-        echo "         this instance stays incognito for its lifetime"
-    fi
-
     if [ "$cookies" = allow ]; then
         set_cookie_policy true
         echo
@@ -1233,10 +1290,8 @@ cmd_browser() {
 
     echo
     bold "applied at this launch"
-    [ "$exit_kind" = upstream ] && warn "exit: upstream only - NOT the pinned address" \
-                                || ok "exit: the pinned address"
-    [ "$exit_kind" = upstream ] && ok "incognito: forced" \
-                                || ok "incognito: unavailable in this browser"
+    ok "exit: the pinned address"
+    ok "incognito: unavailable in this browser"
     [ "$cookies" = block ] && ok "third-party cookies: blocked" \
                            || bad "third-party cookies: ALLOWED - cross-site linking possible"
     if [ "$want" = block ]; then
@@ -1253,7 +1308,6 @@ cmd_browser() {
         warn "timezone: system default"
     fi
 }
-
 
 # Rendering what the env file describes and diffing it is the one check the
 # status server deliberately does not do - a second copy of the generator
@@ -1301,7 +1355,8 @@ case "${1:-status}" in
     *)
         echo "usage: vpnchain {start|restart} [chained|direct]"
         echo "       vpnchain stop"
-        echo "       vpnchain browser [incognito|with-webrtc] [with-cookies]"
+        echo "       vpnchain browser [with-webrtc] [with-cookies]"
+        echo "       vpnchain browser upstream"
         echo "       vpnchain config [check]"
         echo "       vpnchain blocklist"
         exit 1
