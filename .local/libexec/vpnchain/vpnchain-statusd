@@ -356,7 +356,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # Any page can issue requests to 127.0.0.1 - the browsers here bypass the
+    # proxy for loopback, which is how the dashboard reaches this server at
+    # all - and DNS rebinding turns that from "can send" into "can read": the
+    # attacker's own name is made to resolve here, so the reply is same-origin
+    # to their page and its body is theirs. What this file hands out is the
+    # pinned exit, the measured real address, ports, process names and the
+    # browser policy.
+    #
+    # The Host header separates the two cases, because the browser sends the
+    # name the page asked for rather than the address it resolved to. A
+    # rebound request therefore arrives carrying the attacker's hostname.
+    #
+    # Both loopback names are allowed deliberately: the cookie probe is framed
+    # from whichever of them the dashboard was NOT served from, which is what
+    # makes that frame genuinely third-party and is the whole point of it.
+    def _host_allowed(self):
+        host = (self.headers.get("Host") or "").strip().lower()
+        if not host:
+            return False
+        port = self.server.server_address[1]
+        for name in ("127.0.0.1", "localhost", "[::1]"):
+            if host == name or host == "%s:%d" % (name, port):
+                return True
+        return False
+
     def do_GET(self):
+        if not self._host_allowed():
+            # Named rather than silently dropped: the one person who will
+            # ever see this is whoever reaches the server by a name nobody
+            # anticipated, and they need to know what refused them.
+            return self._send(403, b"vpnchain-statusd: this server answers "
+                                   b"only to 127.0.0.1 and localhost\n",
+                              "text/plain")
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             try:
