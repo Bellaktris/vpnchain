@@ -173,8 +173,13 @@
 #              everyone else's is neither.
 #
 #              INCOGNITO_TZ and INCOGNITO_TZ_FOLLOW_EXIT are inert here:
-#              resistFingerprinting reports UTC whatever TZ the process was
-#              launched with, so the zone is no longer ours to choose. The
+#              resistFingerprinting reports a fixed zone whatever TZ the
+#              process was launched with - measured as Atlantic/Reykjavik,
+#              UTC+0 without the tell of literally saying UTC - in the main
+#              thread, a Worker and an iframe alike. The zone is no longer
+#              ours to choose, and the dashboard's clock-vs-exit row will
+#              therefore always disagree with wherever the upstream landed:
+#              that warning is expected here, not a fault. The
 #              old logic derived it from the exit at launch because UTC
 #              measured 6.78 bits - one browser in 110 - against a populous
 #              real zone's 3.85. That was measured in Chrome, where UTC was
@@ -1185,6 +1190,13 @@ user_pref("network.proxy.socks_remote_dns", true);
 // as a candidate. SOCKS carries no UDP, which is also why media needs TURN
 // over TCP to connect at all.
 user_pref("media.peerconnection.ice.proxy_only", true);
+// 2 = display in English. Not a preference so much as an answer to the
+// prompt this browser shows on a non-English system ("...has set your
+// display language to English"): leaving it unanswered means the bar comes
+// back at every launch, since the profile is new every time. English is also
+// the answer that keeps the shared fingerprint - the other one makes this
+// browser the rare localised instance.
+user_pref("privacy.spoof_english", 2);
 // Not web-observable, so it costs nothing against the shared fingerprint.
 user_pref("browser.startup.page", 1);
 user_pref("browser.startup.homepage", "$dash");
@@ -1216,7 +1228,7 @@ EOF
     warn "that exit is flagged as a proxy by IP databases - expect CAPTCHAs"
     ok "profile: wiped at launch, nothing carried over from last time"
     ok "fingerprint: this browser's defaults, unmodified"
-    ok "timezone: UTC, from resistFingerprinting - not ours to set"
+    ok "timezone: fixed by resistFingerprinting - not ours to set"
     echo "         the exit and the clock are measurable only from inside"
     echo "         the browser, which is what the startup page is for"
 }

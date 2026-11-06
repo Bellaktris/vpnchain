@@ -323,6 +323,20 @@ function effectiveIncognito() {
   return (hostData && hostData.exits && hostData.exits.incognito) || null;
 }
 
+// ...and it rotates between connections, not just between launches: the
+// address the server measured and the one this browser came out at are two
+// different trips through the upstream, so an exact match is a coin flip. It
+// was losing that flip and reporting a red "wrong exit" at an instance doing
+// exactly what it should. The network is the stable part - the upstream's
+// pool - and landing anywhere in it is the thing being checked. An unrelated
+// address, the real one included, still matches nothing.
+function sameNetwork(a, b) {
+  if (!a || !b) return false;
+  var x = a.split("."), y = b.split(".");
+  if (x.length !== 4 || y.length !== 4) return a === b;   // IPv6: exact
+  return x[0] === y[0] && x[1] === y[1];
+}
+
 var findings = { exitIp: null, exitTz: null, exitCountry: null,
                  tzMain: null, tzWorker: null, tzIframe: null,
                  rtcLeak: null, rtcCount: 0,
@@ -811,7 +825,7 @@ function conclude() {
   if (!pending.exit && !pending.host) {
     var cls = !findings.exitIp ? "bad"
             : (exp && findings.exitIp === exp) ? "ok"
-            : (inc && findings.exitIp === inc) ? "warn" : "bad";
+            : sameNetwork(findings.exitIp, inc) ? "warn" : "bad";
     if (findings.exitIp) put("exit-ip", findings.exitIp, cls);
     put("exit-expect", exp || "not supplied", exp ? cls : "pend");
   }
@@ -830,12 +844,14 @@ function conclude() {
   } else if (exp && findings.exitIp === exp) {
     checks.push({ state: "pass", label: "Exit address",
                   detail: findings.exitIp + " - pinned exit" });
-  } else if (inc && findings.exitIp === inc) {
+  } else if (sameNetwork(findings.exitIp, inc)) {
     // A known exit, just not the pinned one. Correct in the incognito
     // instance, wrong in the everyday one - and the page cannot tell which it
     // is running in, so it reports rather than judges.
     checks.push({ state: "warn", label: "Exit address",
-                  detail: findings.exitIp + " - incognito exit" });
+                  detail: findings.exitIp + " - incognito exit" +
+                          (findings.exitIp === inc ? ""
+                           : " (rotated; host saw " + inc + ")") });
   } else {
     checks.push({ state: "fail", label: "Exit address",
                   detail: findings.exitIp + ", expected " + (exp || inc) });
