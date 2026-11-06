@@ -122,6 +122,41 @@ def singbox_config_path():
                os.path.expanduser("~/.config/sing-box/config.json"))
 
 
+def hidden_services():
+    """Whether .onion and .i2p can actually go anywhere.
+
+    Three things fail here and all three look identical from a browser - the
+    request simply does not complete. The port can be missing from the env
+    file, in which case the generated config has no rule for the suffix and
+    the name was never going anywhere. The rule can be absent from the LIVE
+    config even though the port is set, which is the state between editing
+    the env file and running 'vpnchain config && vpnchain restart'. Or the
+    daemon can be down, which for i2pd is the normal resting state since it
+    is started on demand.
+
+    Reported as three fields rather than one verdict, because the fix is
+    different in each case."""
+    try:
+        with open(singbox_config_path()) as f:
+            live = f.read()
+    except OSError:
+        live = ""
+
+    out = {}
+    for name, var, suffix in (("tor", "TOR_PORT", ".onion"),
+                              ("i2p", "I2P_PORT", ".i2p")):
+        port = env(var)
+        out[name] = {
+            "suffix": suffix,
+            # The daemons are local to this machine, never on PROXY_HOST:
+            # they are what the chain hands these names off to.
+            "port": int(port) if port else None,
+            "listening": port_open("127.0.0.1", port) if port else False,
+            "routed": ('"%s"' % suffix) in live,
+        }
+    return out
+
+
 def blocklist():
     """Tracker rejection happens in the chain, so this is one of the few facts
     the dashboard genuinely cannot measure for itself: a blocked request looks
@@ -267,6 +302,7 @@ def collect():
         "systemProxy": system_proxy(),
         "browserPolicy": browser_policy(),
         "blocklist": blocklist(),
+        "hidden": hidden_services(),
         "exits": {
             "expected": env("EXPECTED_EXIT_IP"),
             # Measured, not pattern-matched: the upstream exit rotates with the
