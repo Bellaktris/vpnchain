@@ -70,6 +70,12 @@
     font: 15px/1.55 ui-sans-serif, -apple-system, system-ui, sans-serif;
   }
   .wrap { max-width: 56rem; margin: 0 auto; }
+
+  /* Only ever seen when the script did not run; it removes this itself. */
+  .reload-note {
+    margin-bottom: 1rem; padding: .6rem .8rem; border-radius: .4rem;
+    border: 1px solid #b7791f; color: #b7791f; font-size: .85rem;
+  }
   .verdict-actions { position: absolute; right: 1.1rem; bottom: .8rem; }
   h1 { font-size: 1.3rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
   .sub { color: var(--dim); font-size: .85rem; margin-bottom: 1.5rem; }
@@ -162,8 +168,26 @@
   }
 </style>
 </head>
+<!-- Inside <noscript> because removing the element from the DOM does NOT
+     cancel a refresh the parser has already scheduled - that was tried, and
+     it reloaded the page every eight seconds whether the script had run or
+     not. Here the browser never schedules one unless scripting is off. -->
+<noscript><meta http-equiv="refresh" content="8"></noscript>
 <body>
 <div class="wrap">
+
+<!-- Scripts can be blocked on the FIRST load of a browser session without
+     anything being wrong: NoScript's content script asks its background page
+     for the policy, that page is not up yet during startup, and it fails
+     closed. What is left is this skeleton with every row still reading
+     "checking", which is indistinguishable from a verdict until you notice
+     that nothing ever changes - so the page says so, and reloads itself. -->
+<noscript>
+  <div class="reload-note">
+    Scripts did not run on this load - reloading shortly. If this repeats,
+    they are blocked for this page rather than merely late.
+  </div>
+</noscript>
 
 <div class="verdict" id="verdict">
   <span class="headline" id="verdict-headline">Measuring</span>

@@ -304,13 +304,16 @@ Optional:
              'vpnchain browser'
     INCOGNITO_PORT=<sing-box inbound that bypasses the WireGuard endpoint,
              default 1081; must exist in SINGBOX_CONFIG>
-    REAL_ADDRESS=<the address this machine presents with no proxy, or the
-             word "auto" to have 'vpnchain browser' measure it at launch>
-             Given it, the dashboard can name the one failure it otherwise
-             cannot see: a browser with no proxy in effect. A fixed value
-             needs updating when the ISP hands you a different one; "auto"
-             cannot go stale but makes one direct request per launch, which
-             is the request everything else here avoids making.
+    REAL_ADDRESS=auto (the default), a fixed address, or "off"
+             The address this machine presents with no proxy, which is how
+             the dashboard names the one failure it otherwise cannot see: a
+             browser with no proxy in effect. Measured at each launch unless
+             pinned here, since a written-down one goes stale; "off" skips
+             the measurement and the check with it.
+    INCOGNITO_SEARCH=<default search engine for it: google, duckduckgo,
+             startpage, brave or mojeek. Unset leaves the browser's own
+             choice. Needs App Management permission, since the policy that
+             sets it lives inside the application bundle>
     INCOGNITO_PROFILE=<throwaway profile dir for the incognito browser>
     INCOGNITO_APP=<bundle of the incognito browser, defaults to
              Mullvad Browser>
@@ -501,23 +504,24 @@ SPOOF_TZ="${SPOOF_TZ:-}"
 # picking a port, and both can be in use at once.
 INCOGNITO_PORT="${INCOGNITO_PORT:-1081}"
 
-# The address this machine presents with nothing in the way. Configured
-# rather than discovered, because discovering it means making the one request
-# this whole arrangement is arranged to avoid making by accident - so it
-# happens only when the env file says REAL_ADDRESS=auto, only at launch, and
-# it says so on screen when it does.
+# The address this machine presents with nothing in the way, which is what
+# lets the dashboard tell an upstream node it has not seen before from a
+# browser running with no proxy at all - the one failure the page cannot
+# otherwise name.
 #
-# Without it the dashboard cannot tell an upstream node it has not seen
-# before from a browser running with no proxy at all. With it, the check the
-# incognito instance actually needs - not the pinned address, not this one -
-# is one the page can run.
-REAL_ADDRESS="${REAL_ADDRESS:-}"
+# MEASURED at every launch by default, because an ISP hands out a different
+# one often enough that a written-down value is wrong exactly when it
+# matters. That costs one direct request per launch, which is the request
+# everything else here is arranged to avoid making, so it is announced on
+# screen rather than done quietly. Pin an address to skip it, or set "off" if
+# you would rather the page went without.
+REAL_ADDRESS="${REAL_ADDRESS:-auto}"
 
 real_address() {
     case "$REAL_ADDRESS" in
-        ("")     return 0 ;;
-        (auto)   ;;
-        (*)      printf '%s\n' "$REAL_ADDRESS"; return 0 ;;
+        (off|none|no) return 0 ;;
+        (auto)        ;;
+        (*)           printf '%s\n' "$REAL_ADDRESS"; return 0 ;;
     esac
     local ip
     # --noproxy so a proxy in the environment cannot answer for the question
@@ -555,6 +559,89 @@ if [ -z "$INCOGNITO_BIN" ]; then
     done
 fi
 unset cand
+
+# Default search engine for the incognito browser. Empty leaves the browser's
+# own choice alone, which is what an untouched install should get.
+#
+# This is the one setting that cannot live in the profile: the engine list is
+# not a pref, and the policy that sets it is read from inside the application
+# bundle. browser.policies.alternatePath, the per-profile escape hatch, is
+# honoured only in automation and Nightly builds; macOS policy preferences
+# have to be FORCED ones from a configuration profile, which a defaults write
+# is not. Both were tried and both left the policy engine inactive.
+#
+# So this writes into the bundle, which needs App Management permission for
+# whatever runs this script, and which a Mullvad auto-update will undo -
+# hence rewriting it at every launch rather than once.
+INCOGNITO_SEARCH="${INCOGNITO_SEARCH:-}"
+
+# Engines the policy can name. A search engine is a URL template and little
+# else; add one here rather than letting arbitrary templates in from the env
+# file, where a typo becomes a browser that quietly searches somewhere else.
+search_template() {
+    # bash 3.2 is /bin/bash here, so no ${1,,}.
+    case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+        (google)     printf 'https://www.google.com/search?q={searchTerms}\n' ;;
+        (duckduckgo) printf 'https://duckduckgo.com/?q={searchTerms}\n' ;;
+        (startpage)  printf 'https://www.startpage.com/sp/search?query={searchTerms}\n' ;;
+        (brave)      printf 'https://search.brave.com/search?q={searchTerms}\n' ;;
+        (mojeek)     printf 'https://www.mojeek.com/search?q={searchTerms}\n' ;;
+    esac
+}
+
+# Put the search policy in place, or report why it is not. Never fatal: a
+# browser with the wrong default search engine is a nuisance, and refusing to
+# launch over it would be worse than the nuisance.
+set_search_policy() {
+    local name="$1" dist file template current
+    dist="$INCOGNITO_APP/Contents/Resources/distribution"
+    file="$dist/policies.json"
+
+    template=$(search_template "$name")
+    if [ -z "$template" ]; then
+        warn "INCOGNITO_SEARCH=$name is not one this script knows - ignoring"
+        return 0
+    fi
+
+    # "_vpnchain" marks the file as ours. Firefox reads the "policies" key and
+    # ignores the rest, so this costs nothing and keeps us from overwriting a
+    # policies.json that someone else put there deliberately.
+    local want
+    want=$(cat <<EOF
+{
+  "_vpnchain": "default search engine, rewritten at every launch",
+  "policies": {
+    "SearchEngines": {
+      "Add": [
+        {
+          "Name": "$name",
+          "URLTemplate": "$template",
+          "Method": "GET",
+          "Description": "$name"
+        }
+      ],
+      "Default": "$name"
+    }
+  }
+}
+EOF
+)
+    if [ -f "$file" ] && ! grep -q '"_vpnchain"' "$file"; then
+        warn "$file exists and is not ours - leaving the search engine alone"
+        return 0
+    fi
+    current=$(cat "$file" 2>/dev/null)
+    if [ "$current" = "$want" ]; then
+        ok "default search engine: $name"
+        return 0
+    fi
+    if ! mkdir -p "$dist" 2>/dev/null || ! printf '%s\n' "$want" > "$file" 2>/dev/null; then
+        warn "could not write $file"
+        warn "grant App Management to whatever runs this, or unset INCOGNITO_SEARCH"
+        return 0
+    fi
+    ok "default search engine: $name (policy written into the bundle)"
+}
 
 # Firefox keeps the proxy in prefs rather than on the command line, so this
 # directory is where the proxy for that instance lives - which is why it has
@@ -1216,12 +1303,15 @@ launch_incognito() {
     if [ -n "$real" ]; then
         frag="#real=$real"
         [ "$REAL_ADDRESS" = auto ] &&
-            warn "measured this machine's own address directly to pass it on: $real"
+            warn "asked the network directly for this machine's own address: $real"
         ok "dashboard will check the exit against $real"
     else
-        [ -n "$REAL_ADDRESS" ] && warn "could not determine this machine's own address"
-        warn "REAL_ADDRESS unset - the page cannot tell an unproxied browser"
-        warn "from an upstream node it has not seen; set it, or REAL_ADDRESS=auto"
+        case "$REAL_ADDRESS" in
+            (off|none|no) ok "not measuring this machine's own address (REAL_ADDRESS=$REAL_ADDRESS)" ;;
+            (*)           warn "could not determine this machine's own address" ;;
+        esac
+        warn "the page cannot tell an unproxied browser from an upstream node"
+        warn "it has not seen before"
     fi
 
     if [ -n "$STATUSD_AGENT" ]; then
@@ -1271,6 +1361,8 @@ user_pref("intl.language_notification.shown", true);
 user_pref("browser.startup.page", 1);
 user_pref("browser.startup.homepage", "$dash");
 EOF
+    [ -n "$INCOGNITO_SEARCH" ] && set_search_policy "$INCOGNITO_SEARCH"
+
     ok "proxy pinned in the profile: $PROXY_HOST:$INCOGNITO_PORT (remote DNS)"
     ok "webrtc restricted to the proxy - no direct UDP, no host candidate"
     ok "startup page: $dash"
