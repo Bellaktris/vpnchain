@@ -704,6 +704,42 @@ I2P_PORT="${I2P_PORT:-}"
 
 port_listening() { nc -z "$1" "$2" >/dev/null 2>&1; }
 
+# Nothing rotates a launchd redirect, and sing-box logs every connection at
+# info - which is deliberate, since that log is what answers "where did this
+# name actually go", but it had reached 59 MB. Trimmed to its tail rather
+# than emptied: the recent lines are the useful ones.
+#
+# Only ever while the agent is down, which is the one moment truncating
+# cannot race the process appending to it.
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-10485760}"
+LOG_KEEP_LINES="${LOG_KEEP_LINES:-2000}"
+
+trim_log() {
+    local f="$1" size tmp
+    [ -f "$f" ] || return 0
+    size=$(stat -f %z "$f" 2>/dev/null) || return 0
+    [ "${size:-0}" -gt "$LOG_MAX_BYTES" ] || return 0
+    tmp=$(mktemp -t vpnchain-log) || return 0
+    if tail -n "$LOG_KEEP_LINES" "$f" > "$tmp" 2>/dev/null; then
+        cat "$tmp" > "$f"
+        ok "trimmed $(basename "$f"): $((size / 1048576)) MB -> last $LOG_KEEP_LINES lines"
+    fi
+    rm -f "$tmp"
+}
+
+# Read from the plists rather than guessed, so this follows the agents if
+# their logs ever move.
+trim_agent_logs() {
+    local plist key path
+    for plist in "$PLIST" "$STATUSD_PLIST"; do
+        [ -f "$plist" ] || continue
+        for key in StandardOutPath StandardErrorPath; do
+            path=$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist" 2>/dev/null) || continue
+            [ -n "$path" ] && trim_log "$path"
+        done
+    done
+}
+
 # i2pd is started on demand rather than kept running, which is the whole
 # reason this verb exists. An I2P router is not a client that dials out when
 # asked: it joins the network, carries other people's traffic and costs
@@ -883,6 +919,10 @@ cmd_start() {
         start_statusd
         return
     fi
+
+    # Down right now, so this is the safe moment.
+    trim_agent_logs
+
     launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
         || launchctl load -w "$PLIST" 2>/dev/null
     sleep 2
