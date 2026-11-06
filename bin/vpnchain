@@ -3,7 +3,7 @@
 #
 #   browser, launched by 'vpnchain browser'
 #     -> proxy pinned to that launch alone: a command-line flag for the
-#        pinned browser, a profile pref for the upstream one
+#        pinned browser, a profile pref for the incognito one
 #        -> sing-box: userspace WireGuard endpoint (no tun, no root)
 #           -> detour via an upstream SOCKS proxy
 #              -> upstream transport
@@ -74,7 +74,7 @@
 #            protected again - no timer, nothing to remember. Use it when a
 #            call needs to connect.
 #
-#   browser upstream
+#   browser incognito
 #            launch Mullvad Browser against the inbound that bypasses the
 #            WireGuard endpoint, so the session exits at the upstream instead
 #            of the pinned address. It coexists with the pinned browser: a
@@ -83,7 +83,12 @@
 #            proxy by IP databases, so expect CAPTCHAs - the trade is that
 #            the session is not linked to the pinned address.
 #
-#            'incognito' is still accepted as the old name for this verb.
+#            'upstream' is accepted as a synonym, that being what the exit
+#            is. The name 'incognito' belongs to this verb and to the
+#            INCOGNITO_* settings, NOT to Chrome's mode of the same name -
+#            that mode is disabled in the pinned browser and is no longer
+#            used anywhere. What it used to provide here, a session that
+#            persists nothing, is now the wiped profile below.
 #
 #            A different browser rather than a second Chrome profile, because
 #            the two sessions want different things. The pinned one wants a
@@ -133,6 +138,39 @@
 #              ground - canvas readback prompts, WebGL is normalised - as a
 #              default shared with every other user of this browser rather
 #              than as a deviation from one.
+#
+#            What those flags were measured against is worth keeping, since it
+#            is the case for this browser and against any further flags:
+#
+#              Every combination tested in Chrome left the JOINT fingerprint
+#              unique, or within a couple of browsers of it, in a corpus of
+#              406,000. Per-row bits kept improving while the join stayed
+#              solvable, so blending in was never actually on offer there.
+#
+#              The canvas hash measured IDENTICAL in the pinned and unlinked
+#              instances - it is a property of the GPU and installed fonts,
+#              not of the profile - so it linked the two personas straight
+#              through a different exit, a different timezone, forced
+#              incognito and blocked third-party cookies. It was the
+#              strongest join key between them, which is why it was worth
+#              denying even at the cost of looking stranger.
+#
+#              It was not the only one. Screen 1512x982x30, 10 cores, 16 GB,
+#              MacIntel, the 27-font list, the AudioContext value
+#              (124.0434748024636, 1 in 38.6) and the user agent were also
+#              identical in both, and no Chrome flag touches any of them.
+#              Breaking that needs an engine that standardises or randomises
+#              per site, which is the whole reason this instance is no longer
+#              Chrome.
+#
+#              And the rule the Chrome setup kept relearning: altering a
+#              value only helps if the new value is commoner than the old
+#              one, and for anything tied to this hardware it usually is not.
+#              --disable-accelerated-2d-canvas took the canvas row from 9.49
+#              bits to 11.34 - the rarest value in the report - because
+#              almost nobody on macOS rasterises in software. Denials are
+#              safe; substitutions are a bet. A browser whose defaults are
+#              everyone else's is neither.
 #
 #              INCOGNITO_TZ and INCOGNITO_TZ_FOLLOW_EXIT are inert here:
 #              resistFingerprinting reports UTC whatever TZ the process was
@@ -215,8 +253,11 @@
 #
 #     file://<this directory>/vpnchain-dashboard.html#expect=<exit address>
 #
-# Add &incognito=<prefix> so the upstream instance, which exits elsewhere by
-# design, is labelled rather than reported as a wrong address.
+# The incognito instance exits elsewhere by design, and that address rotates
+# with the upstream node, so it is not something a fragment could pin: the
+# status server measures it and the page labels the exit rather than calling
+# it wrong. Which means that instance wants the SERVED page, not the file -
+# 'browser incognito' sets it as the startup page for exactly that reason.
 #
 # Worth setting as the browser's startup page. Then any launch, including one
 # from the Dock that carries no proxy flag, shows you immediately whether you
@@ -249,8 +290,8 @@ Optional:
              'vpnchain browser'
     INCOGNITO_PORT=<sing-box inbound that bypasses the WireGuard endpoint,
              default 1081; must exist in SINGBOX_CONFIG>
-    INCOGNITO_PROFILE=<throwaway profile dir for the upstream browser>
-    INCOGNITO_APP=<bundle of the upstream browser, defaults to
+    INCOGNITO_PROFILE=<throwaway profile dir for the incognito browser>
+    INCOGNITO_APP=<bundle of the incognito browser, defaults to
              Mullvad Browser>
     BROWSER_APP=<bundle of the pinned browser, defaults to Google Chrome>
     BROWSER_DOMAIN=<its preference domain, for the WebRTC policy>
@@ -281,6 +322,7 @@ STATUSD_AGENT="${STATUSD_AGENT:-}"
 STATUSD_PLIST="$HOME/Library/LaunchAgents/$STATUSD_AGENT.plist"
 STATUS_PORT="${STATUS_PORT:-8787}"
 STATUSD_BIN="$(cd "$(dirname "$0")" && pwd)/vpnchain-statusd"
+DASHBOARD_PAGE="$(cd "$(dirname "$0")" && pwd)/vpnchain-dashboard.html"
 
 # Chromium-family preference domain whose WebRTC policy we toggle.
 # Override in the env file for Brave, Edge, Chromium, etc.
@@ -293,7 +335,7 @@ WEBRTC_BLOCK_VALUE=disable_non_proxied_udp
 # Incognito in the pinned browser clears cookies and history while leaving
 # the exit address untouched - so it looks anonymous while still presenting
 # the one address that identifies you. Disabled for that reason, and never
-# re-enabled: the unlinked exit is 'browser upstream', a different browser
+# re-enabled: the unlinked exit is 'browser incognito', a different browser
 # altogether, so nothing needs this mode any more.
 #   0 available   1 disabled   2 forced
 INCOGNITO_KEY=IncognitoModeAvailability
@@ -469,7 +511,9 @@ unset cand
 # directory is where the proxy for that instance lives - which is why it has
 # to be ours alone. It is wiped at every launch; the marker file is what
 # makes doing that with rm -rf safe, since a mistyped path will not have one.
-INCOGNITO_PROFILE="${INCOGNITO_PROFILE:-$HOME/.cache/vpnchain-upstream-profile}"
+# Not the vpnchain-upstream-profile the Chrome instance used: that one may
+# still exist, holds no marker, and would be refused rather than wiped.
+INCOGNITO_PROFILE="${INCOGNITO_PROFILE:-$HOME/.cache/vpnchain-incognito-profile}"
 INCOGNITO_MARKER=.vpnchain-profile
 
 # Set by env files written for the Chrome instance this replaced. Warned
@@ -1040,7 +1084,7 @@ have_wg_creds() {
     return 0
 }
 
-# The pid of the upstream browser, or nothing.
+# The pid of the incognito browser, or nothing.
 #
 # The profile path is the precise match: only our own launch names it on a
 # command line. The binary is a fallback for the case where the bundle re-execs
@@ -1049,17 +1093,17 @@ have_wg_creds() {
 # used for the already-running gate, since it would also match an instance
 # started from the Dock, which holds no proxy and which -no-remote keeps
 # separate from ours anyway.
-upstream_pid() {
+incognito_pid() {
     local pid
     pid=$(pgrep -f "$INCOGNITO_PROFILE" 2>/dev/null | head -1)
     [ -z "$pid" ] && pid=$(pgrep -f "$INCOGNITO_BIN" 2>/dev/null | head -1)
     printf '%s\n' "$pid"
 }
 
-# The upstream-exit browser. Everything this configures lives in the profile
-# it is about to be handed, so unlike the pinned launch there is no global
-# state to relax, no trap, and nothing to put back afterwards.
-launch_upstream() {
+# The incognito browser. Everything this configures lives in the profile it
+# is about to be handed, so unlike the pinned launch there is no global state
+# to relax, no trap, and nothing to put back afterwards.
+launch_incognito() {
     local v pid
     for v in "${RETIRED_VARS[@]}"; do
         [ -n "${!v:-}" ] && warn "$v is set but no longer does anything - see the header"
@@ -1102,9 +1146,31 @@ launch_upstream() {
     : > "$INCOGNITO_PROFILE/$INCOGNITO_MARKER"
     ok "fresh profile: $INCOGNITO_PROFILE"
 
+    # The startup page is the dashboard, since the facts that matter for
+    # this instance - the exit it came out at, the clock, whether WebRTC
+    # leaks - are measurable only from inside the browser. The SERVED copy
+    # rather than the file: same origin as status.json, so the page can read
+    # the host-side status, including the measured address of this exit; from
+    # a file:// origin that fetch is cross-origin and the page would report a
+    # browser behaving exactly as intended as being on the wrong exit.
+    #
+    # Loopback is exempt from the proxy (and from HTTPS-only), so this is
+    # reachable from a browser whose every other request goes to SOCKS.
+    local dash
+    if [ -n "$STATUSD_AGENT" ]; then
+        dash="http://127.0.0.1:$STATUS_PORT/"
+        statusd_running || warn "status server is not running - the startup page will not load"
+    else
+        # No server configured, so the page cannot be served and cannot read
+        # host status either. The expectation has to come from the fragment,
+        # and the Chain section will be empty.
+        dash="file://$DASHBOARD_PAGE#expect=$EXPECTED_EXIT_IP"
+        warn "no STATUSD_AGENT - the startup page cannot show host-side status"
+    fi
+
     # user.js is re-read at every startup, so this file is the entire
-    # configuration of the instance. Only the proxy belongs in it - see the
-    # header on why anything else here is a step backwards.
+    # configuration of the instance. Only the proxy and the startup page
+    # belong in it - see the header on why anything else is a step backwards.
     cat > "$INCOGNITO_PROFILE/user.js" <<EOF
 // Written by vpnchain at every launch - the profile is wiped first, so
 // editing this file achieves nothing. Do not add prefs: each one moves this
@@ -1119,9 +1185,13 @@ user_pref("network.proxy.socks_remote_dns", true);
 // as a candidate. SOCKS carries no UDP, which is also why media needs TURN
 // over TCP to connect at all.
 user_pref("media.peerconnection.ice.proxy_only", true);
+// Not web-observable, so it costs nothing against the shared fingerprint.
+user_pref("browser.startup.page", 1);
+user_pref("browser.startup.homepage", "$dash");
 EOF
     ok "proxy pinned in the profile: $PROXY_HOST:$INCOGNITO_PORT (remote DNS)"
     ok "webrtc restricted to the proxy - no direct UDP, no host candidate"
+    ok "startup page: $dash"
 
     # -no-remote so this cannot hand off to another Firefox-family process
     # and inherit its proxy; -profile so it uses this profile rather than the
@@ -1131,9 +1201,9 @@ EOF
     disown 2>/dev/null
     sleep 3
 
-    pid=$(upstream_pid)
+    pid=$(incognito_pid)
     if [ -z "$pid" ]; then
-        bad "upstream browser did not come up"
+        bad "incognito browser did not come up"
         echo "         run it in the foreground to see why:"
         echo "           '$INCOGNITO_BIN' -no-remote -profile '$INCOGNITO_PROFILE'"
         exit 1
@@ -1141,15 +1211,14 @@ EOF
 
     echo
     bold "applied at this launch"
-    ok "upstream browser running (pid $pid)"
+    ok "incognito browser running (pid $pid)"
     warn "exit: upstream only - NOT the pinned address"
     warn "that exit is flagged as a proxy by IP databases - expect CAPTCHAs"
     ok "profile: wiped at launch, nothing carried over from last time"
     ok "fingerprint: this browser's defaults, unmodified"
     ok "timezone: UTC, from resistFingerprinting - not ours to set"
-    echo "         the exit and the clock are measurable only from inside the"
-    echo "         browser - open vpnchain-dashboard.html there:"
-    echo "         #expect=<pinned exit>&incognito=<upstream prefix>"
+    echo "         the exit and the clock are measurable only from inside"
+    echo "         the browser, which is what the startup page is for"
 }
 
 cmd_browser() {
@@ -1161,18 +1230,18 @@ cmd_browser() {
             "")             ;;
             with-webrtc)    want=allow ;;
             with-cookies)   cookies=allow ;;
-            # 'incognito' was this verb's name while the unlinked exit was a
-            # second Chrome running --incognito. It is a different browser
-            # now, and that mode is no longer used at all.
-            upstream|incognito) exit_kind=upstream ;;
+            # exit_kind names the EXIT, which is the upstream's; the verb
+            # names the instance. Chrome's incognito mode is not involved in
+            # either any more - see the header.
+            incognito|upstream) exit_kind=upstream ;;
             *) echo "usage: vpnchain browser [with-webrtc] [with-cookies]" >&2
-               echo "       vpnchain browser upstream" >&2
+               echo "       vpnchain browser incognito" >&2
                exit 1 ;;
         esac
     done
 
     # Dispatched before anything below touches a preference domain: launching
-    # the upstream browser must not change the pinned browser's settings.
+    # the incognito browser must not change the pinned browser's settings.
     if [ "$exit_kind" = upstream ]; then
         # Not flags on this launch but on a browser that is not involved, so
         # they have nothing to act on here.
@@ -1180,7 +1249,7 @@ cmd_browser() {
             warn "with-webrtc does not apply - webrtc already rides the proxy there"
         [ "$cookies" = allow ] && \
             warn "with-cookies does not apply - that browser keeps its own defaults"
-        launch_upstream
+        launch_incognito
         return
     fi
 
@@ -1356,7 +1425,7 @@ case "${1:-status}" in
         echo "usage: vpnchain {start|restart} [chained|direct]"
         echo "       vpnchain stop"
         echo "       vpnchain browser [with-webrtc] [with-cookies]"
-        echo "       vpnchain browser upstream"
+        echo "       vpnchain browser incognito"
         echo "       vpnchain config [check]"
         echo "       vpnchain blocklist"
         exit 1
