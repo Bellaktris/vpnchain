@@ -756,26 +756,19 @@ i2p_running() { pgrep -f "i2pd --conf $I2PD_CONF" >/dev/null 2>&1; }
 
 i2p_pid() { pgrep -f "i2pd --conf $I2PD_CONF" | head -1; }
 
-# Asked of i2pd rather than inferred from its files, which live under
-# ~/Library/Application Support/i2pd whatever the config says and are not
-# named predictably. The console is local-only and on by default.
-I2PD_CONSOLE="${I2PD_CONSOLE:-127.0.0.1:7070}"
+# Counted off disk, because i2pd's web console - which would also report
+# tunnel counts and build success - is turned off. It is unauthenticated by
+# default, and the browsers here bypass the proxy for loopback, so any page
+# they load could reach it and stop the router.
+#
+# Not the datadir from the config either: i2pd ignores that key and uses this
+# path regardless, which is why counting the configured one found nothing.
+I2PD_DATA="${I2PD_DATA:-$HOME/Library/Application Support/i2pd}"
 
-i2p_health() {
-    curl -s -m 5 "http://$I2PD_CONSOLE/" 2>/dev/null | python3 -c '
-import re, sys
-page = sys.stdin.read()
-if not page:
-    raise SystemExit(1)
-text = re.sub(r"&nbsp;", " ", re.sub(r"<[^>]+>", " ", page))
-text = re.sub(r"\s+", " ", text)
-def field(label, pattern=r"([0-9]+)"):
-    m = re.search(re.escape(label) + r"[: ]+" + pattern, text)
-    return m.group(1) if m else "?"
-print("%s routers, %s client tunnels, %s%% tunnel success"
-      % (field("Routers"), field("Client Tunnels"),
-         field("Tunnel creation success rate", r"([0-9]+)%")))
-' 2>/dev/null
+i2p_routers() {
+    [ -d "$I2PD_DATA/netDb" ] || { echo 0; return; }
+    find "$I2PD_DATA/netDb" -type f -name 'routerInfo-*' 2>/dev/null |
+        wc -l | tr -d ' '
 }
 
 cmd_i2p() {
@@ -836,12 +829,12 @@ cmd_i2p() {
                     && ok "socks proxy listening on $I2P_PORT" \
                     || warn "nothing listening on $I2P_PORT"
             } || warn "I2P_PORT unset - .i2p names are not routed"
-            local health
-            health=$(i2p_health)
-            if [ -n "$health" ]; then
-                ok "$health"
-            elif i2p_running; then
-                warn "its console on $I2PD_CONSOLE did not answer"
+            local n
+            n=$(i2p_routers)
+            if [ "${n:-0}" -gt 0 ]; then
+                ok "knows $n routers"
+            else
+                warn "knows no routers - reseeding, or reseed is failing"
             fi
             ;;
         (*)
