@@ -218,6 +218,22 @@
 </details>
 
 <details class="sect">
+  <summary>Recently blocked <span id="b-count" class="pend"></span></summary>
+  <dl id="b-rows">
+    <div class="row"><dt>Tracker list</dt><dd id="b-summary" class="pend">checking</dd></div>
+  </dl>
+  <details class="note"><summary>why this matters</summary>A request the
+    tracker list rejects fails like any other dead connection - a link to a
+    blocked host opens on ERR_SOCKS_CONNECTION_FAILED or "can't be reached",
+    with nothing saying why. That is deliberate: a page cannot tell the
+    rejection from a firewall. This list, read from the sing-box log and
+    checked against the list itself, is where to tell. Only host names are
+    known here, never the full address, so for an email click-tracking link
+    the real destination has to be read out of the link itself, usually
+    after <code>/CL0/</code>, <code>?url=</code> or similar.</details>
+</details>
+
+<details class="sect">
   <summary>Browser policy</summary>
   <dl>
     <div class="row"><dt>Third-party cookies</dt><dd id="p-cookies" class="pend">checking</dd></div>
@@ -716,6 +732,8 @@ function checkHost() {
         }
       });
 
+      showBlocked(d.blocked || {});
+
       var bl = d.blocklist || {};
       if (!bl.configured) {
         put("h-blocklist", "no list configured", "warn");
@@ -734,7 +752,7 @@ function checkHost() {
     .catch(function () {
       ["h-mode", "h-upstream", "h-singbox", "h-pinned", "h-incognito",
        "h-incexit", "h-sysproxy", "h-blocklist", "h-onion", "h-i2pdest",
-       "p-cookies", "p-webrtc",
+       "b-summary", "p-cookies", "p-webrtc",
        "p-incognito", "p-devices", "p-adprivacy", "p-https", "p-telemetry",
        "p-notify", "p-background", "p-downloads"]
         .forEach(function (id) {
@@ -742,6 +760,48 @@ function checkHost() {
       });
     })
     .then(function () { settle("host"); });
+}
+
+// Host names come from the sing-box log, i.e. from whatever any page asked
+// for, so they are only ever set as text.
+function showBlocked(b) {
+  if (!b.available) {
+    put("b-summary", "unavailable - no blocklist, or the sing-box log " +
+        "cannot be found", "pend");
+    return;
+  }
+  var since = b.since ? new Date(b.since * 1000) : null;
+  put("b-count", "(" + b.hostsTotal + ")", "pend");
+  put("b-summary", b.hostsTotal
+        ? b.hostsTotal + " host(s), " + b.requestsTotal + " request(s)" +
+          (since ? " since " + clock(since) : "") +
+          (b.hosts.length < b.hostsTotal ? " - latest " + b.hosts.length + " shown" : "")
+        : "nothing blocked" + (since ? " since " + clock(since) : ""),
+      b.hostsTotal ? "" : "ok");
+  var dl = $("b-rows");
+  b.hosts.forEach(function (h) {
+    var row = document.createElement("div");
+    row.className = "row";
+    var dt = document.createElement("dt");
+    dt.textContent = h.last ? clock(new Date(h.last * 1000)) : "-";
+    var dd = document.createElement("dd");
+    dd.textContent = h.host;
+    var extra = document.createElement("span");
+    extra.className = "pend";
+    extra.textContent = "  x" + h.count +
+      (h.inbounds.length ? ", " + h.inbounds.join(" + ") : "");
+    dd.appendChild(extra);
+    row.appendChild(dt);
+    row.appendChild(dd);
+    dl.appendChild(row);
+  });
+}
+
+// "08:18" today, "Nov 7 23:10" before that.
+function clock(d) {
+  var hm = d.toTimeString().slice(0, 5);
+  return d.toDateString() === new Date().toDateString() ? hm
+    : d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " " + hm;
 }
 
 /* --------------------------------------------------------------------- dns */
@@ -984,8 +1044,34 @@ function conclude() {
                           " tell an unproxied browser from another node" });
   }
 
+  // The other exit, as the host measured it through the incognito inbound.
+  // Whichever browser this page runs in, that instance's one requirement is
+  // to come out unlinked: neither at the real address nor at the pinned one.
+  if (pending.host) {
+    checks.push({ state: "pend", label: "Incognito exit", detail: "measuring" });
+  } else if (!hostData) {
+    checks.push({ state: "warn", label: "Incognito exit",
+                  detail: "no status server - not measured" });
+  } else if (!(hostData.singbox || {}).incognitoListening) {
+    checks.push({ state: "warn", label: "Incognito exit",
+                  detail: "incognito inbound not listening" });
+  } else if (!inc) {
+    checks.push({ state: "warn", label: "Incognito exit",
+                  detail: "unreachable through the incognito inbound" });
+  } else if (real && inc === real) {
+    checks.push({ state: "fail", label: "Incognito exit",
+                  detail: inc + " - YOUR REAL ADDRESS" });
+  } else if (exp && inc === exp) {
+    checks.push({ state: "fail", label: "Incognito exit",
+                  detail: inc + " - same as the pinned exit, so the two are linkable" });
+  } else {
+    checks.push({ state: "pass", label: "Incognito exit",
+                  detail: inc + (real ? " - neither pinned nor real"
+                                      : " - not the pinned exit") });
+  }
+
   // Timezone agreement across scopes.
-  var seen = [findings.tzMain, findings.tzWorker, findings.tzIframe]
+  var seen =[findings.tzMain, findings.tzWorker, findings.tzIframe]
              .filter(Boolean);
   if (pending.timezone) {
     checks.push({ state: "pend", label: "Timezone scopes", detail: "measuring" });

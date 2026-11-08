@@ -26,14 +26,17 @@ rendering the generated config, and keeping a second copy of the generator
 here would be two things to hold in sync.
 """
 
+import datetime
 import json
 import os
+import plistlib
 import re
 import socket
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -185,6 +188,141 @@ def blocklist():
             "referenced": referenced, "active": referenced and configured}
 
 
+# How much of the sing-box log to read back. It logs every connection at info
+# level, so this is roughly the last hour or two of browsing; the log itself is
+# only trimmed when the chain stops.
+BLOCKED_TAIL = 4 * 1024 * 1024
+BLOCKED_SHOWN = 50
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_LOG_LINE = re.compile(
+    r"^(?P<ts>[+-]\d{4} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (?P<level>[A-Z]+) "
+    r"\[(?P<id>\d+) [^\]]*\] (?P<who>\S+): (?P<msg>.*)$")
+_INBOUND_TO = re.compile(r"^inbound connection to (?P<host>.+):\d+$")
+_INBOUND_TAG = re.compile(r"\[(?P<tag>[^\]]+)\]$")
+# Friendlier names for the two inbounds the generated config defines.
+_INBOUND_NAMES = {"pinned-in": "pinned", "upstream-in": "incognito"}
+
+# host -> matched, valid for one version of the blocklist file.
+_match_cache = {"key": None, "hosts": {}}
+
+
+def singbox_agent():
+    """The sing-box launchd agent: its binary and its log. Read from the plist,
+    as the CLI's log trimming does, so both follow the agent if it moves -
+    launchd's PATH would not find a Homebrew sing-box by name anyway."""
+    label = env("SINGBOX_AGENT")
+    if not label:
+        return None, None
+    try:
+        with open(os.path.expanduser(
+                "~/Library/LaunchAgents/%s.plist" % label), "rb") as f:
+            pl = plistlib.load(f)
+    except Exception:
+        return None, None
+    args = pl.get("ProgramArguments") or []
+    return (args[0] if args else None,
+            pl.get("StandardErrorPath") or pl.get("StandardOutPath"))
+
+
+def blocked_recent():
+    """Hosts the tracker list rejected recently.
+
+    A rejected request looks to the page exactly like a network failure - the
+    browser shows ERR_SOCKS_CONNECTION_FAILED or the like - which is what makes
+    blocking unattributable, and also what makes a blocked LINK puzzling. This
+    is the place to look it up, out of reach of any site: same origin and Host
+    checks as everything else here. It does say which trackers were contacted,
+    which hints at what was browsed - one more reason those checks matter.
+
+    sing-box logs no rejection at info level. A rejected connection is one that
+    was accepted and never went anywhere: an "inbound connection to" line with
+    no "outbound connection to" or error after it. A connection still being set
+    up looks the same for a moment, so every candidate is confirmed against the
+    list itself with 'sing-box rule-set match'.
+
+    Hosts only: the proxy sees the name the browser asked for, never the path,
+    so the target hidden in a click-tracking link is not recoverable here."""
+    binary, log = singbox_agent()
+    path = env("BLOCKLIST_PATH",
+               os.path.expanduser("~/.config/sing-box/blocklist.srs"))
+    if not binary or not log or not os.path.exists(path):
+        return {"available": False}
+    try:
+        with open(log, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - BLOCKED_TAIL))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return {"available": False}
+
+    pending = {}            # id -> (time, host, inbound)
+    since = None
+    for line in text.splitlines():
+        m = _LOG_LINE.match(_ANSI.sub("", line))
+        if not m:
+            continue
+        if since is None:
+            since = m.group("ts")
+        cid, msg = m.group("id"), m.group("msg")
+        to = _INBOUND_TO.match(msg)
+        if to:
+            tag = _INBOUND_TAG.search(m.group("who"))
+            tag = tag.group("tag") if tag else ""
+            pending[cid] = (m.group("ts"), to.group("host"),
+                            _INBOUND_NAMES.get(tag, tag))
+        elif msg.startswith("outbound connection to") or m.group("level") == "ERROR":
+            pending.pop(cid, None)
+
+    st = os.stat(path)
+    key = (path, st.st_mtime, st.st_size)
+    if _match_cache["key"] != key:
+        _match_cache.update(key=key, hosts={})
+    known = _match_cache["hosts"]
+
+    def matches(host):
+        # Exit status is 0 either way; a match is reported as text on stderr.
+        try:
+            p = subprocess.run([binary, "rule-set", "match", "-f", "binary",
+                                path, host], capture_output=True, text=True,
+                               timeout=10)
+        except Exception:
+            return None
+        return bool((p.stdout + p.stderr).strip())
+
+    fresh = sorted({h for _, h, _ in pending.values()} - set(known))
+    with ThreadPoolExecutor(8) as pool:
+        for host, hit in zip(fresh, pool.map(matches, fresh)):
+            if hit is not None:
+                known[host] = hit
+
+    hosts = {}
+    for ts, host, inbound in pending.values():
+        if not known.get(host):
+            continue
+        h = hosts.setdefault(host, {"host": host, "count": 0, "last": None,
+                                    "inbounds": []})
+        h["count"] += 1
+        when = _epoch(ts)
+        if when and (h["last"] is None or when > h["last"]):
+            h["last"] = when
+        if inbound and inbound not in h["inbounds"]:
+            h["inbounds"].append(inbound)
+    shown = sorted(hosts.values(), key=lambda h: h["last"] or 0, reverse=True)
+    return {"available": True, "since": _epoch(since) if since else None,
+            "hostsTotal": len(shown),
+            "requestsTotal": sum(h["count"] for h in shown),
+            "hosts": shown[:BLOCKED_SHOWN]}
+
+
+def _epoch(ts):
+    try:
+        return int(datetime.datetime.strptime(
+            ts, "%z %Y-%m-%d %H:%M:%S").timestamp())
+    except ValueError:
+        return None
+
+
 def singbox_mode():
     try:
         with open(singbox_config_path()) as f:
@@ -302,6 +440,7 @@ def collect():
         "systemProxy": system_proxy(),
         "browserPolicy": browser_policy(),
         "blocklist": blocklist(),
+        "blocked": blocked_recent(),
         "hidden": hidden_services(),
         "exits": {
             "expected": env("EXPECTED_EXIT_IP"),
