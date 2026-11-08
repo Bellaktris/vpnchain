@@ -140,7 +140,7 @@ def hidden_services():
     file, in which case the generated config has no rule for the suffix and
     the name was never going anywhere. The rule can be absent from the LIVE
     config even though the port is set, which is the state between editing
-    the env file and running 'vpnchain config && vpnchain restart'. Or the
+    the env file and running 'vpnchain config gen && vpnchain restart'. Or the
     daemon can be down, which for i2pd is the normal resting state since it
     is started on demand.
 

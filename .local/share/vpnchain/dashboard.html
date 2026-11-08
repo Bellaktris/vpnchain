@@ -769,7 +769,7 @@ function checkHost() {
           put(row[1], "not routed - " + row[2] + " unset", "pend");
         } else if (!h.routed) {
           put(row[1], row[2] + "=" + h.port + " set, but the live config has " +
-              "no rule for it - run: vpnchain config && vpnchain restart", "bad");
+              "no rule for it - run: vpnchain config gen && vpnchain restart", "bad");
         } else if (!h.listening) {
           put(row[1], "routed to " + h.port + ", nothing listening there" +
               (row[0] === "i2p" ? " - start it with: " + row[3] : ""), "warn");
@@ -788,7 +788,7 @@ function checkHost() {
             "bad");
       } else if (!bl.referenced) {
         put("h-blocklist", "installed but NOT in the live config - run: " +
-            "vpnchain config && vpnchain restart", "bad");
+            "vpnchain config gen && vpnchain restart", "bad");
       } else {
         put("h-blocklist", "active, " +
             Math.round(bl.bytes / 1024) + " KB, updated " +

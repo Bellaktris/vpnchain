@@ -30,7 +30,9 @@
 #
 #   start [mode]    load the sing-box agent
 #   stop            unload it
-#   restart [mode]  reload it
+#   restart [mode]  unload and load it again, pilot and status server too
+#   reload          regenerate the config and restart sing-box alone, for
+#                   applying an edit; the pilot keeps running
 #
 # The optional [mode] on start/restart is one of:
 #
@@ -241,8 +243,8 @@
 #            the shared port means dozens through the one Reality server -
 #            the same pattern that has torrents refused there.
 #
-#   config [check]
-#            write the sing-box config from the env file, which is the single
+#   config gen|check
+#            'config gen' writes the sing-box config from the env file, the single
 #            source of truth for it. start does this automatically when no
 #            config exists, since writing a missing file cannot lose anything.
 #            Regenerating an existing one can - hand-added routing rules are
@@ -283,7 +285,7 @@
 #
 #            Blocking is engaged only when the file exists AND BLOCKLIST_URL is
 #            set; sing-box refuses to start on a missing local rule-set path, so
-#            'vpnchain config' is safe to run before the first fetch.
+#            'vpnchain config gen' is safe to run before the first fetch.
 #
 #            Unlike an extension this has no per-site off switch - rejection is
 #            all or nothing. Blocked ads do, however, leave their bait elements
@@ -1107,7 +1109,7 @@ cmd_i2p() {
                     || warn "socks proxy on $I2P_PORT has not come up"
             else
                 warn "I2P_PORT is not set, so .i2p names are not routed anywhere"
-                warn "set it in $CONFIG and run: vpnchain config && vpnchain restart"
+                warn "set it in $CONFIG and run: vpnchain config gen && vpnchain restart"
             fi
             warn "give it several minutes - it cannot reach anything until it has"
             warn "found peers and built tunnels, however healthy it looks here"
@@ -1644,7 +1646,7 @@ maybe_switch_mode() {
 
 # Blocking is engaged only when a list is configured AND the converted set is
 # actually on disk. sing-box refuses to start if a local rule-set path is
-# missing, so conditioning on the file is what keeps 'vpnchain config' safe to
+# missing, so conditioning on the file is what keeps 'vpnchain config gen' safe to
 # run before the first fetch - and what makes deleting the file a complete
 # off switch after the next regenerate.
 blocklist_active() { [ -n "$BLOCKLIST_URL" ] && [ -s "$BLOCKLIST_PATH" ]; }
@@ -1735,7 +1737,7 @@ cmd_blocklist() {
 
     if ! grep -q 'blocklist' "$SINGBOX_CONFIG" 2>/dev/null; then
         warn "the live config does not reference it yet - regenerate and reload:"
-        echo "           vpnchain config && vpnchain restart"
+        echo "           vpnchain config gen && vpnchain restart"
     elif agent_running; then
         echo "         load the updated list with: vpnchain restart"
     fi
@@ -2140,7 +2142,7 @@ PY
     esac
     # Only a config that is already native is refreshed here. Moving from an
     # upstream proxy to native mode is a cutover - the other core has to let
-    # go of the shared port first - so it stays an explicit 'vpnchain config'.
+    # go of the shared port first - so it stays an explicit 'vpnchain config gen'.
     if live_config_native; then
         cmd_config
         if agent_running; then
@@ -2149,7 +2151,7 @@ PY
         fi
     elif [ -f "$SINGBOX_CONFIG" ]; then
         warn "the live config still uses an upstream proxy; switch with:"
-        echo "           vpnchain config && vpnchain restart"
+        echo "           vpnchain config gen && vpnchain restart"
         echo "         once nothing else holds port $SHARED_PORT"
     fi
 }
@@ -2231,7 +2233,7 @@ cmd_config() {
     ok "config written and valid: $SINGBOX_CONFIG"
     # Only worth saying when something is already running the old one; during
     # bootstrap the caller starts the agent immediately after this.
-    agent_running && echo "         apply it with: vpnchain restart"
+    agent_running && echo "         apply it with: vpnchain reload"
 }
 
 # Renders the config implied by the env file to $1. Kept separate from
@@ -3075,7 +3077,7 @@ cmd_config_check() {
         exit 1
     fi
     if [ ! -f "$SINGBOX_CONFIG" ]; then
-        bad "no config at $SINGBOX_CONFIG - generate one with: vpnchain config"
+        bad "no config at $SINGBOX_CONFIG - generate one with: vpnchain config gen"
         exit 1
     fi
     local mode tmpcfg
@@ -3093,7 +3095,7 @@ cmd_config_check() {
         warn "live config differs from what the env file describes"
         echo "         either it was hand-edited, or the env file changed"
         echo "         since it was generated. Regenerate with:"
-        echo "           vpnchain config   (backs the current one up first)"
+        echo "           vpnchain config gen   (backs the current one up first)"
     fi
     rm -f "$tmpcfg"
 }
@@ -3110,7 +3112,13 @@ case "${1:-status}" in
              cmd_stop; cmd_start; echo; wait_for_chain ;;
     browser) shift; cmd_browser "$@" ;;
     i2p)     cmd_i2p "${2:-}" ;;
-    config)  [ "${2:-}" = check ] && cmd_config_check || cmd_config ;;
+             # Both spelled out: a bare 'config' overwriting the live file
+             # would be the wrong default for a verb that can lose rules.
+    config)  case "${2:-}" in
+                 (gen)   cmd_config ;;
+                 (check) cmd_config_check ;;
+                 (*)     echo "usage: vpnchain config {gen|check}" >&2; exit 1 ;;
+             esac ;;
              # The country lists first: they need no BLOCKLIST_URL, and
              # cmd_blocklist exits when that is unset.
     get-blocklist) cmd_keep_out; cmd_blocklist ;;
@@ -3125,14 +3133,13 @@ case "${1:-status}" in
     ssh-reality) shift; cmd_ssh_reality "$@" ;;
     *)
         echo "usage: vpnchain {start|restart} [chained|chained-reality|direct]"
-        echo "       vpnchain stop"
+        echo "       vpnchain {stop|reload}"
         echo "       vpnchain browser [with-webrtc] [with-cookies]"
         echo "       vpnchain browser incognito"
         echo "       vpnchain i2p [start|stop|status]"
-        echo "       vpnchain config [check]"
+        echo "       vpnchain config {gen|check}"
         echo "       vpnchain get-blocklist"
         echo "       vpnchain subscribe"
-        echo "       vpnchain reload"
         echo "       vpnchain setup"
         echo "       vpnchain ssh-reality [own-node] [ssh arguments]"
         exit 1
