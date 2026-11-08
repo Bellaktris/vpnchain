@@ -1150,6 +1150,39 @@ UPSTREAM_TAG="${UPSTREAM_TAG:-upstream}"
 # and switching nodes needs no restart: the pilot moves the selector through
 # the Clash API, on loopback and behind a secret.
 NODES_FILE="${NODES_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/nodes.json}"
+# Reality nodes you run yourself, in the node list's own format ({"nodes":
+# [...]}, each with tag, server, ip, port, secret, security "reality", sni,
+# pbk, sid, flow, fp, family, region). Merged into the node list, so
+# chained-reality uses them beside the subscription's - and the pilot prefers
+# them, since their setup is yours to get right. Kept apart from the list
+# because the subscription rewrites that.
+OWN_NODES_FILE="${OWN_NODES_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/own-nodes.json}"
+
+# Bring the node list up to date with OWN_NODES_FILE: its nodes in, any own
+# node no longer in it out. Run before every config generation, so an edit
+# to that file takes effect with 'vpnchain reload'.
+merge_own_nodes() {
+    [ -s "$NODES_FILE" ] || return 0
+    python3 - "$NODES_FILE" "$OWN_NODES_FILE" <<'PY'
+import json, os, sys
+path, own_path = sys.argv[1:3]
+doc = json.load(open(path))
+try:
+    own = json.load(open(own_path))["nodes"]
+except (OSError, ValueError, KeyError):
+    own = []
+own_tags = {n["tag"] for n in own}
+nodes = [n for n in doc["nodes"] if not str(n.get("family", "")).startswith("own:")
+         and n["tag"] not in own_tags] + own
+if nodes != doc["nodes"]:
+    doc["nodes"] = nodes
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(doc, f, indent=1)
+    os.replace(tmp, path)
+PY
+}
 SHARED_PORT="${SHARED_PORT:-20170}"
 # Resolvers for node names, by address so that none needs a lookup of its
 # own: DoH to each in turn, then the system's resolver as the last resort.
@@ -1832,7 +1865,8 @@ cmd_subscribe() {
     [ "$via" = direct ] && notify "Node list fetched directly - no proxied route worked"
 
     local summary rc
-    summary=$(NODE_DNS="$NODE_DNS" python3 - "$raw" "$tmp/nodes.json" "$NODES_FILE" "$via" <<'PY'
+    summary=$(NODE_DNS="$NODE_DNS" OWN_NODES="$OWN_NODES_FILE" \
+              python3 - "$raw" "$tmp/nodes.json" "$NODES_FILE" "$via" <<'PY'
 import base64, json, os, re, sys, time, urllib.parse as up
 raw_path, out_path, old_path, via = sys.argv[1:5]
 raw = open(raw_path, "rb").read().strip()
@@ -1960,6 +1994,15 @@ for n in nodes:
         ech = was.get(n["server"])
     if ech:
         n["ech"] = True
+
+# Nodes of your own, run outside the subscription, kept in the same list so
+# that everything reading it - the generator, the pilot, the status server -
+# treats them like any other. Merged here as well as at config time, so a
+# fetch that changed nothing compares as unchanged.
+try:
+    nodes += json.load(open(os.environ["OWN_NODES"]))["nodes"]
+except (KeyError, OSError, ValueError):
+    pass
 fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
     json.dump({"fetched_at": int(time.time()), "via": via, "nodes": nodes}, f, indent=1)
@@ -2092,6 +2135,7 @@ generate_config() {
             bad "no node list at $NODES_FILE - fetch it with: vpnchain subscribe"
             return 1
         fi
+        merge_own_nodes || return 1
         native_nodes="$NODES_FILE"
         clash_secret >/dev/null || return 1
     fi

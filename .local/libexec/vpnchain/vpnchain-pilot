@@ -30,6 +30,11 @@ The priorities, in order, and what each one costs the next:
      standbys one has ECH and one has not: every ECH node of this provider
      sits on one CDN, and the other standby is what outlives that CDN.
 
+     Above both come nodes you run yourself (own-nodes.json), in
+     chained-reality mode beside the provider's Reality node: their setup
+     is yours to get right, so the active node is one of them whenever one
+     answers, and the pilot returns to one as soon as it does.
+
   3. Latency. Measured through each node, plus the distance from the node to
      the WireGuard peer, which the measurement cannot see - the probe target
      is anycast and sits next to every node alike. Both together predicted
@@ -467,11 +472,22 @@ class Pilot:
     def is_ech(self, tag):
         return bool(self.nodes[tag].get("ech"))
 
-    def prefer_ech(self, tags):
-        """The ECH nodes among these, if any. In chained mode the active node
-        is one of them whenever one answers: their names travel encrypted,
-        the others' in the clear. Other modes have no ECH nodes to prefer."""
-        return [t for t in tags if self.is_ech(t)] or tags
+    def is_own(self, tag):
+        return str(self.nodes[tag].get("family", "")).startswith("own:")
+
+    def tier(self, tag):
+        """How strongly a node is preferred, lowest first. Your own nodes,
+        whose setup is yours to get right; then ECH nodes, whose names travel
+        encrypted; then the rest, whose names cross the wire in the clear."""
+        return 0 if self.is_own(tag) else 1 if self.is_ech(tag) else 2
+
+    def prefer(self, tags):
+        """The best-tier nodes among these. The active node is one of them
+        whenever one answers."""
+        if not tags:
+            return tags
+        best = min(self.tier(t) for t in tags)
+        return [t for t in tags if self.tier(t) == best]
 
     def suspect(self, fam):
         return self.state["suspect"].get(fam, 0) > time.time()
@@ -543,7 +559,8 @@ class Pilot:
         plain_pool = not self.reality_mode and any(self.is_ech(t) for t in self.nodes)
         going_plain = plain_pool and not self.is_ech(tag) and not self.state.get("plain")
         self.event("switch", "%s -> %s (%s)" % (old, tag, why),
-                   alert=why not in ("latency", "start", "back to ECH") and not going_plain)
+                   alert=why not in ("latency", "start", "back to ECH", "back to own node")
+                   and not going_plain)
         if going_plain:
             self.state["plain"] = True
             notify("On %s, a node without ECH - its name is visible on the "
@@ -698,7 +715,7 @@ class Pilot:
             pool = [t for t in self.reserve() if t not in out["tried"]]
             # One node per family before a second from any of them.
             fresh = [t for t in pool if self.family(t) not in tried_fams] or pool
-            tag = self.weighted_pick(self.prefer_ech(fresh))
+            tag = self.weighted_pick(self.prefer(fresh))
             if not tag:
                 break
             out["tried"].append(tag)
@@ -738,7 +755,7 @@ class Pilot:
             d = self.stat(tag)["delays"][-2:]
             if len(d) < 2:
                 continue
-            if self.is_ech(act) and not self.is_ech(tag):
+            if self.tier(tag) > self.tier(act):
                 continue
             geo = self.geo_ms(tag)
             if all(x + geo < act_score * UPGRADE_RATIO and x + geo < act_score - UPGRADE_MS
@@ -763,19 +780,21 @@ class Pilot:
             self.state["standbys"] = [t for t in self.state["standbys"] if t != worst] + [tag]
             self.event("standby", "%s replaces %s" % (tag, worst))
 
-    def ech_return(self):
-        """Off a node without ECH as soon as an ECH node answers. Checked
-        every few minutes while on one: an ECH probe shows the network only
-        the CDN's shared ECH name, so asking often costs nothing, and every
-        minute on the other node is a minute of its name on the wire."""
-        # Every ECH node, set-aside families included: an outage of all of
+    def better_return(self):
+        """Back to a better-tier node as soon as one answers: your own node
+        from the provider's, an ECH node from one without. Checked every few
+        minutes while on a worse one - probing an own node or an ECH node
+        shows the network nothing it can block by name, so asking often costs
+        nothing, while every minute on the worse node is a minute of it."""
+        # Every better node, set-aside families included: an outage of all of
         # them sets their families aside too, and waiting that out would keep
-        # names on the wire for hours after it ended.
-        cands = [t for t in self.nodes if self.is_ech(t) and t != self.state["active"]]
+        # the chain on the worse node for hours after it ended.
+        act = self.state["active"]
+        cands = self.prefer([t for t in self.nodes if self.tier(t) < self.tier(act)])
         tag = self.weighted_pick(cands)
         if tag and self.probe(tag):
             self.state["standbys"] = [t for t in self.state["standbys"] if t != tag]
-            self.switch(tag, "back to ECH")
+            self.switch(tag, "back to own node" if self.is_own(tag) else "back to ECH")
 
     @staticmethod
     def download(port):
@@ -881,7 +900,7 @@ class Pilot:
             self.state["active"] = now if now in self.nodes else None
             self.state["standbys"] = [t for t in self.state["standbys"] if t != now]
         if self.state["active"] is None:
-            tag = self.weighted_pick(self.prefer_ech(self.reserve()))
+            tag = self.weighted_pick(self.prefer(self.reserve()))
             if tag and self.probe(tag):
                 self.switch(tag, "start")
             return
@@ -902,10 +921,10 @@ class Pilot:
             self.maybe_upgrade()
             if self.due("explore", EXPLORE_EVERY):
                 self.explore()
-            if (not self.is_ech(self.state["active"])
-                    and any(self.is_ech(t) for t in self.nodes)
-                    and self.due("ech-return", (180, 600))):
-                self.ech_return()
+            act = self.state["active"]
+            if (any(self.tier(t) < self.tier(act) for t in self.nodes)
+                    and self.due("better-return", (180, 600))):
+                self.better_return()
             if (self.dns_current() != self.dns_choices()[0]
                     and self.due("dns-prefer", (1800, 3600))):
                 self.prefer_dns()
