@@ -46,10 +46,11 @@
 #            node(s) only, for networks that block or throttle CDNs, DoH and
 #            ECH - Russia, China, Iran. Reality's visible server name is a
 #            real site's and the node is dialled by stored address, so
-#            neither the name nor DNS gives it away. The incognito browser
-#            and the shared port go through it too, but BitTorrent is
-#            refused: dozens of busy connections to one server is how such
-#            networks find Reality servers.
+#            neither the name nor DNS gives it away. The shared port goes
+#            through it too, but BitTorrent is refused: dozens of busy
+#            connections to one server is how such networks find Reality
+#            servers. The incognito browser uses the subscription's Reality
+#            nodes only, never one of your own, whose address is yours alone.
 #
 # Neither chained mode falls back on the other's nodes: when every node of
 # the mode fails, the pilot says so and leaves the choice of switching to
@@ -1577,8 +1578,9 @@ PY
         warn "peer address, with none of the upstream's cover traffic"
         warn "it will also fail outright on networks that block UDP or VPNs"
     elif [ "$want" = chained-reality ]; then
-        ok "everything now goes through the Reality node, and only it: the"
-        ok "tunnel, the incognito browser and the shared port"
+        ok "the tunnel and the shared port now go through Reality nodes only,"
+        ok "your own first; the incognito browser through the subscription's"
+        ok "Reality nodes only, never your own"
         ok "BitTorrent is refused on the shared port while in this mode"
         # i2pd dials out through the shared port, so a running router would
         # move its dozens of connections onto the Reality server with the
@@ -2336,6 +2338,32 @@ if nodes:
              "action": "reject"}]
     cfg["route"]["rules"].append(
         {"inbound": ["shared-in"], "action": "route", "outbound": up})
+    # The incognito browser exists to be unlinked from you, so in
+    # chained-reality mode it never goes through a node of your own - that
+    # address is yours alone, and its host knows who rents it. It uses the
+    # subscription's Reality nodes, in a group of their own that picks a
+    # working one by itself; with none, it is refused rather than allowed
+    # onto your node.
+    if want_reality:
+        public = [n["tag"] for n in nodes
+                  if not str(n.get("family", "")).startswith("own:")]
+        rule = next(r for r in cfg["route"]["rules"]
+                    if r.get("inbound") == ["upstream-in"])
+        dns_rule = next(r for r in cfg["dns"]["rules"]
+                        if r.get("inbound") == ["upstream-in"])
+        if public:
+            cfg["outbounds"].append(
+                {"type": "urltest", "tag": "reality-public", "outbounds": public,
+                 "url": "https://www.gstatic.com/generate_204",
+                 "interval": "10m", "idle_timeout": "30m"})
+            rule["outbound"] = "reality-public"
+            next(s for s in cfg["dns"]["servers"]
+                 if s["tag"] == "upstream-dns")["detour"] = "reality-public"
+        else:
+            rule.pop("outbound", None)
+            rule["action"] = "reject"
+            dns_rule.pop("server", None)
+            dns_rule["action"] = "reject"
     cfg["experimental"] = {
         # What the pilot steers through. Loopback only, and the secret is what
         # keeps a web page - which can reach loopback - from steering it.
