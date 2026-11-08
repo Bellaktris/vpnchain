@@ -295,6 +295,16 @@
 #            root. It also writes the sing-box user unit if there is none.
 #            On macOS there is nothing to do.
 #
+#   ssh-reality [own-node] [ssh arguments]
+#            a shell on one of your own nodes (the first, unless one is named
+#            by tag), carried inside its Reality inbound to the node's own
+#            sshd on loopback - so port 22 can stay closed to the world, and
+#            administering the node looks like using it. ssh_user (default
+#            root) and ssh_key in OWN_NODES_FILE say how to log in.
+#            Restarting sing-box on the node ends the session carrying it;
+#            reconnect, or give the restart to systemd-run to finish alone.
+#            With sing-box down for good, the provider's console is the way in.
+#
 # There is no 'status' verb. The dashboard is the status view - it reports the
 # chain AND what the browser actually does, which no shell command can see. In
 # a terminal, curl the server directly:
@@ -2861,6 +2871,70 @@ cmd_setup() {
     fi
 }
 
+# A shell on one of your own nodes, carried by the node's own Reality inbound
+# rather than a port of its own, so the node needs nothing open but 443. A
+# private sing-box of its own does the carrying - not the agent, which may be
+# down, in another mode, or the very thing being repaired.
+cmd_ssh_reality() {
+    command -v sing-box >/dev/null 2>&1 || {
+        bad "sing-box not found - $(install_hint sing-box sing-box)"; exit 1; }
+    local dir info tag ip port user key
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/vpnchain-ssh.XXXXXX") || exit 1
+    # Globals, not locals: the trap runs after this function has returned.
+    SSH_DIR=$dir SSH_PID=""
+    trap '[ -n "$SSH_PID" ] && kill "$SSH_PID" 2>/dev/null; rm -rf "$SSH_DIR"' EXIT
+    # Prints "tag ip port user key" and writes the config. The first argument
+    # names the node when it is one's tag; otherwise it belongs to ssh.
+    info=$(python3 - "$OWN_NODES_FILE" "$dir/config.json" "${1:-}" <<'PY'
+import json, os, socket, sys
+own_path, out, want = sys.argv[1:4]
+try:
+    nodes = json.load(open(own_path))["nodes"]
+except (OSError, ValueError, KeyError):
+    sys.exit(f"no own nodes in {own_path}")
+n = next((n for n in nodes if n["tag"] == want), None) or nodes[0]
+with socket.socket() as s:
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+out_ = {"type": "vless", "tag": "node", "server": n["ip"], "server_port": n.get("port", 443),
+        "uuid": n["secret"],
+        "tls": {"enabled": True, "server_name": n["sni"],
+                "utls": {"enabled": True, "fingerprint": n.get("fp") or "chrome"},
+                "reality": {"enabled": True, "public_key": n["pbk"], "short_id": n["sid"]}}}
+if n.get("multiplex"):
+    out_["multiplex"] = {"enabled": True, "protocol": "h2mux", "max_connections": 1, "padding": True}
+elif n.get("flow"):
+    out_["flow"] = n["flow"]
+# The node dials its own sshd on loopback, which only the owner's user may.
+cfg = {"log": {"level": "error"},
+       "inbounds": [{"type": "direct", "listen": "127.0.0.1", "listen_port": port,
+                     "override_address": "127.0.0.1", "override_port": 22}],
+       "outbounds": [out_]}
+fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(cfg, f)
+key = os.path.expanduser(n["ssh_key"]) if n.get("ssh_key") else "-"
+print(n["tag"], n["ip"], port, n.get("ssh_user") or "root", key)
+PY
+    ) || exit 1
+    read -r tag ip port user key <<<"$info"
+    [ "$tag" = "${1:-}" ] && shift
+    sing-box run -c "$dir/config.json" >"$dir/log" 2>&1 &
+    SSH_PID=$!
+    local i
+    for i in $(seq 50); do
+        port_listening 127.0.0.1 "$port" && break
+        kill -0 "$SSH_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    port_listening 127.0.0.1 "$port" || {
+        bad "sing-box did not come up for $tag"; cat "$dir/log" >&2; exit 1; }
+    # The host key is filed under the node's address, not the loopback end.
+    local -a opts=(-p "$port" -o HostKeyAlias="$ip")
+    [ "$key" != - ] && opts+=(-i "$key" -o IdentitiesOnly=yes)
+    ssh "${opts[@]}" "$user@127.0.0.1" "$@"
+}
+
 # Rendering what the env file describes and diffing it is the one check the
 # status server deliberately does not do - a second copy of the generator
 # there would be two things to hold in sync. So it lives with the command that
@@ -2916,6 +2990,7 @@ case "${1:-status}" in
              cmd_config >/dev/null && agent_restart "$SINGBOX_AGENT" "$PLIST" &&
                  ok "sing-box reloaded" ;;
     setup)   cmd_setup ;;
+    ssh-reality) shift; cmd_ssh_reality "$@" ;;
     *)
         echo "usage: vpnchain {start|restart} [chained|chained-reality|direct]"
         echo "       vpnchain stop"
@@ -2927,6 +3002,7 @@ case "${1:-status}" in
         echo "       vpnchain subscribe"
         echo "       vpnchain reload"
         echo "       vpnchain setup"
+        echo "       vpnchain ssh-reality [own-node] [ssh arguments]"
         exit 1
         ;;
 esac
