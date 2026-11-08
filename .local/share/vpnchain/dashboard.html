@@ -232,10 +232,12 @@
     <div class="row"><dt>Recent events</dt><dd id="n-events" class="pend">checking</dd></div>
   </dl>
   <details class="note"><summary>why this matters</summary>Each mode has
-    its own nodes and never borrows the other's: chained the nodes whose names
-    ECH hides, chained-reality the Reality node, which stays unknown at home
-    until it is needed. Only the node the pilot chose is ever dialled, plus
-    two standbys from other domain families that it checks now and then. A
+    its own nodes and never borrows the other's: chained the CDN nodes, on one
+    whose name ECH hides whenever any answers, chained-reality the Reality
+    node, which stays unknown at home until it is needed. Only the node the
+    pilot chose is ever dialled, plus two standbys from other domain families
+    that it checks now and then - in chained mode one with ECH and one
+    without, since all the ECH nodes sit on one CDN. A
     family whose nodes keep failing is set aside for a few hours, since one
     blocking rule takes out a whole family at once, and a node that answers
     but stalls on a real download - how some networks throttle - counts as
@@ -872,9 +874,13 @@ function showNodes(u) {
   } else {
     // Answering probes but failing real downloads, or recovering from that:
     // the pilot's own spell-of-trouble flag, the same one its notices follow.
+    // And in chained mode, a node without ECH: its name is on the wire until
+    // the pilot gets back to one with it.
+    var plain = !u.active.ech && !u.active.reality && u.list && u.list.ech;
     put("n-active", nodeText(u.active) +
-          (u.trouble ? "\nrecovering - not yet confirmed by a real download" : ""),
-        u.trouble ? "warn" : "ok");
+          (u.trouble ? "\nrecovering - not yet confirmed by a real download" : "") +
+          (plain ? "\nname visible on the wire - back to an ECH node when one answers" : ""),
+        u.trouble || plain ? "warn" : "ok");
   }
 
   var sb = u.standbyNodes || [];

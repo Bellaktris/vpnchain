@@ -37,7 +37,8 @@
 #   chained  the WireGuard endpoint dials through the upstream SOCKS proxy, so
 #            only ordinary TLS leaves the machine and the tunnel survives
 #            censorship. Carries UDP over TCP. With a subscription, through
-#            the provider's CDN nodes whose names ECH hides, and only those.
+#            the provider's CDN nodes - those whose names ECH hides while any
+#            of them answers, the others only when none does.
 #   direct   the endpoint dials its peer itself. Fewer moving parts, but
 #            plainly a VPN on the wire and dead where UDP or VPNs are filtered.
 #   chained-reality
@@ -2236,20 +2237,17 @@ cfg = {
 # detoured through the upstream - the WireGuard endpoint, the incognito
 # inbound, its DNS - now goes through whichever node the selector holds.
 if nodes:
-    # Each mode holds its own kind of node and no other: chained the nodes
-    # whose names ECH hides, chained-reality the Reality ones. Neither falls
-    # back on the other, nor chained on CDN nodes that would show their names
-    # - a network where ECH or Cloudflare fails is the kind chained-reality is
-    # for, and moving there is a decision, made with 'vpnchain restart
-    # <mode>'. So what the mode says is what goes on the wire, and the Reality
-    # node is never seen until it is the one in use. Direct mode's other
-    # ports use the chained set.
+    # Each mode holds its own kind of node and no other: chained the CDN
+    # nodes - ECH on those whose CDN publishes keys, and the pilot keeps to
+    # those while any answers - chained-reality the Reality ones. Neither
+    # falls back on the other: moving between them is a decision, made with
+    # 'vpnchain restart <mode>'. So the Reality node is never seen until it is
+    # the one in use. Direct mode's other ports use the chained set.
     want_reality = e["MODE"] == "chained-reality"
-    nodes = [n for n in nodes
-             if (n["security"] == "reality" if want_reality else n.get("ech"))]
+    nodes = [n for n in nodes if (n["security"] == "reality") == want_reality]
     if not nodes:
         raise SystemExit("the subscription has no %s node for %s mode" % (
-            "Reality" if want_reality else "ECH", e["MODE"]))
+            "Reality" if want_reality else "CDN", e["MODE"]))
     tags = [n["tag"] for n in nodes]
     # A switch closes what the old node carried. Without that the WireGuard
     # flow - one UDP association that its keepalive never lets end - would

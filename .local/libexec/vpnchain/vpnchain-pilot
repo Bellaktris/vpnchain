@@ -24,6 +24,12 @@ The priorities, in order, and what each one costs the next:
      keep failing is set aside. A node that answers probes but stalls on a
      real download - how some networks throttle - counts as failing too.
 
+     In chained mode the active node is one whose name ECH hides whenever
+     one answers; a node without ECH is used only while none does, said so
+     in a notification, and left as soon as one answers again. Of the two
+     standbys one has ECH and one has not: every ECH node of this provider
+     sits on one CDN, and the other standby is what outlives that CDN.
+
   3. Latency. Measured through each node, plus the distance from the node to
      the WireGuard peer, which the measurement cannot see - the probe target
      is anycast and sits next to every node alike. Both together predicted
@@ -458,6 +464,15 @@ class Pilot:
     def family(self, tag):
         return self.nodes[tag]["family"]
 
+    def is_ech(self, tag):
+        return bool(self.nodes[tag].get("ech"))
+
+    def prefer_ech(self, tags):
+        """The ECH nodes among these, if any. In chained mode the active node
+        is one of them whenever one answers: their names travel encrypted,
+        the others' in the clear. Other modes have no ECH nodes to prefer."""
+        return [t for t in tags if self.is_ech(t)] or tags
+
     def suspect(self, fam):
         return self.state["suspect"].get(fam, 0) > time.time()
 
@@ -481,6 +496,11 @@ class Pilot:
             st["fails"] = 0
             st["last_ok"] = st["last_try"]
             st["delays"] = (st["delays"] + [ms])[-3:]
+            # A family set aside for failing has a member answering: the
+            # failures are over, whatever the set-aside's clock says.
+            if self.state["suspect"].pop(self.family(tag), None):
+                self.event("suspect", "%s answers again - no longer set aside"
+                           % self.family(tag))
         else:
             st["fails"] += 1
             self.judge_family(self.family(tag))
@@ -515,8 +535,21 @@ class Pilot:
             # is working once it carries a download, which comes next.
             self.event("recovered", "%s answers again" % tag)
             return
+        # Onto a node whose name crosses the wire, and back: said once each
+        # way, since that is the one thing about the chain that changes in
+        # what the network sees - and it says the failover too, so that
+        # notice stands in for the ordinary one. Only where the pool has ECH
+        # nodes at all.
+        plain_pool = not self.reality_mode and any(self.is_ech(t) for t in self.nodes)
+        going_plain = plain_pool and not self.is_ech(tag) and not self.state.get("plain")
         self.event("switch", "%s -> %s (%s)" % (old, tag, why),
-                   alert=why not in ("latency", "start"))
+                   alert=why not in ("latency", "start", "back to ECH") and not going_plain)
+        if going_plain:
+            self.state["plain"] = True
+            notify("On %s, a node without ECH - its name is visible on the "
+                   "wire until an ECH node answers again" % tag)
+        elif plain_pool and self.is_ech(tag) and self.state.pop("plain", None):
+            notify("Back on an ECH node (%s)" % tag)
 
     def reserve(self, exclude_families=()):
         """The mode's nodes not in use. Suspect families only when nothing
@@ -532,15 +565,37 @@ class Pilot:
 
     def fill_standbys(self):
         """One candidate per call, measured before it is admitted, from a
-        family that neither the active node nor the other standby is in."""
-        if len(self.state["standbys"]) >= STANDBYS:
+        family that neither the active node nor the other standby is in.
+
+        Where the pool has both kinds, the standbys are one of each: an ECH
+        node, the first choice to fail over to, and one without ECH. Every
+        ECH node of this provider sits on one CDN, so the second is what
+        survives that CDN failing or a network blocking ECH - at the price
+        of its name crossing the wire when it is checked."""
+        sb = self.state["standbys"]
+        # A full pair of one kind - left over from before an outage, or from
+        # an older pilot - gives up its weaker member for the other kind, if
+        # there is a node of that kind to take the place.
+        if len(sb) >= STANDBYS and len({self.is_ech(t) for t in sb}) == 1:
+            other = not self.is_ech(sb[0])
+            if self.standby_pool(other):
+                out = max(sb, key=self.score)
+                sb.remove(out)
+                self.event("standby", "%s makes room for a standby %s ECH" % (
+                    out, "with" if other else "without"))
+        if len(sb) >= STANDBYS:
             return
         if time.time() < self.state["due"].get("fill", 0):
             return
-        fams = {self.family(t) for t in [self.state["active"], *self.state["standbys"]] if t}
-        # A standby that one blocking rule would take out together with the
-        # active node is no standby - unless no other family is left.
-        tag = self.weighted_pick(self.reserve(exclude_families=fams) or self.reserve())
+        # The kind missing from the pair comes first, then the other.
+        kinds = {self.is_ech(t) for t in sb}
+        want = True if True not in kinds else False if False not in kinds else None
+        pool = []
+        for kind in ([want, not want] if want is not None else [None]):
+            pool = self.standby_pool(kind)
+            if pool:
+                break
+        tag = self.weighted_pick(pool)
         if not tag:
             return
         if self.probe(tag):
@@ -554,6 +609,20 @@ class Pilot:
             # attempt shows it another name. Back off from a minute to an hour.
             n = self.state["fill_fails"] = self.state.get("fill_fails", 0) + 1
             self.state["due"]["fill"] = time.time() + min(60 * 2 ** n, 3600) * random.uniform(0.7, 1.3)
+
+    def standby_pool(self, ech):
+        """Candidates for a standby of this kind (None: either). From a
+        family that neither the active node nor the other standby is in if
+        there is one - a standby one blocking rule would take out together
+        with the active node is no standby - and from any family otherwise,
+        since for the ECH standby the kind matters more: every ECH node sits
+        on the one CDN anyway."""
+        fams = {self.family(t) for t in [self.state["active"], *self.state["standbys"]] if t}
+        for pool in (self.reserve(exclude_families=fams), self.reserve()):
+            pool = [t for t in pool if ech is None or self.is_ech(t) == ech]
+            if pool:
+                return pool
+        return []
 
     def check_active(self):
         tag = self.state["active"]
@@ -617,7 +686,8 @@ class Pilot:
         backoff = 60 * 2 ** max(0, out["rounds"] - OUTAGE_ROUNDS_BEFORE_REFRESH - 1)
         out["next"] = time.time() + min(backoff, 1800) * random.uniform(0.7, 1.3)
 
-        for tag in list(self.state["standbys"]):
+        # The ECH standby before the other, which is there for when it fails.
+        for tag in sorted(self.state["standbys"], key=lambda t: not self.is_ech(t)):
             if self.probe(tag):
                 return self.recovered(tag, "failover")
             self.state["standbys"].remove(tag)
@@ -628,7 +698,7 @@ class Pilot:
             pool = [t for t in self.reserve() if t not in out["tried"]]
             # One node per family before a second from any of them.
             fresh = [t for t in pool if self.family(t) not in tried_fams] or pool
-            tag = self.weighted_pick(fresh)
+            tag = self.weighted_pick(self.prefer_ech(fresh))
             if not tag:
                 break
             out["tried"].append(tag)
@@ -660,12 +730,15 @@ class Pilot:
 
     def maybe_upgrade(self):
         """Switch for latency only when a standby beat the active node clearly
-        in each of its last two measurements."""
+        in each of its last two measurements - and never from an ECH node to
+        one without, whatever the speed: that would put names on the wire."""
         act = self.state["active"]
         act_score = self.score(act)
         for tag in self.state["standbys"]:
             d = self.stat(tag)["delays"][-2:]
             if len(d) < 2:
+                continue
+            if self.is_ech(act) and not self.is_ech(tag):
                 continue
             geo = self.geo_ms(tag)
             if all(x + geo < act_score * UPGRADE_RATIO and x + geo < act_score - UPGRADE_MS
@@ -681,11 +754,28 @@ class Pilot:
         tag = self.weighted_pick(pool)
         if not tag or not self.probe(tag):
             return
-        worst = max(self.state["standbys"], key=self.score, default=None)
+        # Only the standby of its own kind, so the pair stays one ECH node
+        # and one without.
+        same = [t for t in self.state["standbys"] if self.is_ech(t) == self.is_ech(tag)]
+        worst = max(same, key=self.score, default=None)
         fams = {self.family(t) for t in [self.state["active"], *self.state["standbys"]] if t != worst}
         if worst and self.score(tag) < self.score(worst) and self.family(tag) not in fams:
             self.state["standbys"] = [t for t in self.state["standbys"] if t != worst] + [tag]
             self.event("standby", "%s replaces %s" % (tag, worst))
+
+    def ech_return(self):
+        """Off a node without ECH as soon as an ECH node answers. Checked
+        every few minutes while on one: an ECH probe shows the network only
+        the CDN's shared ECH name, so asking often costs nothing, and every
+        minute on the other node is a minute of its name on the wire."""
+        # Every ECH node, set-aside families included: an outage of all of
+        # them sets their families aside too, and waiting that out would keep
+        # names on the wire for hours after it ended.
+        cands = [t for t in self.nodes if self.is_ech(t) and t != self.state["active"]]
+        tag = self.weighted_pick(cands)
+        if tag and self.probe(tag):
+            self.state["standbys"] = [t for t in self.state["standbys"] if t != tag]
+            self.switch(tag, "back to ECH")
 
     @staticmethod
     def download(port):
@@ -791,7 +881,7 @@ class Pilot:
             self.state["active"] = now if now in self.nodes else None
             self.state["standbys"] = [t for t in self.state["standbys"] if t != now]
         if self.state["active"] is None:
-            tag = self.weighted_pick(self.reserve())
+            tag = self.weighted_pick(self.prefer_ech(self.reserve()))
             if tag and self.probe(tag):
                 self.switch(tag, "start")
             return
@@ -812,6 +902,10 @@ class Pilot:
             self.maybe_upgrade()
             if self.due("explore", EXPLORE_EVERY):
                 self.explore()
+            if (not self.is_ech(self.state["active"])
+                    and any(self.is_ech(t) for t in self.nodes)
+                    and self.due("ech-return", (180, 600))):
+                self.ech_return()
             if (self.dns_current() != self.dns_choices()[0]
                     and self.due("dns-prefer", (1800, 3600))):
                 self.prefer_dns()
