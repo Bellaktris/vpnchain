@@ -784,7 +784,7 @@ function checkHost() {
       if (!bl.configured) {
         put("h-blocklist", "no list configured", "warn");
       } else if (!bl.present) {
-        put("h-blocklist", "configured but not fetched - run: vpnchain blocklist",
+        put("h-blocklist", "configured but not fetched - run: vpnchain get-blocklist",
             "bad");
       } else if (!bl.referenced) {
         put("h-blocklist", "installed but NOT in the live config - run: " +

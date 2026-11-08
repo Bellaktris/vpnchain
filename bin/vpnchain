@@ -253,7 +253,11 @@
 #            server does not do, since a second copy of the generator there
 #            would be two things to hold in sync.
 #
-#   blocklist
+#   get-blocklist
+#            fetch the domain lists and address ranges of KEEP_OUT_COUNTRIES
+#            into KEEP_OUT_DIR, each smoke-tested before it replaces the
+#            installed copy - see KEEP_OUT_COUNTRIES on why the pinned browser
+#            refuses those countries' sites. Then
 #            fetch the tracker lists named by BLOCKLIST_URL, convert them to a
 #            sing-box rule-set and install it at BLOCKLIST_PATH. Rejection then
 #            happens INSIDE the chain rather than in the browser, which is the
@@ -419,6 +423,9 @@ Optional:
     BROWSER_POLICY_FILE=<Linux: the policy file, defaults to
              /etc/opt/chrome/policies/managed/vpnchain.json; create it with
              'vpnchain setup'>
+    KEEP_OUT_COUNTRIES=<countries whose sites the pinned browser refuses,
+             so they get a separate unproxied browser; default "ru cn ir",
+             empty turns it off. Lists come with 'vpnchain get-blocklist'>
     NOTIFY_ALLOW=<space-separated origins allowed to show notifications,
              e.g. "https://mail.example.com https://chat.example.com";
              everything else is blocked>
@@ -1226,6 +1233,20 @@ clash_secret() {
 BLOCKLIST_URL="${BLOCKLIST_URL:-}"
 BLOCKLIST_PATH="${BLOCKLIST_PATH:-$HOME/.config/sing-box/blocklist.srs}"
 
+# Countries whose sites the pinned browser refuses, so that they are visited
+# from a separate, unproxied browser instead. A local site loaded through the
+# chain sees a foreign visitor, and one sent around it - the split routing
+# v2rayA calls bypassing the mainland - lets the page compare the address
+# its own server sees with the one a foreign address-check sees, and learn
+# the browser uses a proxy. Its identity is also the exit's: timezone,
+# language, cookies shared with everything else. Neither belongs at a bank
+# that knows you by national ID. Refusing them makes the split visible.
+#
+# Set explicitly empty to turn it off. Matched on the pinned port only; the
+# incognito browser is left alone.
+KEEP_OUT_COUNTRIES="${KEEP_OUT_COUNTRIES-ru cn ir}"
+KEEP_OUT_DIR="${KEEP_OUT_DIR:-$HOME/.config/sing-box/keep-out}"
+
 # Installed only if the converted set still blocks what it should and still
 # lets through what it must. A bad list is not a cosmetic problem: it presents
 # as sign-in or payment pages mysteriously failing, days after the fetch that
@@ -1720,6 +1741,82 @@ cmd_blocklist() {
     fi
 }
 
+# Per-country data for KEEP_OUT_COUNTRIES. Three layers, because none is
+# complete alone: the country's TLDs (needs no fetch, so it holds even before
+# the first one), a list of its services' names - which mostly live under
+# .com - and its address ranges, which catch whatever is hosted there under
+# any name at all.
+keep_out_tlds() {
+    case "$1" in
+        (ru) echo ru su xn--p1ai ;;                     # .рф
+        (cn) echo cn xn--fiqs8s xn--fiqz9s ;;           # .中国 .中國
+        (ir) echo ir xn--mgba3a4f16a ;;                 # .ایران
+        (*)  echo "$1" ;;
+    esac
+}
+
+# SagerNet's lists track v2fly's community list. Its Iran entry is a few
+# dozen names, so Iran comes from the list Iranian clients themselves use.
+keep_out_geosite_url() {
+    local r=https://raw.githubusercontent.com
+    case "$1" in
+        (cn) echo "$r/SagerNet/sing-geosite/rule-set/geosite-cn.srs" ;;
+        (ir) echo "$r/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-ir.srs" ;;
+        (*)  echo "$r/SagerNet/sing-geosite/rule-set/geosite-category-$1.srs" ;;
+    esac
+}
+keep_out_geoip_url() {
+    echo "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-$1.srs"
+}
+
+# A name and an address each list must hold. The addresses are resolvers
+# rather than websites, since a resolver's address is what stays put.
+keep_out_probe() {
+    case "$1" in
+        (ru) echo yandex.com 77.88.8.8 ;;
+        (cn) echo baidu.com 114.114.114.114 ;;
+        (ir) echo digikala.com 2.144.0.1 ;;
+    esac
+}
+KEEP_OUT_MUST_PASS=(google.com wikipedia.org github.com 8.8.8.8 1.1.1.1)
+
+# Fetch, verify, install, one file at a time: a list that fails keeps the
+# installed copy, and a country without one is still refused by its TLDs.
+cmd_keep_out() {
+    [ -n "$KEEP_OUT_COUNTRIES" ] || return 0
+    command -v sing-box >/dev/null 2>&1 || { bad "sing-box not found"; return 1; }
+    local tmp cc kind url f probe want p bad_one rc=0
+    tmp=$(temp_dir vpnchain-keep-out) || return 1
+    mkdir -p "$KEEP_OUT_DIR"
+    for cc in $KEEP_OUT_COUNTRIES; do
+        probe=$(keep_out_probe "$cc")
+        for kind in geosite geoip; do
+            url=$("keep_out_${kind}_url" "$cc")
+            f="$tmp/$kind-$cc.srs"
+            if ! curl -fsSL -m 120 -o "$f" "$url" || [ ! -s "$f" ]; then
+                bad "could not fetch $kind for $cc - $url"; rc=1; continue
+            fi
+            bad_one=
+            # The probe pair is "name address"; each list must hold its half.
+            if [ -n "$probe" ]; then
+                if [ "$kind" = geosite ]; then want=${probe% *}; else want=${probe#* }; fi
+                blocklist_blocks "$f" "$want" || bad_one="$want is missing"
+            fi
+            for p in "${KEEP_OUT_MUST_PASS[@]}"; do
+                blocklist_blocks "$f" "$p" && bad_one="$p would be refused"
+            done
+            if [ -n "$bad_one" ]; then
+                bad "$kind-$cc failed its smoke test ($bad_one); keeping the installed one"
+                rc=1; continue
+            fi
+            mv -f "$f" "$KEEP_OUT_DIR/$kind-$cc.srs"
+            ok "installed $kind-$cc ($(file_size "$KEEP_OUT_DIR/$kind-$cc.srs") bytes)"
+        done
+    done
+    rm -rf "$tmp"
+    return $rc
+}
+
 # A desktop notification, for the few events worth interrupting for. Fixed
 # strings only - nothing from the network ever reaches the osascript line.
 notify() {
@@ -2163,6 +2260,8 @@ generate_config() {
     WG_PEER_PUBLIC_KEY="$WG_PEER_PUBLIC_KEY" \
     WG_PEER_HOST="$WG_PEER_HOST" WG_PEER_PORT="$WG_PEER_PORT" \
     BL="$(blocklist_active && echo "$BLOCKLIST_PATH")" \
+    KEEP_OUT="$KEEP_OUT_COUNTRIES" KEEP_OUT_DIR="$KEEP_OUT_DIR" \
+    KEEP_OUT_TLDS="$(for cc in $KEEP_OUT_COUNTRIES; do keep_out_tlds "$cc"; done)" \
     TOR_PORT="$TOR_PORT" I2P_PORT="$I2P_PORT" \
     OUT="$out" \
     python3 - <<'PY' || { restore_config_backup; bad "generation failed"; exit 1; }
@@ -2435,6 +2534,37 @@ if bl:
     cfg["route"]["rule_set"] = [{"type": "local", "tag": "blocklist",
                                  "format": "binary", "path": bl}]
     cfg["route"]["rules"].insert(0, {"rule_set": "blocklist", "action": "reject"})
+
+# KEEP_OUT_COUNTRIES, on the pinned port alone. The TLDs need no file; the
+# lists join once 'vpnchain get-blocklist' has fetched them, since sing-box will
+# not start on a missing local rule-set. Address ranges can only match an
+# address, and the browser hands over names, so the name is resolved first -
+# through the same DNS the tunnel would use for it a moment later anyway.
+# Except .onion and .i2p, which must never reach a resolver at all.
+tlds = e.get("KEEP_OUT_TLDS", "").split()
+if tlds:
+    keep = [{"inbound": ["pinned-in"], "domain_suffix": tlds, "action": "reject"}]
+    sets = {"geosite": [], "geoip": []}
+    for cc in e.get("KEEP_OUT", "").split():
+        for kind in sets:
+            path = os.path.join(e["KEEP_OUT_DIR"], "%s-%s.srs" % (kind, cc))
+            if os.path.isfile(path) and os.path.getsize(path):
+                tag = "keep-out-%s-%s" % (kind, cc)
+                cfg["route"].setdefault("rule_set", []).append(
+                    {"type": "local", "tag": tag, "format": "binary", "path": path})
+                sets[kind].append(tag)
+    if sets["geosite"]:
+        keep.append({"inbound": ["pinned-in"], "rule_set": sets["geosite"],
+                     "action": "reject"})
+    if sets["geoip"]:
+        keep += [
+            {"type": "logical", "mode": "and", "action": "resolve",
+             "rules": [{"inbound": ["pinned-in"]},
+                       {"domain_suffix": ["onion", "i2p"], "invert": True}]},
+            {"inbound": ["pinned-in"], "rule_set": sets["geoip"],
+             "action": "reject"},
+        ]
+    cfg["route"]["rules"][0:0] = keep
 
 # Every lookup of a node's name - its address and, for ECH, its key - goes
 # to the node resolver, ahead of every other rule. Without this an ECH key
@@ -2981,7 +3111,9 @@ case "${1:-status}" in
     browser) shift; cmd_browser "$@" ;;
     i2p)     cmd_i2p "${2:-}" ;;
     config)  [ "${2:-}" = check ] && cmd_config_check || cmd_config ;;
-    blocklist) cmd_blocklist ;;
+             # The country lists first: they need no BLOCKLIST_URL, and
+             # cmd_blocklist exits when that is unset.
+    get-blocklist) cmd_keep_out; cmd_blocklist ;;
     subscribe) cmd_subscribe ;;
              # Regenerate and restart sing-box alone, leaving the pilot and
              # the status server running - which is what lets the pilot use
@@ -2998,7 +3130,7 @@ case "${1:-status}" in
         echo "       vpnchain browser incognito"
         echo "       vpnchain i2p [start|stop|status]"
         echo "       vpnchain config [check]"
-        echo "       vpnchain blocklist"
+        echo "       vpnchain get-blocklist"
         echo "       vpnchain subscribe"
         echo "       vpnchain reload"
         echo "       vpnchain setup"
