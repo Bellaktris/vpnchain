@@ -816,20 +816,19 @@ function showBlocked(b) {
         "cannot be found", "pend");
     return;
   }
-  var since = b.since ? new Date(b.since * 1000) : null;
+  var window = b.since ? " in the last " + dur(Date.now() / 1000 - b.since) : "";
   put("b-count", "(" + b.hostsTotal + ")", "pend");
   put("b-summary", b.hostsTotal
-        ? b.hostsTotal + " host(s), " + b.requestsTotal + " request(s)" +
-          (since ? " since " + clock(since) : "") +
+        ? b.hostsTotal + " host(s), " + b.requestsTotal + " request(s)" + window +
           (b.hosts.length < b.hostsTotal ? " - latest " + b.hosts.length + " shown" : "")
-        : "nothing blocked" + (since ? " since " + clock(since) : ""),
+        : "nothing blocked" + window,
       b.hostsTotal ? "" : "ok");
   var dl = $("b-rows");
   b.hosts.forEach(function (h) {
     var row = document.createElement("div");
     row.className = "row";
     var dt = document.createElement("dt");
-    dt.textContent = h.last ? clock(new Date(h.last * 1000)) : "-";
+    dt.textContent = h.last ? ago(h.last) : "-";
     var dd = document.createElement("dd");
     dd.textContent = h.host;
     var extra = document.createElement("span");
@@ -863,8 +862,8 @@ function showNodes(u) {
   $("n-sect").hidden = false;
 
   if (u.outage) {
-    put("n-active", "no node answers since " +
-          clock(new Date(u.outage.since * 1000)) + " - searching, round " +
+    put("n-active", "no node has answered for " +
+          dur(Date.now() / 1000 - u.outage.since) + " - searching, round " +
           u.outage.rounds + (u.active ? "; selector still on " + u.active.tag : ""),
         "bad");
   } else if (!u.active) {
@@ -893,7 +892,7 @@ function showNodes(u) {
   var sus = u.suspect || [];
   put("n-suspect", sus.length
         ? sus.map(function (s) {
-            return s.family + " until " + clock(new Date(s.until * 1000));
+            return s.family + " for another " + dur(s.until - Date.now() / 1000);
           }).join(", ")
         : "none", sus.length ? "warn" : "ok");
 
@@ -913,7 +912,7 @@ function showNodes(u) {
     var age = (Date.now() / 1000 - (l.fetchedAt || 0)) / 3600;
     put("n-list", l.count + " nodes in " + l.families + " families" +
           (l.ech ? ", " + l.ech + " with ECH" : "") + ", fetched " +
-          (l.fetchedAt ? clock(new Date(l.fetchedAt * 1000)) : "?") +
+          (l.fetchedAt ? ago(l.fetchedAt) : "?") +
           " via " + (l.via || "?"),
         // Refreshed about daily; two days means the refresh is failing.
         // Fetched directly means every proxied route was down at the time.
@@ -926,18 +925,29 @@ function showNodes(u) {
   var latest = ev.length ? ev[0].kind : "";
   put("n-events", ev.length
         ? ev.map(function (e) {
-            return clock(new Date(e.at * 1000)) + "  " + e.kind + ": " + e.msg;
+            return ago(e.at) + "  " + e.kind + ": " + e.msg;
           }).join("\n")
         : "none yet",
       latest === "down" || latest === "failed" ? "bad"
         : (latest === "suspect" || latest === "dns" ? "warn" : ""));
 }
 
-// "08:18" today, "Nov 7 23:10" before that.
-function clock(d) {
-  var hm = d.toTimeString().slice(0, 5);
-  return d.toDateString() === new Date().toDateString() ? hm
-    : d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " " + hm;
+// Times as durations - "5 min", "2 h 10 min" - never as clock times. The
+// pinned browser runs under SPOOF_TZ, so a clock time would read in the
+// spoofed zone, hours off the reader's own; a duration is the same anywhere.
+function dur(seconds) {
+  var s = Math.max(0, Math.round(seconds));
+  if (s < 60) return s + " s";
+  var m = Math.round(s / 60);
+  if (m < 60) return m + " min";
+  var h = Math.floor(m / 60);
+  if (h < 48) return h + " h" + (m % 60 ? " " + (m % 60) + " min" : "");
+  return Math.round(h / 24) + " d";
+}
+
+// An epoch in seconds, as "5 min ago".
+function ago(epoch) {
+  return dur(Date.now() / 1000 - epoch) + " ago";
 }
 
 /* --------------------------------------------------------------------- dns */

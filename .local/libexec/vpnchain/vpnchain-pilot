@@ -771,15 +771,19 @@ class Pilot:
 
         # The mode reads from the selector's name. A change starts the pool
         # over: the new config's selector holds other nodes entirely.
+        #
+        # Compared with the mode saved in the state, not with this process's
+        # idea of it: every mode change restarts the pilot, so a fresh process
+        # is the normal case and would otherwise miss half the switches.
         reality_mode = self.api.selector == "reality"
-        if reality_mode != self.reality_mode:
-            self.reality_mode = reality_mode
-            if self.state.get("reality_mode") is not None:
-                self.event("mode", "chained-reality: Reality nodes only" if reality_mode
-                           else "chained: ECH nodes only")
+        self.reality_mode = reality_mode
+        if reality_mode != self.state.get("reality_mode"):
+            self.event("mode", "chained-reality: Reality nodes only" if reality_mode
+                       else "chained: ECH nodes only")
             self.state["reality_mode"] = reality_mode
             self.state["outage"] = None
             self.state["standbys"] = []
+            self.state.pop("trouble", None)
 
         # Adopt whatever the selector holds - after a restart that is the
         # cached choice, and a manual choice should be respected too.
