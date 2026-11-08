@@ -221,7 +221,7 @@
 </details>
 
 <details class="sect" id="n-sect" hidden>
-  <summary>Nodes</summary>
+  <summary>Upstream</summary>
   <dl>
     <div class="row"><dt>Active node</dt><dd id="n-active" class="pend">checking</dd></div>
     <div class="row"><dt>Standbys</dt><dd id="n-standby" class="pend">checking</dd></div>
@@ -668,7 +668,7 @@ function checkHost() {
       var u = d.upstream || {};
       if (u.native) {
         // No separate core: the upstream is a node sing-box dials itself.
-        // The detail is in the Nodes section; this row says whether the
+        // The detail is in the Upstream section; this row says whether the
         // link to it is there at all.
         put("h-upstream", "sing-box's own nodes, shared port " + u.port +
               (u.listening ? "" : " NOT listening"),
