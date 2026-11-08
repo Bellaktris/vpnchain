@@ -1201,9 +1201,8 @@ function conclude() {
     checks.push({ state: "fail", label: "Incognito exit",
                   detail: inc + " - same as the pinned exit, so the two are linkable" });
   } else {
-    checks.push({ state: "pass", label: "Incognito exit",
-                  detail: inc + (real ? " - neither pinned nor real"
-                                      : " - not the pinned exit") });
+    // A pass already says it is neither the pinned nor the real address.
+    checks.push({ state: "pass", label: "Incognito exit", detail: inc });
   }
 
   // Timezone agreement across scopes.
