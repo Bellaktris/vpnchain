@@ -2201,6 +2201,17 @@ def node_outbound(n):
     if n["transport"] == "ws":
         o["transport"] = {"type": "ws", "path": n.get("path") or "/",
                           "headers": {"Host": n.get("host") or n["sni"]}}
+    # A node marked "multiplex" - one of your own, where both ends run
+    # sing-box - carries everything in one padded multiplexed connection
+    # instead of Vision. Vision pads TLS carried inside the tunnel; this one
+    # carries WireGuard, whose handshake and keepalive sizes would otherwise
+    # show through, and padding the whole stream is what hides them. It also
+    # reuses the one connection, which measured faster than Vision here.
+    if n.get("multiplex"):
+        o.pop("flow", None)
+        o.pop("packet_encoding", None)
+        o["multiplex"] = {"enabled": True, "protocol": "h2mux",
+                          "max_connections": 1, "padding": True}
     return o
 
 nodes = []
@@ -2257,20 +2268,22 @@ cfg = {
         {"type": "socks", "tag": up, "server": e["UP_HOST"],
          "server_port": int(e["UP_PORT"]), "version": "5"},
     ],
-    # BitTorrent never leaves by the pinned address. That address is the one
-    # that identifies you, and torrents belong on the shared upstream exits -
-    # which is where a client pointed at the upstream's own port already
-    # sends them. These two rules make that a guarantee rather than a habit:
-    # a client mistakenly pointed at the pinned inbound is refused instead of
-    # quietly torrenting on the pinned address.
+    # Only web traffic leaves by the pinned address - TLS and plain HTTP,
+    # which is all the browser it is pinned to ever speaks. That address is
+    # the one that identifies you, and a client mistakenly pointed at the
+    # pinned inbound is refused instead of quietly using it. Matching
+    # BitTorrent by name was not enough: a client that requires encryption
+    # sends nothing a sniffer can recognise, and walked straight past.
+    # Anything not recognisably web is refused instead.
     #
     # Sniffing waits for the client's first bytes, so server-first protocols
     # pay its timeout once per connection; browsers speak first and do not.
     "route": {
         "rules": [
             {"inbound": ["pinned-in"], "action": "sniff"},
-            {"inbound": ["pinned-in"], "protocol": ["bittorrent"],
-             "action": "reject"},
+            {"type": "logical", "mode": "and", "action": "reject",
+             "rules": [{"inbound": ["pinned-in"]},
+                       {"protocol": ["tls", "http"], "invert": True}]},
             {"inbound": ["upstream-in"], "action": "route",
              "outbound": up},
         ],
@@ -2329,13 +2342,14 @@ if nodes:
     # server: torrents there would be dozens of busy parallel connections to
     # a single address presenting itself as the cover site - the pattern the
     # networks that mode is for look for when hunting Reality servers, and
-    # the way to lose the one node that works there. Refused, by the same
-    # two rules that keep torrents off the pinned address.
+    # the way to lose the one node that works there.
+    #
+    # Refused outright, not filtered: nothing of yours needs the shared port
+    # in that mode, and filtering by protocol failed - a torrent client that
+    # requires encryption is unrecognisable and got through. i2pd, which
+    # would also fan out through it, is stopped on the switch as well.
     if want_reality:
-        cfg["route"]["rules"] += [
-            {"inbound": ["shared-in"], "action": "sniff"},
-            {"inbound": ["shared-in"], "protocol": ["bittorrent"],
-             "action": "reject"}]
+        cfg["route"]["rules"].append({"inbound": ["shared-in"], "action": "reject"})
     cfg["route"]["rules"].append(
         {"inbound": ["shared-in"], "action": "route", "outbound": up})
     # The incognito browser exists to be unlinked from you, so in
