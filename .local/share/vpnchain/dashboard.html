@@ -135,6 +135,9 @@
             border-right: 1px solid var(--line); padding-right: .75rem; }
   .row dd { margin: 0; font-family: var(--mono); font-size: .85rem;
             word-break: break-word; text-align: center; }
+  /* Several lines each; the text is set with textContent, so line breaks
+     have to come from the newlines in it. */
+  #n-active, #n-standby, #n-events { white-space: pre-line; }
   .note { color: var(--dim); font-size: .8rem; font-family: inherit;
           padding: .45rem 1.1rem .55rem; border-top: 1px solid var(--line); }
   .note summary { cursor: pointer; list-style: none; width: max-content;
@@ -215,6 +218,34 @@
     visible to a page on its own - it comes from the status server that serves
     this file. Opened as a bare file with no server running, this section is
     empty and the rest still works.</details>
+</details>
+
+<details class="sect" id="n-sect" hidden>
+  <summary>Nodes</summary>
+  <dl>
+    <div class="row"><dt>Active node</dt><dd id="n-active" class="pend">checking</dd></div>
+    <div class="row"><dt>Standbys</dt><dd id="n-standby" class="pend">checking</dd></div>
+    <div class="row"><dt>Pilot</dt><dd id="n-pilot" class="pend">checking</dd></div>
+    <div class="row"><dt>Families set aside</dt><dd id="n-suspect" class="pend">checking</dd></div>
+    <div class="row"><dt>Node name lookups</dt><dd id="n-dns" class="pend">checking</dd></div>
+    <div class="row"><dt>Node list</dt><dd id="n-list" class="pend">checking</dd></div>
+    <div class="row"><dt>Recent events</dt><dd id="n-events" class="pend">checking</dd></div>
+  </dl>
+  <details class="note"><summary>why this matters</summary>Every node the
+    chain could use is loaded, but only the one the pilot chose is ever dialled,
+    plus two standbys from other domain families that it checks now and then -
+    a few names a day are all the network sees. A family whose nodes keep
+    failing is set aside for a few hours, since one blocking rule takes out a
+    whole family at once. The Reality node is used only when nothing else
+    answers, so that it is still unknown when it is needed. Delays are measured
+    to the node; the distance on to the WireGuard peer is estimated and added
+    when the pilot chooses, so a fast node on the wrong continent does not win.
+    The delays are for a fresh HTTPS request through each node, which crosses
+    to the node's real server several times over - a page already loaded
+    feels one crossing, not four. A plain ping would answer from the CDN edge
+    in front of the node in a few ms and say nothing about the node itself.
+    Events are the pilot's own log: switches, standbys admitted and dropped,
+    families set aside, outages.</details>
 </details>
 
 <details class="sect">
@@ -632,11 +663,21 @@ function checkHost() {
       put("h-mode", d.mode || "unknown", d.mode ? "" : "warn");
 
       var u = d.upstream || {};
-      put("h-upstream", u.running
-            ? "running, pid " + u.pid + ", port " + u.port +
-              (u.listening ? "" : " NOT listening")
-            : "not running",
-          u.running && u.listening ? "ok" : "bad");
+      if (u.native) {
+        // No separate core: the upstream is a node sing-box dials itself.
+        // The detail is in the Nodes section; this row says whether the
+        // link to it is there at all.
+        put("h-upstream", "sing-box's own nodes, shared port " + u.port +
+              (u.listening ? "" : " NOT listening"),
+            u.listening ? "ok" : "bad");
+        showNodes(u);
+      } else {
+        put("h-upstream", u.running
+              ? "running, pid " + u.pid + ", port " + u.port +
+                (u.listening ? "" : " NOT listening")
+              : "not running",
+            u.running && u.listening ? "ok" : "bad");
+      }
 
       var b = d.singbox || {};
       put("h-singbox", b.running ? "running, pid " + b.pid : "not running",
@@ -752,7 +793,9 @@ function checkHost() {
     .catch(function () {
       ["h-mode", "h-upstream", "h-singbox", "h-pinned", "h-incognito",
        "h-incexit", "h-sysproxy", "h-blocklist", "h-onion", "h-i2pdest",
-       "b-summary", "p-cookies", "p-webrtc",
+       "b-summary", "n-active", "n-standby", "n-pilot", "n-suspect", "n-list",
+       "n-events", "n-dns",
+       "p-cookies", "p-webrtc",
        "p-incognito", "p-devices", "p-adprivacy", "p-https", "p-telemetry",
        "p-notify", "p-background", "p-downloads"]
         .forEach(function (id) {
@@ -795,6 +838,89 @@ function showBlocked(b) {
     row.appendChild(dd);
     dl.appendChild(row);
   });
+}
+
+/* ------------------------------------------------------------------- nodes */
+
+// What the pilot is doing, from its state file via the status server. Node
+// names come from the provider's subscription, so like host names above they
+// are only ever set as text.
+function nodeText(n) {
+  if (!n) return "-";
+  var bits = [n.region, n.family].filter(Boolean);
+  // A fresh HTTPS request through the node: several round trips to the
+  // node's real server, not a ping to the CDN edge in front of it - which
+  // answers in a few ms whichever node it fronts, and so ranks nothing.
+  return n.tag + (bits.length ? " (" + bits.join(", ") + ")" : "") + "\n" +
+         (n.delay ? n.delay + " ms per fresh request" : "not measured yet");
+}
+
+function showNodes(u) {
+  $("n-sect").hidden = false;
+
+  if (u.outage) {
+    put("n-active", "no node answers since " +
+          clock(new Date(u.outage.since * 1000)) + " - searching, round " +
+          u.outage.rounds + (u.active ? "; selector still on " + u.active.tag : ""),
+        "bad");
+  } else if (!u.active) {
+    put("n-active", u.pilot ? "none chosen yet" : "none chosen, and no pilot",
+        u.pilot ? "pend" : "bad");
+  } else {
+    put("n-active", nodeText(u.active) +
+          (u.active.reality ? "\nLAST RESORT - every ordinary node failed" : ""),
+        u.active.reality ? "warn" : "ok");
+  }
+
+  var sb = u.standbyNodes || [];
+  // A blank line between nodes, now that each takes two.
+  put("n-standby", sb.length ? sb.map(nodeText).join("\n\n")
+                             : "none yet - admitted as they are measured",
+      sb.length >= 2 ? "ok" : "warn");
+
+  put("n-pilot", u.pilot ? "running" : "NOT running - nothing replaces a failed node",
+      u.pilot ? "ok" : "bad");
+
+  var sus = u.suspect || [];
+  put("n-suspect", sus.length
+        ? sus.map(function (s) {
+            return s.family + " until " + clock(new Date(s.until * 1000));
+          }).join(", ")
+        : "none", sus.length ? "warn" : "ok");
+
+  // Plain DNS puts every node name in the network's resolver logs, so the
+  // fallback to it is worth seeing; a DoH fallback is merely worth noting.
+  var dns = u.dns || {};
+  put("n-dns", dns.current === "local"
+        ? "system resolver - PLAIN DNS, every DoH server failed"
+        : "DoH to " + (dns.current || "?") +
+          (dns.current !== dns.preferred ? " (fallback; " + dns.preferred + " failed)" : ""),
+      dns.current === "local" ? "bad" : (dns.current !== dns.preferred ? "warn" : "ok"));
+
+  var l = u.list;
+  if (!l) {
+    put("n-list", "no node list - run: vpnchain subscribe", "bad");
+  } else {
+    var age = (Date.now() / 1000 - (l.fetchedAt || 0)) / 3600;
+    put("n-list", l.count + " nodes in " + l.families + " families, fetched " +
+          (l.fetchedAt ? clock(new Date(l.fetchedAt * 1000)) : "?") +
+          " via " + (l.via || "?"),
+        // Refreshed about daily; two days means the refresh is failing.
+        // Fetched directly means every proxied route was down at the time.
+        age > 48 ? "warn" : (l.via === "direct" ? "warn" : "ok"));
+  }
+
+  // Newest first, one per line. Coloured by the newest only: older trouble
+  // the pilot has since recovered from is history, not a current fault.
+  var ev = (u.events || []).slice().reverse();
+  var latest = ev.length ? ev[0].kind : "";
+  put("n-events", ev.length
+        ? ev.map(function (e) {
+            return clock(new Date(e.at * 1000)) + "  " + e.kind + ": " + e.msg;
+          }).join("\n")
+        : "none yet",
+      latest === "down" || latest === "failed" ? "bad"
+        : (latest === "suspect" || latest === "dns" ? "warn" : ""));
 }
 
 // "08:18" today, "Nov 7 23:10" before that.
@@ -1113,6 +1239,15 @@ function conclude() {
     if (broken.length) {
       checks.push({ state: "fail", label: "Chain",
                     detail: broken.join(" and ") + " not healthy" });
+    } else if (up.native && up.outage) {
+      checks.push({ state: "fail", label: "Chain",
+                    detail: "no node answers - the pilot is searching" });
+    } else if (up.native && !up.pilot) {
+      checks.push({ state: "warn", label: "Chain",
+                    detail: "links up, but no pilot - a failed node stays failed" });
+    } else if (up.native && up.active && up.active.reality) {
+      checks.push({ state: "warn", label: "Chain",
+                    detail: "on the Reality node - every ordinary node failed" });
     } else {
       checks.push({ state: "pass", label: "Chain",
                     detail: (hostData.mode || "?") + " mode, all links up" });

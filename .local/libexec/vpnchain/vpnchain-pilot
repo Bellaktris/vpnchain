@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""Keep vpnchain on a working node without being asked, and without showing
+the network more of the provider than it has to.
+
+sing-box holds every node of the subscription in one selector and dials none
+of them until the selector points there. This moves the selector, through the
+Clash API on loopback, and is the only thing that does.
+
+The priorities, in order, and what each one costs the next:
+
+  1. No manual intervention. A dead node is replaced within a few minutes,
+     a dead pool is searched, the Reality node is tried when nothing else
+     connects, and if that fails too the subscription is fetched again -
+     by Tor, and directly as the last resort. Nothing waits for a person.
+
+  2. Robustness against censorship. Every probe is a TLS connection to a
+     node, with its name in the clear, so probes are few and never on a
+     schedule: the active node, two standbys from other domain families, and
+     one unknown node every several hours. The provider's names fall into a
+     handful of families that a single rule blocks together, so the
+     standbys never share the active node's family, and a family whose nodes
+     keep failing is set aside. The Reality node is never touched while
+     anything else works: the node nobody sees used is the one that lasts.
+
+  3. Latency. Measured through each node, plus the distance from the node to
+     the WireGuard peer, which the measurement cannot see - the probe target
+     is anycast and sits next to every node alike. Both together predicted
+     the real end-to-end order of eight nodes far better than either alone
+     (see geo_ms). The active node is
+     replaced on latency alone only by a clearly better one, measured twice:
+     every switch shows the network another name.
+
+The state, including recent events, is written to pilot.json beside the env
+file, for the dashboard and for whoever wants to know why the exit moved.
+"""
+
+import base64
+import json
+import math
+import os
+import random
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONF_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "vpnchain")
+ENV_FILE = os.path.join(CONF_DIR, "env")
+STATE_FILE = os.path.join(CONF_DIR, "pilot.json")
+SELECTOR = "shared"
+
+# Intervals are drawn from these ranges afresh every time, so no two probes
+# of a node are ever a fixed distance apart: a fixed period is a fingerprint
+# of its own, which Xray's documentation warns about for exactly this case.
+TICK = (40, 80)                     # seconds between looks at the state
+ACTIVE_EVERY = (120, 360)           # the node in use
+STANDBY_EVERY = (900, 1800)         # the two standbys
+EXPLORE_EVERY = (4 * 3600, 8 * 3600)        # one node nobody has measured
+SUBSCRIBE_EVERY = (20 * 3600, 28 * 3600)    # the node list itself
+
+STANDBYS = 2
+FAILS_TO_SWITCH = 2         # consecutive failures before the active node goes
+OUTAGE_BATCH = 3            # reserve nodes tried per round while nothing works
+OUTAGE_ROUNDS_BEFORE_REALITY = 2
+SUSPECT_FOR = 6 * 3600      # how long a failing family is set aside
+UPGRADE_RATIO, UPGRADE_MS = 0.75, 40    # "clearly better", for a latency switch
+TAU_MS = 120                # how sharply the random choice favours low scores
+PROBE_TIMEOUT_MS = 6000
+UNKNOWN_DELAY_MS = 400      # prior for a node never measured
+GEO_MS_PER_KM = 0.03        # see geo_ms for how this was measured
+
+# Inside the node's TLS, so the network never sees which; varied anyway since
+# it costs nothing. All anycast, so each answers from next to the node.
+PROBE_URLS = ["https://www.gstatic.com/generate_204",
+              "https://cp.cloudflare.com/generate_204",
+              "https://connectivitycheck.gstatic.com/generate_204"]
+
+# Where the provider's regions and the likely WireGuard peers are. Coarse on
+# purpose: a node's city is a guess from its name, and a few hundred km is
+# a few ms. Unknown names get the median penalty rather than none.
+COORDS = {
+    "austria": (48.2, 16.4), "belgium": (50.8, 4.4), "bulgaria": (42.7, 23.3),
+    "canada": (43.7, -79.4), "germany": (50.1, 8.7), "hongkong": (22.3, 114.2),
+    "italy": (45.5, 9.2), "kenya": (-1.3, 36.8), "losangeles": (34.1, -118.2),
+    "miami": (25.8, -80.2), "moldova": (47.0, 28.9), "netherlands": (52.4, 4.9),
+    "norway": (59.9, 10.8), "phoenix": (33.4, -112.1), "romania": (44.4, 26.1),
+    "russia": (55.8, 37.6), "singapore": (1.35, 103.8), "slovakia": (48.1, 17.1),
+    "sweden": (59.3, 18.1), "swiss": (47.4, 8.5), "turkey": (41.0, 29.0),
+    "uae": (25.2, 55.3), "uk-man": (53.5, -2.2), "ukraine": (50.5, 30.5),
+    "seattle": (47.6, -122.3), "newyork": (40.7, -74.0), "chicago": (41.9, -87.6),
+    "dallas": (32.8, -96.8), "atlanta": (33.7, -84.4), "london": (51.5, -0.1),
+    "frankfurt": (50.1, 8.7), "amsterdam": (52.4, 4.9), "tokyo": (35.7, 139.7),
+}
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+def read_env(path):
+    """Shell-style KEY=VALUE, as vpnchain-statusd reads it."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                out[k.strip()] = os.path.expanduser(
+                    os.path.expandvars(v.strip().strip('"').strip("'")))
+    except OSError:
+        pass
+    return out
+
+
+def distance_km(a, b):
+    (la1, lo1), (la2, lo2) = [(math.radians(x), math.radians(y)) for x, y in (a, b)]
+    h = (math.sin((la2 - la1) / 2) ** 2
+         + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2)
+    return 6371 * 2 * math.asin(math.sqrt(h))
+
+
+def notify(msg):
+    """Fixed strings only reach here - never anything from the network."""
+    if sys.platform == "darwin":
+        cmd = ["osascript", "-e",
+               'display notification "%s" with title "vpnchain"' % msg]
+    else:
+        cmd = ["notify-send", "vpnchain", msg]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+class Api:
+    """The few Clash API calls the pilot needs."""
+
+    def __init__(self, port, secret):
+        self.base = "http://127.0.0.1:%s" % port
+        self.secret = secret
+
+    def _call(self, method, path, body=None, timeout=10):
+        req = urllib.request.Request(
+            self.base + path, method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"Authorization": "Bearer " + self.secret,
+                     "Content-Type": "application/json"})
+        # The API is loopback; a proxy from the environment must not answer.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as r:
+            data = r.read()
+            return json.loads(data) if data else None
+
+    def selected(self):
+        return self._call("GET", "/proxies/" + SELECTOR)["now"]
+
+    def select(self, tag):
+        self._call("PUT", "/proxies/" + SELECTOR, {"name": tag})
+
+    def delay(self, tag):
+        """Milliseconds through this node, or None if it did not answer."""
+        q = urllib.parse.urlencode({"url": random.choice(PROBE_URLS),
+                                    "timeout": PROBE_TIMEOUT_MS})
+        try:
+            r = self._call("GET", "/proxies/%s/delay?%s"
+                           % (urllib.parse.quote(tag, safe=""), q),
+                           timeout=PROBE_TIMEOUT_MS / 1000 + 5)
+            return r.get("delay") or None
+        except urllib.error.HTTPError:
+            return None
+
+
+class Pilot:
+    def __init__(self):
+        self.env = {}
+        self.nodes = {}             # tag -> node from nodes.json
+        self.nodes_mtime = None
+        self.api = None
+        self.state = self.load_state()
+
+    # --- state -------------------------------------------------------------
+
+    def load_state(self):
+        try:
+            with open(STATE_FILE) as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            s = {}
+        s.setdefault("active", None)
+        s.setdefault("standbys", [])
+        s.setdefault("stats", {})       # tag -> fails, delays, last_ok, last_try
+        s.setdefault("suspect", {})     # family -> until
+        s.setdefault("due", {})
+        s.setdefault("outage", None)    # {"since", "rounds", "tried", "next"}
+        s.setdefault("events", [])
+        # The first explore and subscribe come one interval after the first
+        # start, not at it: a start should not look like a burst.
+        for key, every in (("explore", EXPLORE_EVERY), ("subscribe", SUBSCRIBE_EVERY)):
+            s["due"].setdefault(key, time.time() + random.uniform(*every))
+        return s
+
+    def save_state(self):
+        self.state["due"] = {k: v for k, v in self.state["due"].items()
+                             if not k.startswith("standby:")
+                             or k[len("standby:"):] in self.state["standbys"]}
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.state, f, indent=1)
+        os.replace(tmp, STATE_FILE)
+
+    def event(self, kind, msg, alert=False):
+        log("%s: %s" % (kind, msg))
+        self.state["events"] = (self.state["events"]
+                                + [{"at": int(time.time()), "kind": kind,
+                                    "msg": msg}])[-30:]
+        if alert:
+            notify(msg)
+
+    def due(self, key, every):
+        """True once per drawn interval; the next one is drawn when it fires."""
+        now = time.time()
+        if now < self.state["due"].get(key, 0):
+            return False
+        self.state["due"][key] = now + random.uniform(*every)
+        return True
+
+    # --- inputs ------------------------------------------------------------
+
+    def refresh_inputs(self):
+        self.env = read_env(ENV_FILE)
+        try:
+            with open(os.path.join(CONF_DIR, "clash-secret")) as f:
+                secret = f.read().strip()
+        except OSError:
+            secret = ""
+        self.api = Api(self.env.get("CLASH_PORT", "9090"), secret)
+        path = self.env.get("NODES_FILE", os.path.join(CONF_DIR, "nodes.json"))
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            return
+        if mtime != self.nodes_mtime:
+            with open(path) as f:
+                self.nodes = {n["tag"]: n for n in json.load(f)["nodes"]}
+            self.nodes_mtime = mtime
+            # Forget nodes the provider dropped, keep everything else.
+            for key in ("standbys",):
+                self.state[key] = [t for t in self.state[key] if t in self.nodes]
+            self.state["stats"] = {t: v for t, v in self.state["stats"].items()
+                                   if t in self.nodes}
+
+    def online(self):
+        """Whether there is a network at all. Without this, a closed lid
+        would burn through the reserve.
+
+        Any one of several answers will do: a TCP connection to one of the
+        DoH resolvers sing-box may already be talking to, or the system
+        resolver answering for the name macOS itself asks about every time
+        it joins a network. None of it shows the network anything new - and
+        no single blocked address can make a working network look offline,
+        which would leave the pilot idle exactly when it is needed."""
+        for ip in self.dns_choices()[:-1]:
+            try:
+                with socket.create_connection((ip, 443), timeout=3):
+                    return True
+            except OSError:
+                pass
+        try:
+            socket.getaddrinfo("captive.apple.com", 443)
+            return True
+        except OSError:
+            return False
+
+    # --- node-name resolver --------------------------------------------------
+
+    def dns_choices(self):
+        """In order of preference; "local" is the system resolver."""
+        return self.env.get("NODE_DNS", "1.1.1.1 8.8.8.8 9.9.9.9").split() + ["local"]
+
+    def dns_current(self):
+        try:
+            with open(os.path.join(CONF_DIR, "node-dns")) as f:
+                cur = f.read().strip()
+        except OSError:
+            cur = ""
+        choices = self.dns_choices()
+        return cur if cur in choices else choices[0]
+
+    @staticmethod
+    def answers(choice, name):
+        """Whether this resolver is working: it gives an answer for the name,
+        yes or no. A clean "no such name" is a working resolver and a dead
+        node - which node failover deals with - so it must not move the
+        resolver. Only silence, a refusal or a broken transport does.
+
+        Asked over HTTP/2 through curl, the way sing-box asks: some servers
+        (Quad9) refuse DoH over HTTP/1.1, which would fail them here while
+        they work fine there."""
+        if choice == "local":
+            try:
+                socket.getaddrinfo(name, 443, socket.AF_INET)
+                return True
+            except socket.gaierror as e:
+                return e.errno == socket.EAI_NONAME
+            except OSError:
+                return False
+        # RFC 8484 GET: a plain A query, base64url without padding.
+        q = (os.urandom(2) + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+             + b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
+             + b"\x00\x00\x01\x00\x01")
+        url = "https://%s/dns-query?dns=%s" % (
+            choice, base64.urlsafe_b64encode(q).decode().rstrip("="))
+        try:
+            a = subprocess.run(
+                ["curl", "-s", "--http2", "--noproxy", "*", "-m", "6", "-f",
+                 "-H", "accept: application/dns-message", url],
+                capture_output=True, timeout=10).stdout
+        except Exception:
+            return False
+        # NOERROR or NXDOMAIN; SERVFAIL and REFUSED count as not working.
+        return len(a) > 12 and (a[3] & 0x0F) in (0, 3)
+
+    def use_dns(self, choice, why):
+        tmp = os.path.join(CONF_DIR, "node-dns.tmp")
+        with open(tmp, "w") as f:
+            f.write(choice + "\n")
+        os.replace(tmp, os.path.join(CONF_DIR, "node-dns"))
+        p = subprocess.run([os.path.join(HERE, "vpnchain"), "reload"],
+                           capture_output=True, text=True, timeout=120)
+        plain = choice == "local"
+        self.event("dns", "node names now resolved by %s (%s)%s" % (
+            "the system resolver - plain DNS" if plain else "DoH to " + choice, why,
+            "" if p.returncode == 0 else " - reload FAILED"),
+            alert=plain or p.returncode != 0)
+
+    def check_dns(self):
+        """When probes fail, ask first whether the nodes are dead or merely
+        unresolvable. If the resolver is the problem, change the resolver -
+        otherwise every node looks dead at once, families get set aside and
+        the pilot ends up on Reality over a DNS outage.
+
+        "ok" if the resolver in use answers, "changed" if another one had to
+        take over, "down" if none answers - then the names themselves may be
+        what is blocked, and the ordinary search through nodes and families
+        is the right response after all."""
+        name = self.nodes[self.state["active"]]["server"] if self.state["active"] \
+            else next(iter(self.nodes.values()))["server"]
+        cur = self.dns_current()
+        if self.answers(cur, name):
+            return "ok"
+        for choice in self.dns_choices():
+            if choice != cur and self.answers(choice, name):
+                self.use_dns(choice, "%s stopped answering" % cur)
+                return "changed"
+        return "down"
+
+    def prefer_dns(self):
+        """Off a fallback as soon as something earlier in the order answers
+        again - above all off plain DNS."""
+        cur, choices = self.dns_current(), self.dns_choices()
+        name = self.nodes[self.state["active"]]["server"]
+        for choice in choices[:choices.index(cur)]:
+            if self.answers(choice, name):
+                self.use_dns(choice, "answering again")
+                return
+
+    # --- scoring -----------------------------------------------------------
+
+    def stat(self, tag):
+        return self.state["stats"].setdefault(
+            tag, {"fails": 0, "delays": [], "last_ok": 0, "last_try": 0})
+
+    def geo_ms(self, tag):
+        """What the leg from the node to the WireGuard peer adds, in the same
+        currency as a delay measurement: a fresh request, which crosses that
+        leg as many times as it crosses the one to the node.
+
+        The weight is measured, not derived. Eight nodes from Austria to
+        Singapore were each put under the tunnel (2026-11-08, peer on another
+        continent) and the real end-to-end time fitted against the pilot's two
+        inputs: 1.11 x delay + 0.036 x km + 185, i.e. 0.033 ms per km
+        relative to the delay. That ranked the nodes 0.86 like reality,
+        against 0.71 for the 0.015 first guessed and 0.46 for delay alone."""
+        exit_at = COORDS.get(self.env.get("EXIT_REGION", "").lower().replace(" ", ""))
+        here = COORDS.get(self.nodes[tag].get("region", "").lower())
+        if not exit_at:
+            return 0
+        if not here:
+            # About the median distance of the provider's regions.
+            return 200
+        return distance_km(here, exit_at) * GEO_MS_PER_KM
+
+    def score(self, tag):
+        d = self.stat(tag)["delays"]
+        measured = sorted(d)[len(d) // 2] if d else UNKNOWN_DELAY_MS
+        return measured + self.geo_ms(tag)
+
+    def is_reality(self, tag):
+        return self.nodes[tag]["security"] == "reality"
+
+    def family(self, tag):
+        return self.nodes[tag]["family"]
+
+    def suspect(self, fam):
+        return self.state["suspect"].get(fam, 0) > time.time()
+
+    def weighted_pick(self, tags):
+        """Random, but leaning towards low scores: the order of nodes tried
+        should not be predictable, and should still favour good ones."""
+        if not tags:
+            return None
+        scores = {t: self.score(t) for t in tags}
+        best = min(scores.values())
+        weights = [math.exp(-(scores[t] - best) / TAU_MS) for t in tags]
+        return random.choices(tags, weights)[0]
+
+    # --- probing -----------------------------------------------------------
+
+    def probe(self, tag):
+        st = self.stat(tag)
+        st["last_try"] = int(time.time())
+        ms = self.api.delay(tag)
+        if ms:
+            st["fails"] = 0
+            st["last_ok"] = st["last_try"]
+            st["delays"] = (st["delays"] + [ms])[-3:]
+        else:
+            st["fails"] += 1
+            self.judge_family(self.family(tag))
+        return ms
+
+    def judge_family(self, fam):
+        """Two members failing in the last hour, none answering since, and the
+        family is treated as blocked for a while. One rule takes out a whole
+        family, so trying its other members is mostly wasted exposure."""
+        hour_ago = time.time() - 3600
+        members = [t for t in self.nodes if self.family(t) == fam]
+        recent_fail = [t for t in members if self.stat(t)["fails"]
+                       and self.stat(t)["last_try"] > hour_ago]
+        recent_ok = [t for t in members if self.stat(t)["last_ok"] > hour_ago]
+        if len(recent_fail) >= 2 and not recent_ok and not self.suspect(fam):
+            self.state["suspect"][fam] = int(time.time() + SUSPECT_FOR)
+            self.event("suspect", "%s set aside after repeated failures" % fam)
+
+    # --- decisions ---------------------------------------------------------
+
+    def switch(self, tag, why):
+        self.api.select(tag)
+        old = self.state["active"]
+        self.state["active"] = tag
+        self.state["standbys"] = [t for t in self.state["standbys"] if t != tag]
+        self.event("switch", "%s -> %s (%s)" % (old, tag, why),
+                   alert=why not in ("latency", "start"))
+
+    def reserve(self, exclude_families=()):
+        """Ordinary nodes not in use. Suspect families only when nothing else
+        is left: a network that blocked everything for an hour - a captive
+        portal, say - must not leave the pilot shunning every family for
+        hours after it comes back."""
+        taken = {self.state["active"], *self.state["standbys"]}
+        base = [t for t in self.nodes
+                if t not in taken and not self.is_reality(t)
+                and self.family(t) not in exclude_families]
+        return [t for t in base if not self.suspect(self.family(t))] or base
+
+    def fill_standbys(self):
+        """One candidate per call, measured before it is admitted, from a
+        family that neither the active node nor the other standby is in."""
+        if len(self.state["standbys"]) >= STANDBYS:
+            return
+        if time.time() < self.state["due"].get("fill", 0):
+            return
+        fams = {self.family(t) for t in [self.state["active"], *self.state["standbys"]] if t}
+        pool = self.reserve(exclude_families=fams) or self.reserve()
+        tag = self.weighted_pick(pool)
+        if not tag:
+            return
+        if self.probe(tag):
+            self.state["standbys"].append(tag)
+            self.state["fill_fails"] = 0
+            # Just measured, so its first scheduled check is an interval away.
+            self.state["due"]["standby:" + tag] = time.time() + random.uniform(*STANDBY_EVERY)
+            self.event("standby", "%s admitted (%.0f ms est.)" % (tag, self.score(tag)))
+        else:
+            # Candidates failing in a row means a hostile network, and every
+            # attempt shows it another name. Back off from a minute to an hour.
+            n = self.state["fill_fails"] = self.state.get("fill_fails", 0) + 1
+            self.state["due"]["fill"] = time.time() + min(60 * 2 ** n, 3600) * random.uniform(0.7, 1.3)
+
+    def check_active(self):
+        tag = self.state["active"]
+        if self.probe(tag):
+            return True
+        if self.stat(tag)["fails"] >= FAILS_TO_SWITCH:
+            # A resolver outage looks exactly like a dead node from here.
+            if self.check_dns() == "changed":
+                self.stat(tag)["fails"] = 0
+                return True
+            self.event("failed", "%s stopped answering" % tag)
+            return False
+        # One failure may be a blip; the second opinion comes soon, so a real
+        # outage costs a minute or two rather than one more full interval.
+        self.state["due"]["active"] = time.time() + random.uniform(30, 60)
+        return True
+
+    def failover(self):
+        """Standbys first, then the reserve in random batches, then Reality,
+        then a fresh subscription. One round per tick, so a long outage costs
+        a few probes a minute rather than a burst through the whole list."""
+        out = self.state["outage"] or {"since": int(time.time()), "rounds": 0,
+                                       "tried": [], "next": 0}
+        self.state["outage"] = out
+        if time.time() < out.get("next", 0):
+            # Between rounds, keep asking the node that last worked. It is a
+            # name the network has already seen, so asking costs nothing new,
+            # and it is what notices first that the outage was the network's
+            # own - a captive portal, a dead uplink - and is over.
+            last = max(self.nodes, key=lambda t: self.stat(t)["last_ok"])
+            if self.stat(last)["last_ok"] and self.due("outage-ping", (90, 240)):
+                if self.probe(last):
+                    self.recovered(last, "failover")
+            return
+        out["rounds"] += 1
+        # Nodes cannot be reached without their names resolving; fix that
+        # first, and give the nodes a fresh round under the new resolver.
+        if self.check_dns() == "changed":
+            out["tried"] = []
+        # Every round a minute apart at first, then backing off to half an
+        # hour: a long outage should cost a few probes an hour, not a few a
+        # minute for as long as it lasts.
+        backoff = 60 * 2 ** max(0, out["rounds"] - OUTAGE_ROUNDS_BEFORE_REALITY - 1)
+        out["next"] = time.time() + min(backoff, 1800) * random.uniform(0.7, 1.3)
+
+        for tag in list(self.state["standbys"]):
+            if self.probe(tag):
+                return self.recovered(tag, "failover")
+            self.state["standbys"].remove(tag)
+            out["tried"].append(tag)
+
+        tried_fams = {self.family(t) for t in out["tried"]}
+        for _ in range(OUTAGE_BATCH):
+            pool = [t for t in self.reserve() if t not in out["tried"]]
+            # One node per family before a second from any of them.
+            fresh = [t for t in pool if self.family(t) not in tried_fams] or pool
+            tag = self.weighted_pick(fresh)
+            if not tag:
+                break
+            out["tried"].append(tag)
+            tried_fams.add(self.family(tag))
+            if self.probe(tag):
+                return self.recovered(tag, "failover")
+
+        if out["rounds"] >= OUTAGE_ROUNDS_BEFORE_REALITY:
+            for tag in [t for t in self.nodes if self.is_reality(t)]:
+                if tag not in out["tried"] and self.probe(tag):
+                    out["tried"].append(tag)
+                    return self.recovered(tag, "last resort: Reality")
+
+        # Then a fresh list - once when the outage is established, and every
+        # several hours while it lasts, since the provider may be replacing
+        # exactly the nodes that went dark.
+        if out["rounds"] > OUTAGE_ROUNDS_BEFORE_REALITY and self.due("outage-subscribe",
+                                                                     (6 * 3600, 8 * 3600)):
+            self.event("down", "no node answers - fetching a fresh node list",
+                       alert=True)
+            self.subscribe()
+            # A new list is a new chance for every node.
+            out["tried"] = []
+
+    def recovered(self, tag, why):
+        self.switch(tag, why)
+        self.state["outage"] = None
+        self.state["fill_fails"] = 0
+        for key in ("outage-subscribe", "outage-ping", "fill"):
+            self.state["due"].pop(key, None)
+
+    def maybe_upgrade(self):
+        """Switch for latency only when a standby beat the active node clearly
+        in each of its last two measurements."""
+        act = self.state["active"]
+        act_score = self.score(act)
+        for tag in self.state["standbys"]:
+            d = self.stat(tag)["delays"][-2:]
+            if len(d) < 2:
+                continue
+            geo = self.geo_ms(tag)
+            if all(x + geo < act_score * UPGRADE_RATIO and x + geo < act_score - UPGRADE_MS
+                   for x in d):
+                self.state["standbys"] = [t for t in self.state["standbys"] if t != tag] + [act]
+                self.switch(tag, "latency")
+                return
+
+    def explore(self):
+        """One node nobody has measured, so the pool keeps up with what the
+        provider adds and what got fixed. Replaces a standby only if better."""
+        pool = [t for t in self.reserve() if not self.stat(t)["delays"]] or self.reserve()
+        tag = self.weighted_pick(pool)
+        if not tag or not self.probe(tag):
+            return
+        worst = max(self.state["standbys"], key=self.score, default=None)
+        fams = {self.family(t) for t in [self.state["active"], *self.state["standbys"]] if t != worst}
+        if worst and self.score(tag) < self.score(worst) and self.family(tag) not in fams:
+            self.state["standbys"] = [t for t in self.state["standbys"] if t != worst] + [tag]
+            self.event("standby", "%s replaces %s" % (tag, worst))
+
+    def subscribe(self):
+        try:
+            p = subprocess.run([os.path.join(HERE, "vpnchain"), "subscribe"],
+                               capture_output=True, text=True, timeout=600)
+            self.event("subscribe", "exit %d: %s" % (
+                p.returncode, (p.stdout.strip().splitlines() or ["?"])[-1][-120:]))
+        except Exception as e:
+            self.event("subscribe", "failed to run: %s" % e)
+
+    # --- loop --------------------------------------------------------------
+
+    def tick(self):
+        self.refresh_inputs()
+        if not self.nodes:
+            return
+        try:
+            now = self.api.selected()
+        except Exception:
+            return              # sing-box down or restarting: nothing to steer
+        if not self.online():
+            return
+
+        # Adopt whatever the selector holds - after a restart that is the
+        # cached choice, and a manual choice should be respected too.
+        if now != self.state["active"]:
+            if self.state["active"] is None and self.is_reality(now):
+                now = None
+            self.state["active"] = now
+            self.state["standbys"] = [t for t in self.state["standbys"] if t != now]
+        if self.state["active"] is None:
+            tag = self.weighted_pick(self.reserve())
+            if tag and self.probe(tag):
+                self.switch(tag, "start")
+            return
+
+        if self.state["outage"]:
+            self.failover()
+        elif self.due("active", ACTIVE_EVERY) and not self.check_active():
+            self.failover()
+        else:
+            # Off Reality as soon as anything ordinary works again.
+            if self.is_reality(self.state["active"]) and self.state["standbys"]:
+                if self.probe(self.state["standbys"][0]):
+                    return self.switch(self.state["standbys"][0], "leaving Reality")
+            self.fill_standbys()
+            for tag in list(self.state["standbys"]):
+                if self.due("standby:" + tag, STANDBY_EVERY) and not self.probe(tag):
+                    self.state["standbys"].remove(tag)
+                    self.event("standby", "%s dropped" % tag)
+            self.maybe_upgrade()
+            if self.due("explore", EXPLORE_EVERY):
+                self.explore()
+            if (self.dns_current() != self.dns_choices()[0]
+                    and self.due("dns-prefer", (1800, 3600))):
+                self.prefer_dns()
+
+        if self.due("subscribe", SUBSCRIBE_EVERY):
+            self.subscribe()
+
+    def run(self):
+        log("vpnchain-pilot started")
+        while True:
+            try:
+                self.tick()
+            except Exception as e:
+                log("tick failed: %r" % e)
+            self.save_state()
+            time.sleep(random.uniform(*TICK))
+
+
+if __name__ == "__main__":
+    Pilot().run()

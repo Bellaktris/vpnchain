@@ -470,6 +470,74 @@ def browser_policy():
     }
 
 
+def native_upstream(host):
+    """With a subscription there is no separate core: the upstream is a node
+    sing-box dials itself, chosen by the pilot. Reported from the pilot's
+    state file rather than the Clash API, which would need its secret here -
+    and this server is the one thing a web page can reach.
+
+    For the same reason nothing from the node list goes out but names,
+    families and regions: the list also holds every node's credentials."""
+    conf_dir = os.path.dirname(CONFIG)
+    state = {}
+    try:
+        with open(os.path.join(conf_dir, "pilot.json")) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        pass
+    nodes, listing = {}, None
+    try:
+        with open(env("NODES_FILE", os.path.join(conf_dir, "nodes.json"))) as f:
+            doc = json.load(f)
+        nodes = {n["tag"]: n for n in doc.get("nodes", [])}
+        listing = {"count": len(nodes),
+                   "families": len({n.get("family") for n in nodes.values()}),
+                   "fetchedAt": doc.get("fetched_at"), "via": doc.get("via")}
+    except (OSError, ValueError, KeyError):
+        pass
+
+    stats = state.get("stats") or {}
+
+    def describe(tag):
+        if not tag:
+            return None
+        n, st = nodes.get(tag, {}), stats.get(tag, {})
+        delays = sorted(st.get("delays") or [])
+        return {"tag": tag, "family": n.get("family"), "region": n.get("region"),
+                "reality": n.get("security") == "reality",
+                "delay": delays[len(delays) // 2] if delays else None,
+                "lastOk": st.get("last_ok") or None}
+
+    # Which resolver sing-box looks node names up with: the pilot's choice,
+    # or the first of NODE_DNS when it has not had to choose.
+    dns_choices = env("NODE_DNS", "1.1.1.1 8.8.8.8 9.9.9.9").split() + ["local"]
+    try:
+        with open(os.path.join(conf_dir, "node-dns")) as f:
+            dns = f.read().strip()
+    except OSError:
+        dns = ""
+    dns = dns if dns in dns_choices else dns_choices[0]
+
+    now = time.time()
+    outage = state.get("outage")
+    port = int(env("SHARED_PORT", "20170"))
+    return dict(process_info("sing-box run"), native=True, port=port,
+                listening=port_open(host, port),
+                pilot=process_info("vpnchain-pilot")["running"],
+                node=state.get("active"),
+                standbys=state.get("standbys", []),
+                active=describe(state.get("active")),
+                standbyNodes=[describe(t) for t in state.get("standbys", [])],
+                suspect=[{"family": fam, "until": until}
+                         for fam, until in (state.get("suspect") or {}).items()
+                         if until > now],
+                outage={"since": outage.get("since"), "rounds": outage.get("rounds")}
+                       if outage else None,
+                events=(state.get("events") or [])[-10:],
+                list=listing,
+                dns={"current": dns, "preferred": dns_choices[0]})
+
+
 def collect():
     refresh_env()
     host = env("PROXY_HOST", "127.0.0.1")
@@ -492,7 +560,8 @@ def collect():
         "mode": singbox_mode(),
         # No default: naming a particular upstream here would disclose the
         # stack in a public repo, and the env file always supplies it.
-        "upstream": dict(process_info(env("UPSTREAM_PROCESS", "")) if env("UPSTREAM_PROCESS")
+        "upstream": native_upstream(host) if env("SUBSCRIPTION_URL") else
+                    dict(process_info(env("UPSTREAM_PROCESS", "")) if env("UPSTREAM_PROCESS")
                          else {"running": None},
                          port=int(up_port) if up_port else None,
                          listening=port_open(up_host, up_port) if up_port else False),

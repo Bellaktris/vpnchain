@@ -20,6 +20,10 @@
 # routing Tor through the upstream was tried and does not survive - see the
 # record in the torrc - so it dials out directly, which its own ISP can see.
 #
+# BitTorrent is refused on the pinned inbound: the pinned address is the one
+# that identifies you, so torrents belong on the upstream exits only. A client
+# pointed at the wrong port is turned away rather than trusted to be right.
+#
 # Everything site-specific lives in $XDG_CONFIG_HOME/vpnchain/env, which is
 # deliberately outside this repo. See the template printed by this script when
 # that file is missing.
@@ -323,14 +327,31 @@ Create it with your site-local values:
 
     PROXY_HOST=127.0.0.1
     PROXY_PORT=1080
-    UPSTREAM_HOST=127.0.0.1
-    UPSTREAM_PORT=<port of the upstream SOCKS proxy>
-    UPSTREAM_PROCESS=<process name of the upstream proxy core>
     EXPECTED_EXIT_IP=<the address the chain should present>
     SINGBOX_AGENT=<launchd label (macOS) or systemd user unit name (Linux)
              of the sing-box agent; written for you if it does not exist>
 
+and either the provider's subscription, which sing-box then dials itself:
+
+    SUBSCRIPTION_URL='<v2ray-style subscription link; holds a token>'
+
+or, without one, an upstream SOCKS proxy run by something else:
+
+    UPSTREAM_HOST=127.0.0.1
+    UPSTREAM_PORT=<port of the upstream SOCKS proxy>
+    UPSTREAM_PROCESS=<process name of the upstream proxy core>
+
 Optional:
+
+    SHARED_PORT=<with a subscription: SOCKS/HTTP port onto the provider's
+             nodes for other programs (torrent client, i2pd), default 20170>
+    PILOT_AGENT=<launchd label or unit name of vpnchain-pilot, which picks
+             the node; unset leaves the selection to you>
+    EXIT_REGION=<city of the WireGuard peer, e.g. Frankfurt; the pilot prefers
+             nodes near it>
+    NODE_DNS=<DoH servers, by IP, that resolve node names, in order of
+             preference; default "1.1.1.1 8.8.8.8 9.9.9.9". The system
+             resolver is the last resort after them>
 
     SPOOF_TZ=<tz database zone the browser should report, e.g. America/Denver>
              match it to the exit address's geolocation; applied only by
@@ -344,9 +365,10 @@ Optional:
              pinned here, since a written-down one goes stale; "off" skips
              the measurement and the check with it.
     TOR_PORT=<Tor's SOCKS port, usually 9050. Set it and .onion names are
-             routed there instead of resolving. Point Tor itself at the
-             upstream with Socks5Proxy in torrc, or every circuit it builds
-             starts from your own address>
+             routed there instead of resolving. Tor itself dials out
+             directly, so your ISP can see that you use it; Socks5Proxy
+             through the upstream does not survive, and a bridge (obfs4,
+             snowflake) is the route if that matters - see the header>
     I2P_PORT=<i2pd's SOCKS port, usually 4447, for .i2p names. Note that an
              I2P router carries other people's traffic by default; see
              notransit and share in i2pd.conf>
@@ -375,8 +397,16 @@ fi
 # shellcheck source=/dev/null
 . "$CONFIG"
 
-for var in PROXY_HOST PROXY_PORT UPSTREAM_HOST UPSTREAM_PORT UPSTREAM_PROCESS \
-           EXPECTED_EXIT_IP SINGBOX_AGENT; do
+# Native mode: sing-box speaks to the provider's nodes itself, from a
+# subscription, instead of detouring through a separate proxy core on
+# UPSTREAM_PORT. Setting SUBSCRIPTION_URL is what selects it, so going back is
+# a matter of commenting one line out and regenerating.
+SUBSCRIPTION_URL="${SUBSCRIPTION_URL:-}"
+native() { [ -n "$SUBSCRIPTION_URL" ]; }
+
+required=(PROXY_HOST PROXY_PORT EXPECTED_EXIT_IP SINGBOX_AGENT)
+native || required+=(UPSTREAM_HOST UPSTREAM_PORT UPSTREAM_PROCESS)
+for var in "${required[@]}"; do
     if [ -z "${!var:-}" ]; then
         echo "vpnchain: $var is not set in $CONFIG" >&2
         exit 1
@@ -1082,6 +1112,43 @@ SINGBOX_CONFIG="${SINGBOX_CONFIG:-$HOME/.config/sing-box/config.json}"
 # env file if yours differs.
 UPSTREAM_TAG="${UPSTREAM_TAG:-upstream}"
 
+# Native mode. The upstream becomes a selector over every node in the
+# subscription, and the tag is fixed because nothing outside this script
+# names it.
+#
+# Every node is an outbound, but sing-box dials none of them until the
+# selector points there - an outbound costs nothing on the wire until used.
+# So the whole list can be loaded while only one or two names are ever seen,
+# and switching nodes needs no restart: the pilot moves the selector through
+# the Clash API, on loopback and behind a secret.
+NODES_FILE="${NODES_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/nodes.json}"
+SHARED_PORT="${SHARED_PORT:-20170}"
+# Resolvers for node names, by address so that none needs a lookup of its
+# own: DoH to each in turn, then the system's resolver as the last resort.
+# Only one is in use at a time - sing-box has no failover between DNS
+# servers - and NODE_DNS_STATE records which; the pilot moves it when the
+# one in use stops answering, and back when a better one answers again.
+NODE_DNS="${NODE_DNS:-1.1.1.1 8.8.8.8 9.9.9.9}"
+NODE_DNS_STATE="${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/node-dns"
+CLASH_PORT="${CLASH_PORT:-9090}"
+CLASH_SECRET_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/clash-secret"
+PILOT_AGENT="${PILOT_AGENT:-}"
+PILOT_PLIST=$(agent_file "$PILOT_AGENT")
+PILOT_BIN="$(cd "$(dirname "$0")" && pwd)/vpnchain-pilot"
+native && UPSTREAM_TAG=shared
+
+# Generated once and kept: the pilot reads it from the same file, and
+# regenerating the config must not change it under a running pilot.
+clash_secret() {
+    if [ ! -s "$CLASH_SECRET_FILE" ]; then
+        mkdir -p "$(dirname "$CLASH_SECRET_FILE")"
+        ( umask 077
+          python3 -c 'import secrets; print(secrets.token_hex(24))' \
+              > "$CLASH_SECRET_FILE" ) || return 1
+    fi
+    cat "$CLASH_SECRET_FILE"
+}
+
 # Tracker rejection, done in the chain rather than the browser. Space-separated
 # AdGuard-format DNS filter URLs; empty disables the feature entirely.
 BLOCKLIST_URL="${BLOCKLIST_URL:-}"
@@ -1127,6 +1194,13 @@ cmd_start() {
     # Bootstrap only. Writing a config that does not exist cannot discard
     # anything, so it is safe to do implicitly; regenerating one that does
     # exist can, which is why that stays behind an explicit verb.
+    #
+    # Native mode needs the node list before any config can exist. With no
+    # chain yet, the fetch goes by Tor or directly.
+    if native && [ ! -s "$NODES_FILE" ]; then
+        warn "no node list yet - fetching the subscription"
+        cmd_subscribe
+    fi
     if [ ! -f "$SINGBOX_CONFIG" ]; then
         if have_wg_creds; then
             warn "no config at $SINGBOX_CONFIG - generating one"
@@ -1141,8 +1215,11 @@ cmd_start() {
     if agent_running; then
         ok "sing-box already running"
         start_statusd
+        start_pilot
         return
     fi
+
+    refuse_if_port_blocked
 
     # Down right now, so this is the safe moment.
     trim_agent_logs
@@ -1156,6 +1233,39 @@ cmd_start() {
         bad "sing-box failed to start - check its stderr log"
     fi
     start_statusd
+    start_pilot
+}
+
+pilot_running() { pgrep -f 'vpnchain-pilot' >/dev/null 2>&1; }
+
+# The pilot steers the selector, so it only means anything in native mode and
+# only while sing-box runs - started and stopped with it, like the status
+# server. Unset PILOT_AGENT leaves the selector wherever it was put.
+start_pilot() {
+    native && [ -n "$PILOT_AGENT" ] || return 0
+    if [ ! -x "$PILOT_BIN" ]; then
+        warn "pilot not found at $PILOT_BIN - skipping"
+        return 0
+    fi
+    write_agent "$PILOT_AGENT" "$PILOT_PLIST" \
+        "$HOME/.config/vpnchain/pilot.log" \
+        "$HOME/.config/vpnchain/pilot.err.log" \
+        /usr/bin/env python3 "$PILOT_BIN"
+    if pilot_running; then
+        ok "pilot already running"
+    else
+        agent_start "$PILOT_AGENT" "$PILOT_PLIST"
+        sleep 1
+        pilot_running && ok "pilot steering the node selection" \
+                      || bad "pilot did not start - see pilot.err.log"
+    fi
+}
+
+stop_pilot() {
+    [ -n "$PILOT_AGENT" ] || return 0
+    agent_stop "$PILOT_AGENT" "$PILOT_PLIST"
+    wait_gone 'vpnchain-pilot'
+    ok "pilot stopped"
 }
 
 statusd_running() { pgrep -f 'vpnchain-statusd' >/dev/null 2>&1; }
@@ -1203,13 +1313,31 @@ start_statusd() {
 stop_statusd() {
     [ -z "$STATUSD_AGENT" ] && return 0
     agent_stop "$STATUSD_AGENT" "$STATUSD_PLIST"
+    wait_gone 'vpnchain-statusd'
     ok "status server stopped"
 }
 
+# launchctl and systemctl return once the stop is requested, not once the
+# process is gone. A start straight after - which is what restart is - would
+# then find the old process still exiting, call it "already running", load
+# nothing, and leave the browser with no tunnel once it finished exiting.
+wait_gone() {
+    local i=0
+    while [ "$i" -lt 60 ] && pgrep -f "$1" >/dev/null 2>&1; do
+        sleep 0.25; i=$((i + 1))
+    done
+    ! pgrep -f "$1" >/dev/null 2>&1
+}
+
 cmd_stop() {
+    stop_pilot
     stop_statusd
     agent_stop "$SINGBOX_AGENT" "$PLIST"
-    ok "sing-box stopped"
+    if wait_gone 'sing-box run'; then
+        ok "sing-box stopped"
+    else
+        bad "sing-box is still running after 15s"
+    fi
 }
 
 # "blocked" if either policy key pins non-proxied UDP off, else "allowed".
@@ -1487,6 +1615,292 @@ cmd_blocklist() {
     fi
 }
 
+# A desktop notification, for the few events worth interrupting for. Fixed
+# strings only - nothing from the network ever reaches the osascript line.
+notify() {
+    if [ "$OS" = mac ]; then
+        osascript -e "display notification \"$1\" with title \"vpnchain\"" \
+            >/dev/null 2>&1
+    else
+        notify-send vpnchain "$1" >/dev/null 2>&1
+    fi
+}
+
+# The DNS tunnel route for 'subscribe'. Servers and resolvers come from a
+# site-local list, since both are the provider's and change with it:
+#
+#   server <region> <tunnel-domain> <pubkey-hex> socks
+#   resolver doh <url> <note>
+#
+# Only servers that end in a SOCKS proxy are used, and only DoH resolvers:
+# over plain UDP the tunnel's long random-looking query names are there for
+# any DPI box to read, while over DoH they are inside the resolver's TLS.
+#
+# Resolvers are tried by the tier in their note (T<n>, as the provider grades
+# them): large global ones first, whose traffic a tunnel can hide in and
+# which do not throttle it; small independent ones next, which a censor may
+# not have got to; regional ones (China, Russia) last, since they are what
+# answers inside those countries when nothing foreign does, but their
+# operators read every query and answer to the censor.
+DNSTT_LIST="${DNSTT_LIST:-${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/dnstt.list}"
+DNSTT_TIERS="${DNSTT_TIERS:-T6,T7 T6,T7 T4,T5 T2,T3}"   # one attempt per entry
+
+# launchd's PATH has neither Homebrew nor ~/.local/bin, and the pilot runs
+# subscribe from there.
+dnstt_bin() {
+    command -v dnstt-client 2>/dev/null ||
+        { [ -x "$HOME/.local/bin/dnstt-client" ] && echo "$HOME/.local/bin/dnstt-client"; }
+}
+
+dnstt_available() {
+    grep -q '^server .* socks' "$DNSTT_LIST" 2>/dev/null && [ -n "$(dnstt_bin)" ]
+}
+
+# dnstt_fetch OUT - one attempt per DNSTT_TIERS entry, each with a different
+# server key where the list allows (two domains with one key are one server
+# under two names) and a resolver drawn at random from that entry's tiers, so
+# no two fetches look alike to a resolver.
+dnstt_fetch() {
+    local out="$1" bin region domain key doh port pid i
+    bin=$(dnstt_bin)
+    while read -r region domain key doh; do
+        port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+        "$bin" -doh "$doh" -pubkey "$key" "$domain" "127.0.0.1:$port" >/dev/null 2>&1 &
+        pid=$!
+        i=0
+        while [ "$i" -lt 20 ] && ! port_listening 127.0.0.1 "$port"; do
+            sleep 0.25; i=$((i + 1))
+        done
+        ok "dnstt: trying the $region server (DoH, slow - up to two minutes)"
+        if curl -fsS -m 120 --socks5-hostname "127.0.0.1:$port" \
+                -o "$out" "$SUBSCRIPTION_URL" 2>/dev/null && [ -s "$out" ]; then
+            kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+            return 0
+        fi
+        kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    done < <(python3 - "$DNSTT_LIST" $DNSTT_TIERS <<'PY'
+import random, re, sys
+servers, resolvers = [], []
+for line in open(sys.argv[1]):
+    f = line.split()
+    if len(f) >= 5 and f[0] == "server" and f[4] == "socks":
+        servers.append(f[1:4])
+    elif len(f) >= 3 and f[0] == "resolver" and f[1] == "doh":
+        tier = re.search(r"/(T\d+)\b", f[3] if len(f) > 3 else "")
+        resolvers.append((f[2], tier.group(1) if tier else "T?"))
+if not servers or not resolvers:
+    sys.exit()
+random.shuffle(servers)
+# Distinct keys first: a second name for a server that just failed is the
+# same server failing again.
+seen, first, rest = set(), [], []
+for s in servers:
+    (rest if s[2] in seen else first).append(s)
+    seen.add(s[2])
+order = first + rest
+for i, tiers in enumerate(sys.argv[2:]):
+    pool = [url for url, t in resolvers if t in tiers.split(",")]
+    if not pool:
+        continue
+    region, domain, key = order[i % len(order)]
+    print(region, domain, key, random.choice(pool))
+PY
+)
+    return 1
+}
+
+# Fetch the provider's node list, parse it, and install it if it is sound.
+#
+# Routes are tried best first, and each is a different trade:
+#
+#   chain   the shared port, i.e. through a node that already works. The
+#           ordinary case - the fetch is one more TLS connection to a node
+#           the network already sees. Never the pinned exit: the token
+#           would then be tied to the address that identifies you.
+#   dnstt   a DNS tunnel to the provider, carried over DoH to a large public
+#           resolver. On the wire it is HTTPS to that resolver and nothing
+#           else - the tunnel's name is inside it - so it shows the network
+#           less than Tor does. Slow, which a 30 KB list does not notice.
+#   tor     for when no node works, which is also when a fresh list matters
+#           most. Hides the provider's name from the network at the cost of
+#           Tor's own visibility, which it has anyway.
+#   direct  the last resort: the provider's name in plain sight. Taken
+#           automatically, because a chain that cannot repair itself without
+#           someone noticing is worse than one that shows the network once
+#           what it would see at every update anyway - and announced, so it
+#           is never silent.
+#
+# The list is installed only if it parses to at least one usable node, so a
+# provider outage or an error page cannot replace a good list with nothing.
+# If the set of nodes changed, the config is regenerated and sing-box
+# reloaded, since the selector's members are fixed at load time.
+cmd_subscribe() {
+    if ! native; then
+        bad "SUBSCRIPTION_URL is not set in $CONFIG"
+        exit 1
+    fi
+    local tmp raw route via= args
+    tmp=$(temp_dir vpnchain-sub) || exit 1
+    raw="$tmp/raw"
+    for route in chain dnstt tor direct; do
+        case "$route" in
+            (chain)  port_listening 127.0.0.1 "$SHARED_PORT" || continue
+                     args=(--socks5-hostname "127.0.0.1:$SHARED_PORT") ;;
+            (dnstt)  dnstt_available || continue
+                     if dnstt_fetch "$raw"; then via=dnstt; break; fi
+                     warn "fetch via dnstt failed"
+                     continue ;;
+            (tor)    [ -n "$TOR_PORT" ] && port_listening 127.0.0.1 "$TOR_PORT" || continue
+                     args=(--socks5-hostname "127.0.0.1:$TOR_PORT") ;;
+            (direct) warn "no proxied route worked - fetching directly"
+                     args=(--noproxy '*') ;;
+        esac
+        if curl -fsS -m 90 "${args[@]}" -o "$raw" "$SUBSCRIPTION_URL" 2>/dev/null \
+                && [ -s "$raw" ]; then
+            via=$route
+            break
+        fi
+        warn "fetch via $route failed"
+    done
+    if [ -z "$via" ]; then
+        bad "could not fetch the subscription by any route"
+        bad "the installed node list is untouched"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    ok "fetched via $via"
+    [ "$via" = direct ] && notify "Node list fetched directly - no proxied route worked"
+
+    local summary rc
+    summary=$(python3 - "$raw" "$tmp/nodes.json" "$NODES_FILE" "$via" <<'PY'
+import base64, json, os, re, sys, time, urllib.parse as up
+raw_path, out_path, old_path, via = sys.argv[1:5]
+raw = open(raw_path, "rb").read().strip()
+try:
+    text = base64.b64decode(raw + b"=" * (-len(raw) % 4)).decode()
+except Exception:
+    text = raw.decode("utf-8", "replace")
+
+def family(host):
+    # What one blocking rule takes out together: the registrable domain, or
+    # for Workers the account's subdomain, under which every worker sits.
+    labels = host.lower().split(".")
+    return ".".join(labels[-3:] if host.endswith(".workers.dev") else labels[-2:])
+
+def region(name):
+    # <PREFIX>-<Region>-CDN<n>-Vless, <PREFIX>-<Region>-Reality, the prefix
+    # being the provider's short name. Only a hint for the pilot's geography,
+    # so an unrecognised name just goes unplaced.
+    r = re.sub(r"^[A-Z]{2,4}-", "", name)
+    return re.sub(r"-(CDN\d*-)?(Vless|Trojan|Reality)$", "", r, flags=re.I)
+
+nodes, skipped, seen = [], 0, set()
+for line in text.splitlines():
+    u = up.urlsplit(line.strip())
+    if u.scheme not in ("vless", "trojan"):
+        skipped += line.strip() != ""
+        continue
+    q = {k: v[0] for k, v in up.parse_qs(u.query).items()}
+    name = up.unquote(u.fragment) or u.hostname
+    security, transport = q.get("security", "tls"), q.get("type", "tcp")
+    if (not u.username or not u.hostname or security not in ("tls", "reality")
+            or transport not in ("ws", "tcp")
+            or (security == "reality" and not q.get("pbk"))):
+        skipped += 1
+        continue
+    tag = name
+    while tag in seen:
+        tag += "'"
+    seen.add(tag)
+    n = {"tag": tag, "protocol": u.scheme, "server": u.hostname,
+         "port": u.port or 443, "secret": up.unquote(u.username),
+         "security": security, "transport": transport,
+         "sni": q.get("sni") or u.hostname, "host": q.get("host", ""),
+         "path": q.get("path", "/"), "family": family(u.hostname),
+         "region": region(name)}
+    if q.get("alpn"):
+        n["alpn"] = q["alpn"].split(",")
+    for k in ("flow", "fp", "pbk", "sid"):
+        if q.get(k):
+            n[k] = q[k]
+    nodes.append(n)
+
+if not any(n["security"] != "reality" for n in nodes):
+    print("no usable nodes (%d lines skipped)" % skipped)
+    sys.exit(2)
+
+try:
+    old = json.load(open(old_path))["nodes"]
+except Exception:
+    old = None
+fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump({"fetched_at": int(time.time()), "via": via, "nodes": nodes}, f, indent=1)
+fams = len({n["family"] for n in nodes})
+print("%d nodes in %d families%s; %s" % (
+    len(nodes), fams, ", %d skipped" % skipped if skipped else "",
+    "unchanged" if old == nodes else "changed"))
+PY
+)
+    rc=$?
+    if [ "$rc" != 0 ]; then
+        bad "subscription did not parse: $summary"
+        bad "the installed node list is untouched"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    ok "$summary"
+
+    mkdir -p "$(dirname "$NODES_FILE")"
+    # Installed even when unchanged, so fetched_at records the last success.
+    mv "$tmp/nodes.json" "$NODES_FILE" || { rm -rf "$tmp"; exit 1; }
+    rm -rf "$tmp"
+    case "$summary" in
+        (*unchanged) return 0 ;;
+    esac
+    # Only a config that is already native is refreshed here. Moving from an
+    # upstream proxy to native mode is a cutover - the other core has to let
+    # go of the shared port first - so it stays an explicit 'vpnchain config'.
+    if live_config_native; then
+        cmd_config
+        if agent_running; then
+            agent_restart "$SINGBOX_AGENT" "$PLIST"
+            ok "sing-box reloaded with the new node list"
+        fi
+    elif [ -f "$SINGBOX_CONFIG" ]; then
+        warn "the live config still uses an upstream proxy; switch with:"
+        echo "           vpnchain config && vpnchain restart"
+        echo "         once nothing else holds port $SHARED_PORT"
+    fi
+}
+
+live_config_native() {
+    grep -q '"shared-in"' "$SINGBOX_CONFIG" 2>/dev/null
+}
+
+# In native mode sing-box takes the shared port, which is the port a separate
+# proxy core used to hold. If something still holds it, sing-box would exit
+# at once and launchd would restart it forever, with the browser on no
+# tunnel - so refuse up front, and say why.
+shared_port_blocked() {
+    native && live_config_native || return 1
+    port_listening 127.0.0.1 "$SHARED_PORT" || return 1
+    # Held - by sing-box itself, which is fine, or by anything else.
+    local pid
+    for pid in $(pgrep -f 'sing-box run'); do
+        lsof -nP -a -p "$pid" -iTCP:"$SHARED_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
+            && return 1
+    done
+    return 0
+}
+
+refuse_if_port_blocked() {
+    shared_port_blocked || return 0
+    bad "port $SHARED_PORT is held by another program - stop it first"
+    bad "(the proxy core this config replaces, if it is still running)"
+    exit 1
+}
+
 # Any failure after the backup is taken must put the old config back, or a
 # half-written one is left in place for the next start to trip over.
 restore_config_backup() {
@@ -1544,7 +1958,19 @@ cmd_config() {
 # cmd_config so status can render to a temp file and compare, which is how
 # drift between the env file and the live config gets noticed.
 generate_config() {
-    local out="$1" mode="$2"
+    local out="$1" mode="$2" native_nodes=
+    if native; then
+        if [ ! -s "$NODES_FILE" ]; then
+            bad "no node list at $NODES_FILE - fetch it with: vpnchain subscribe"
+            return 1
+        fi
+        native_nodes="$NODES_FILE"
+        clash_secret >/dev/null || return 1
+    fi
+    NODES="$native_nodes" SHARED_PORT="$SHARED_PORT" NODE_DNS="$NODE_DNS" \
+    NODE_DNS_CHOICE="$(cat "$NODE_DNS_STATE" 2>/dev/null)" \
+    CLASH_PORT="$CLASH_PORT" CLASH_SECRET="$(native && clash_secret)" \
+    CACHE_PATH="$(dirname "$SINGBOX_CONFIG")/cache.db" \
     MODE="$mode" P_HOST="$PROXY_HOST" P_PORT="$PROXY_PORT" \
     U_PORT="$INCOGNITO_PORT" UP_HOST="$UPSTREAM_HOST" \
     UP_PORT="$UPSTREAM_PORT" UP_TAG="$UPSTREAM_TAG" \
@@ -1558,6 +1984,42 @@ generate_config() {
     python3 - <<'PY' || { restore_config_backup; bad "generation failed"; exit 1; }
 import json, os
 e = os.environ
+
+def node_outbound(n):
+    """One subscription node as a sing-box outbound.
+
+    The TLS fingerprint is chosen here rather than taken from the link: the
+    provider ships none for its CDN nodes, which leaves the Go library's own
+    ClientHello on the wire - a known tell. Reality links carry their own,
+    and for Reality it has to match what the server expects, so it is kept."""
+    o = {"type": n["protocol"], "tag": n["tag"],
+         "server": n["server"], "server_port": n["port"]}
+    if n["protocol"] == "vless":
+        o["uuid"] = n["secret"]
+        # XUDP is what carries the WireGuard UDP through the node; measured
+        # working through every node family, Workers included.
+        o["packet_encoding"] = "xudp"
+        if n.get("flow"):
+            o["flow"] = n["flow"]
+    else:
+        o["password"] = n["secret"]
+    tls = {"enabled": True, "server_name": n["sni"]}
+    if n["security"] == "reality":
+        tls["utls"] = {"enabled": True, "fingerprint": n.get("fp") or "chrome"}
+        tls["reality"] = {"enabled": True, "public_key": n["pbk"],
+                          "short_id": n.get("sid", "")}
+    else:
+        tls["alpn"] = n.get("alpn") or ["http/1.1"]
+        tls["utls"] = {"enabled": True, "fingerprint": "chrome"}
+    o["tls"] = tls
+    if n["transport"] == "ws":
+        o["transport"] = {"type": "ws", "path": n.get("path") or "/",
+                          "headers": {"Host": n.get("host") or n["sni"]}}
+    return o
+
+nodes = []
+if e.get("NODES"):
+    nodes = json.load(open(e["NODES"]))["nodes"]
 
 wg = {
     "type": "wireguard", "tag": "tunnel", "system": False,
@@ -1598,16 +2060,84 @@ cfg = {
          "listen": e["P_HOST"], "listen_port": int(e["U_PORT"])},
     ],
     "endpoints": [wg],
-    "outbounds": [
+    # Replaced below by the nodes and their selector in native mode, where
+    # there is no upstream port to point at.
+    "outbounds": [] if nodes else [
         {"type": "socks", "tag": e["UP_TAG"], "server": e["UP_HOST"],
          "server_port": int(e["UP_PORT"]), "version": "5"},
     ],
+    # BitTorrent never leaves by the pinned address. That address is the one
+    # that identifies you, and torrents belong on the shared upstream exits -
+    # which is where a client pointed at the upstream's own port already
+    # sends them. These two rules make that a guarantee rather than a habit:
+    # a client mistakenly pointed at the pinned inbound is refused instead of
+    # quietly torrenting on the pinned address.
+    #
+    # Sniffing waits for the client's first bytes, so server-first protocols
+    # pay its timeout once per connection; browsers speak first and do not.
     "route": {
-        "rules": [{"inbound": ["upstream-in"], "action": "route",
-                   "outbound": e["UP_TAG"]}],
+        "rules": [
+            {"inbound": ["pinned-in"], "action": "sniff"},
+            {"inbound": ["pinned-in"], "protocol": ["bittorrent"],
+             "action": "reject"},
+            {"inbound": ["upstream-in"], "action": "route",
+             "outbound": e["UP_TAG"]},
+        ],
         "final": "tunnel",
     },
 }
+
+# Native mode: the SOCKS hop to a separate core is replaced by the nodes
+# themselves, behind one selector under the same tag, so everything that
+# detoured through the upstream - the WireGuard endpoint, the incognito
+# inbound, its DNS - now goes through whichever node the selector holds.
+if nodes:
+    tags = [n["tag"] for n in nodes]
+    # The default only matters before the pilot has chosen and the cache file
+    # has remembered it. Never the Reality node, which is kept unused until
+    # nothing else connects.
+    #
+    # A switch closes what the old node carried. Without that the WireGuard
+    # flow - one UDP association that its keepalive never lets end - would
+    # stay on a dead node forever. Connections INSIDE the tunnel survive,
+    # since WireGuard simply follows its peer onto the new path; only direct
+    # users of the shared and incognito ports see a reset, and switches are
+    # rare by design.
+    first = next(n["tag"] for n in nodes if n["security"] != "reality")
+    cfg["outbounds"] = [node_outbound(n) for n in nodes] + [
+        {"type": "selector", "tag": e["UP_TAG"], "outbounds": tags,
+         "default": first, "interrupt_exist_connections": True}]
+    # Node names are resolved over DoH to a server named by address, so the
+    # lookup needs no lookup of its own and the names never cross the wire as
+    # plain DNS. They still appear in each node's TLS server name - nothing
+    # here can hide that - but no longer in a resolver's log as well.
+    #
+    # Every candidate is defined, so the pilot's choice needs only this one
+    # line to change. "local" is the system resolver: plain DNS, and the last
+    # resort for a network that blocks every DoH server listed.
+    choices = e["NODE_DNS"].split() + ["local"]
+    for ip in e["NODE_DNS"].split():
+        cfg["dns"]["servers"].append(
+            {"type": "https", "tag": "node-dns-" + ip, "server": ip})
+    cfg["dns"]["servers"].append({"type": "local", "tag": "node-dns-local"})
+    chosen = e.get("NODE_DNS_CHOICE", "").strip()
+    cfg["route"]["default_domain_resolver"] = "node-dns-" + (
+        chosen if chosen in choices else choices[0])
+    # The port other programs used to give the separate core. Torrents are
+    # welcome here: this is the shared exit, not the pinned address.
+    cfg["inbounds"].append(
+        {"type": "mixed", "tag": "shared-in", "listen": e["P_HOST"],
+         "listen_port": int(e["SHARED_PORT"])})
+    cfg["route"]["rules"].append(
+        {"inbound": ["shared-in"], "action": "route", "outbound": e["UP_TAG"]})
+    cfg["experimental"] = {
+        # What the pilot steers through. Loopback only, and the secret is what
+        # keeps a web page - which can reach loopback - from steering it.
+        "clash_api": {"external_controller": "127.0.0.1:%s" % e["CLASH_PORT"],
+                      "secret": e["CLASH_SECRET"]},
+        # Remembers the selector's choice across restarts.
+        "cache_file": {"enabled": True, "path": e["CACHE_PATH"]},
+    }
 
 # Names the ordinary network cannot reach, handed to the daemon that can.
 #
@@ -2112,11 +2642,21 @@ case "${1:-status}" in
              # switch_mode, not maybe_switch_mode: this verb restarts the agent
              # itself, so reloading inside the switch would do it twice.
     restart) if [ -n "${2:-}" ]; then switch_mode "$2" || true; fi
+             # Checked before stopping anything, so a refused start cannot
+             # leave the browser with no tunnel at all.
+             refuse_if_port_blocked
              cmd_stop; cmd_start; echo; wait_for_chain ;;
     browser) shift; cmd_browser "$@" ;;
     i2p)     cmd_i2p "${2:-}" ;;
     config)  [ "${2:-}" = check ] && cmd_config_check || cmd_config ;;
     blocklist) cmd_blocklist ;;
+    subscribe) cmd_subscribe ;;
+             # Regenerate and restart sing-box alone, leaving the pilot and
+             # the status server running - which is what lets the pilot use
+             # it. WireGuard re-handshakes in a second or two.
+    reload)  refuse_if_port_blocked
+             cmd_config >/dev/null && agent_restart "$SINGBOX_AGENT" "$PLIST" &&
+                 ok "sing-box reloaded" ;;
     setup)   cmd_setup ;;
     *)
         echo "usage: vpnchain {start|restart} [chained|direct]"
@@ -2126,6 +2666,8 @@ case "${1:-status}" in
         echo "       vpnchain i2p [start|stop|status]"
         echo "       vpnchain config [check]"
         echo "       vpnchain blocklist"
+        echo "       vpnchain subscribe"
+        echo "       vpnchain reload"
         echo "       vpnchain setup"
         exit 1
         ;;
