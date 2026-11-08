@@ -234,6 +234,11 @@
 #            repo with the rest of the site-local files. Transit, bandwidth
 #            and which transport it dials over are set there, not here.
 #
+#            Refused in chained-reality mode, and stopped on switching to
+#            it: a router keeps connections to dozens of others, which over
+#            the shared port means dozens through the one Reality server -
+#            the same pattern that has torrents refused there.
+#
 #   config [check]
 #            write the sing-box config from the env file, which is the single
 #            source of truth for it. start does this automatically when no
@@ -1050,6 +1055,13 @@ i2p_routers() {
 cmd_i2p() {
     case "${1:-status}" in
         (start)
+            if [ "$(singbox_mode)" = chained-reality ]; then
+                bad "not in chained-reality mode: an I2P router keeps dozens of"
+                bad "connections open, all of which would go through the one"
+                bad "Reality server - the pattern that gets such servers found"
+                echo "           switch first with: vpnchain restart chained"
+                exit 1
+            fi
             [ -x "${I2PD_BIN:-}" ] || { bad "i2pd not found - $(install_hint i2pd i2pd)"; exit 1; }
             [ -r "$I2PD_CONF" ] || { bad "no config at $I2PD_CONF"; exit 1; }
             if i2p_running; then
@@ -1534,6 +1546,13 @@ PY
         ok "everything now goes through the Reality node, and only it: the"
         ok "tunnel, the incognito browser and the shared port"
         ok "BitTorrent is refused on the shared port while in this mode"
+        # i2pd dials out through the shared port, so a running router would
+        # move its dozens of connections onto the Reality server with the
+        # switch. Stopped here rather than left to be noticed.
+        if i2p_running; then
+            cmd_i2p stop
+            ok "i2pd stopped - it is refused in this mode"
+        fi
         warn "if it stops answering, nothing falls back on its own - switch"
         warn "with: vpnchain restart chained"
     fi
