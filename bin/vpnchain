@@ -1,5 +1,5 @@
 #!/bin/bash
-# vpnchain - toggle a chained proxy setup on macOS.
+# vpnchain - toggle a chained proxy setup on macOS or Linux.
 #
 #   browser, launched by 'vpnchain browser'
 #     -> proxy pinned to that launch alone: a command-line flag for the
@@ -262,6 +262,13 @@
 #            request failed, which is indistinguishable from a firewall or a
 #            dead ad server. Unattributable, not undetectable.
 #
+#   setup
+#            one-time preparation. On Linux, Chrome reads policies only from
+#            /etc/opt/chrome/policies/managed, so this creates vpnchain.json
+#            there with sudo and makes it yours; no other verb ever needs
+#            root. It also writes the sing-box user unit if there is none.
+#            On macOS there is nothing to do.
+#
 # There is no 'status' verb. The dashboard is the status view - it reports the
 # chain AND what the browser actually does, which no shell command can see. In
 # a terminal, curl the server directly:
@@ -320,7 +327,8 @@ Create it with your site-local values:
     UPSTREAM_PORT=<port of the upstream SOCKS proxy>
     UPSTREAM_PROCESS=<process name of the upstream proxy core>
     EXPECTED_EXIT_IP=<the address the chain should present>
-    SINGBOX_AGENT=<launchd label of your sing-box agent>
+    SINGBOX_AGENT=<launchd label (macOS) or systemd user unit name (Linux)
+             of the sing-box agent; written for you if it does not exist>
 
 Optional:
 
@@ -349,8 +357,14 @@ Optional:
     INCOGNITO_PROFILE=<throwaway profile dir for the incognito browser>
     INCOGNITO_APP=<bundle of the incognito browser, defaults to
              Mullvad Browser>
+    INCOGNITO_BIN=<Linux: its executable, defaults to mullvad-browser>
     BROWSER_APP=<bundle of the pinned browser, defaults to Google Chrome>
-    BROWSER_DOMAIN=<its preference domain, for the WebRTC policy>
+    BROWSER_BIN=<Linux: its executable, defaults to google-chrome>
+    BROWSER_PROC=<pgrep -f pattern for its main process>
+    BROWSER_DOMAIN=<macOS: its preference domain, for the policies>
+    BROWSER_POLICY_FILE=<Linux: the policy file, defaults to
+             /etc/opt/chrome/policies/managed/vpnchain.json; create it with
+             'vpnchain setup'>
     NOTIFY_ALLOW=<space-separated origins allowed to show notifications,
              e.g. "https://mail.example.com https://chat.example.com";
              everything else is blocked>
@@ -369,13 +383,193 @@ for var in PROXY_HOST PROXY_PORT UPSTREAM_HOST UPSTREAM_PORT UPSTREAM_PROCESS \
     fi
 done
 
-PLIST="$HOME/Library/LaunchAgents/$SINGBOX_AGENT.plist"
+# --- platform ----------------------------------------------------------------
+#
+# Everything that differs between macOS and Linux sits behind the functions in
+# this block, so the verbs below read the same on both:
+#
+#   agents    launchd agents in ~/Library/LaunchAgents, or systemd user units
+#             in ~/.config/systemd/user, both logging to plain files so the
+#             trimming and the status server's log reading work unchanged
+#   policies  the pinned browser's per-user preference domain (defaults), or
+#             on Linux one JSON file in Chrome's managed policy directory.
+#             That directory is root-owned and read only from there, so
+#             'vpnchain setup' creates the file once with sudo and hands it to
+#             you - after which every launch rewrites it without sudo, exactly
+#             as defaults does on macOS. It does apply to every user's Chrome
+#             on the machine, which on a one-person laptop is the same thing.
+#   browsers  .app bundles, or executables on PATH
+case "$(uname -s)" in
+    (Darwin) OS=mac ;;
+    (Linux)  OS=linux ;;
+    (*) echo "vpnchain: unsupported platform $(uname -s)" >&2; exit 1 ;;
+esac
+
+if [ "$OS" = mac ]; then
+    agent_file() { printf '%s\n' "$HOME/Library/LaunchAgents/$1.plist"; }
+else
+    agent_file() { printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$1.service"; }
+fi
+
+# agent_start LABEL FILE / agent_stop LABEL FILE / agent_restart LABEL FILE
+agent_start() {
+    if [ "$OS" = mac ]; then
+        launchctl bootstrap "gui/$(id -u)" "$2" 2>/dev/null \
+            || launchctl load -w "$2" 2>/dev/null
+    else
+        systemctl --user daemon-reload 2>/dev/null
+        systemctl --user start "$1" 2>/dev/null
+    fi
+}
+agent_stop() {
+    if [ "$OS" = mac ]; then
+        launchctl bootout "gui/$(id -u)/$1" 2>/dev/null \
+            || launchctl unload -w "$2" 2>/dev/null
+    else
+        systemctl --user stop "$1" 2>/dev/null
+    fi
+}
+agent_restart() {
+    if [ "$OS" = mac ]; then
+        launchctl kickstart -k "gui/$(id -u)/$1" 2>/dev/null
+    else
+        systemctl --user restart "$1" 2>/dev/null
+    fi
+}
+
+# The log files an agent writes, one per line. Read from the agent's own file
+# rather than guessed, so this follows the agents if their logs ever move.
+agent_logs() {
+    [ -f "$1" ] || return 0
+    if [ "$OS" = mac ]; then
+        local key
+        for key in StandardOutPath StandardErrorPath; do
+            /usr/libexec/PlistBuddy -c "Print :$key" "$1" 2>/dev/null
+        done
+    else
+        sed -n -e 's/^StandardOutput=append://p' \
+               -e 's/^StandardError=append://p' "$1"
+    fi
+}
+
+# write_agent LABEL FILE OUT_LOG ERR_LOG COMMAND...
+# Written only when missing: it carries absolute paths for this machine, and
+# writing a file that does not exist cannot lose anything - the same reasoning
+# as generating a missing config.
+write_agent() {
+    local label="$1" file="$2" out="$3" err="$4" a
+    shift 4
+    [ -f "$file" ] && return 0
+    mkdir -p "$(dirname "$file")" "$(dirname "$out")" "$(dirname "$err")"
+    if [ "$OS" = mac ]; then
+        {
+            cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$label</string>
+    <key>ProgramArguments</key>
+    <array>
+PLIST
+            for a in "$@"; do printf '        <string>%s</string>\n' "$a"; done
+            cat <<PLIST
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict><key>STATUS_PORT</key><string>$STATUS_PORT</string></dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>$out</string>
+    <key>StandardErrorPath</key><string>$err</string>
+    <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+PLIST
+        } > "$file"
+    else
+        # systemd splits ExecStart on spaces, so each argument is quoted.
+        local cmd=
+        for a in "$@"; do cmd="$cmd \"$a\""; done
+        cat > "$file" <<UNIT
+[Unit]
+Description=$label (vpnchain)
+
+[Service]
+ExecStart=${cmd# }
+Environment=STATUS_PORT=$STATUS_PORT
+Restart=always
+RestartSec=2
+StandardOutput=append:$out
+StandardError=append:$err
+
+[Install]
+WantedBy=default.target
+UNIT
+    fi
+    ok "wrote $file"
+}
+
+# BSD and GNU stat disagree on every flag; wc does not.
+file_size() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
+# GNU mktemp wants the X's that BSD's -t supplies itself.
+temp_file() { mktemp "${TMPDIR:-/tmp}/$1.XXXXXX"; }
+temp_dir()  { mktemp -d "${TMPDIR:-/tmp}/$1.XXXXXX"; }
+
+# Policies. pol_set KEY int|bool|string|array VALUE...; pol_del KEY;
+# pol_get KEY prints the value as defaults would (bools as 1/0).
+if [ "$OS" = mac ]; then
+    pol_set() {
+        local k="$1" t="$2"
+        shift 2
+        defaults write "$BROWSER_DOMAIN" "$k" "-$t" "$@"
+    }
+    pol_del() { defaults delete "$BROWSER_DOMAIN" "$1" 2>/dev/null; }
+    pol_get() { defaults read "$BROWSER_DOMAIN" "$1" 2>/dev/null; }
+    policy_ready() { return 0; }
+else
+    # Written in place rather than replaced: the directory is root's, so a
+    # temporary file beside it cannot be created - only this one is ours.
+    pol_json() {
+        python3 - "$BROWSER_POLICY_FILE" "$@" <<'PY'
+import json, sys
+path, op, key, *rest = sys.argv[1:]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (OSError, ValueError):
+    data = {}
+if op == "get":
+    v = data.get(key)
+    if v is None:
+        sys.exit(1)
+    print(int(v) if isinstance(v, bool) else v if not isinstance(v, list)
+          else "\n".join(map(str, v)))
+    sys.exit(0)
+if op == "del":
+    data.pop(key, None)
+else:
+    kind, vals = rest[0], rest[1:]
+    conv = {"int": int, "string": str,
+            "bool": lambda v: v.lower() in ("1", "true", "yes")}
+    data[key] = list(vals) if kind == "array" else conv[kind](vals[0])
+with open(path, "w") as f:
+    json.dump(data, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+    }
+    pol_set() { pol_json set "$@"; }
+    pol_del() { pol_json del "$1" 2>/dev/null; }
+    pol_get() { pol_json get "$1" 2>/dev/null; }
+    policy_ready() { [ -w "$BROWSER_POLICY_FILE" ]; }
+fi
+
+PLIST=$(agent_file "$SINGBOX_AGENT")
 
 # Optional status server, started and stopped with the chain. It serves the
 # dashboard together with the host-side facts a page cannot see for itself.
 # Leave STATUSD_AGENT unset in the env file to do without it.
 STATUSD_AGENT="${STATUSD_AGENT:-}"
-STATUSD_PLIST="$HOME/Library/LaunchAgents/$STATUSD_AGENT.plist"
+STATUSD_PLIST=$(agent_file "$STATUSD_AGENT")
 STATUS_PORT="${STATUS_PORT:-8787}"
 STATUSD_BIN="$(cd "$(dirname "$0")" && pwd)/vpnchain-statusd"
 DASHBOARD_PAGE="$(cd "$(dirname "$0")" && pwd)/vpnchain-dashboard.html"
@@ -383,6 +577,11 @@ DASHBOARD_PAGE="$(cd "$(dirname "$0")" && pwd)/vpnchain-dashboard.html"
 # Chromium-family preference domain whose WebRTC policy we toggle.
 # Override in the env file for Brave, Edge, Chromium, etc.
 BROWSER_DOMAIN="${BROWSER_DOMAIN:-com.google.Chrome}"
+
+# The Linux counterpart: Chrome reads every *.json in this directory as
+# mandatory policy. Chromium uses /etc/chromium/policies/managed, Brave
+# /etc/brave/policies/managed.
+BROWSER_POLICY_FILE="${BROWSER_POLICY_FILE:-/etc/opt/chrome/policies/managed/vpnchain.json}"
 
 # Chrome renamed this policy; write and read both so either vintage works.
 WEBRTC_KEYS=(WebRtcIPHandlingPolicy WebRtcIPHandling)
@@ -515,8 +714,18 @@ AD_PRIVACY_OFF_KEYS=(PrivacySandboxAdTopicsEnabled
                      PrivacySandboxAdMeasurementEnabled
                      PrivacySandboxPromptEnabled)
 
-BROWSER_APP="${BROWSER_APP:-/Applications/Google Chrome.app}"
-BROWSER_BIN="$BROWSER_APP/Contents/MacOS/$(basename "${BROWSER_APP%.app}")"
+# BROWSER_PROC is a pgrep -f pattern for the browser's MAIN process, which is
+# what the quit-and-wait below has to watch. On Linux the command on PATH is a
+# wrapper script around /opt/google/chrome/chrome, and the anchored pattern
+# keeps chrome_crashpad_handler and the helpers from matching too.
+if [ "$OS" = mac ]; then
+    BROWSER_APP="${BROWSER_APP:-/Applications/Google Chrome.app}"
+    BROWSER_BIN="$BROWSER_APP/Contents/MacOS/$(basename "${BROWSER_APP%.app}")"
+    BROWSER_PROC="${BROWSER_PROC:-$BROWSER_BIN}"
+else
+    BROWSER_BIN="${BROWSER_BIN:-$(command -v google-chrome-stable || command -v google-chrome)}"
+    BROWSER_PROC="${BROWSER_PROC:-^/opt/google/chrome/chrome( |\$)}"
+fi
 
 # Timezone the browser should report. The browser has no timezone setting and
 # delegates to the OS, but it honours TZ, which takes effect before ICU
@@ -569,13 +778,21 @@ real_address() {
 # Chromium machinery above applies to it: no preference domain, no
 # --proxy-server, no --incognito. See the header on why it is a different
 # browser rather than a second profile of the pinned one.
-INCOGNITO_APP="${INCOGNITO_APP:-/Applications/Mullvad Browser.app}"
-
 # Bundles in this family disagree on the executable name - Tor Browser ships
 # Contents/MacOS/firefox - so ask the bundle rather than guessing: that is
 # exactly what CFBundleExecutable is for. The name list is the fallback for a
 # bundle with no readable Info.plist, and INCOGNITO_BIN overrides both.
+#
+# On Linux there is no bundle: INCOGNITO_BIN is the executable, by default the
+# mullvad-browser launcher from Mullvad's apt repository, and INCOGNITO_APP is
+# the directory it lives in, which is where distribution/ goes.
 INCOGNITO_BIN="${INCOGNITO_BIN:-}"
+if [ "$OS" = linux ]; then
+    [ -z "$INCOGNITO_BIN" ] && INCOGNITO_BIN=$(command -v mullvad-browser 2>/dev/null)
+    INCOGNITO_APP="${INCOGNITO_APP:-$([ -n "$INCOGNITO_BIN" ] && dirname "$(readlink -f "$INCOGNITO_BIN")")}"
+else
+    INCOGNITO_APP="${INCOGNITO_APP:-/Applications/Mullvad Browser.app}"
+fi
 if [ -z "$INCOGNITO_BIN" ] && [ -r "$INCOGNITO_APP/Contents/Info.plist" ]; then
     cand=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
            "$INCOGNITO_APP/Contents/Info.plist" 2>/dev/null)
@@ -626,7 +843,11 @@ search_template() {
 # launch over it would be worse than the nuisance.
 set_search_policy() {
     local name="$1" dist file template current
-    dist="$INCOGNITO_APP/Contents/Resources/distribution"
+    if [ "$OS" = mac ]; then
+        dist="$INCOGNITO_APP/Contents/Resources/distribution"
+    else
+        dist="$INCOGNITO_APP/distribution"
+    fi
     file="$dist/policies.json"
 
     template=$(search_template "$name")
@@ -669,7 +890,11 @@ EOF
     fi
     if ! mkdir -p "$dist" 2>/dev/null || ! printf '%s\n' "$want" > "$file" 2>/dev/null; then
         warn "could not write $file"
-        warn "grant App Management to whatever runs this, or unset INCOGNITO_SEARCH"
+        if [ "$OS" = mac ]; then
+            warn "grant App Management to whatever runs this, or unset INCOGNITO_SEARCH"
+        else
+            warn "make $dist writable by you once (sudo), or unset INCOGNITO_SEARCH"
+        fi
         return 0
     fi
     ok "default search engine: $name (policy written into the bundle)"
@@ -704,6 +929,12 @@ I2P_PORT="${I2P_PORT:-}"
 
 port_listening() { nc -z "$1" "$2" >/dev/null 2>&1; }
 
+# install_hint BREW_FORMULA APT_PACKAGE
+install_hint() {
+    if [ "$OS" = mac ]; then printf 'brew install %s\n' "$1"
+    else printf 'sudo apt install %s\n' "$2"; fi
+}
+
 # Nothing rotates a launchd redirect, and sing-box logs every connection at
 # info - which is deliberate, since that log is what answers "where did this
 # name actually go", but it had reached 59 MB. Trimmed to its tail rather
@@ -717,9 +948,9 @@ LOG_KEEP_LINES="${LOG_KEEP_LINES:-2000}"
 trim_log() {
     local f="$1" size tmp
     [ -f "$f" ] || return 0
-    size=$(stat -f %z "$f" 2>/dev/null) || return 0
+    size=$(file_size "$f") || return 0
     [ "${size:-0}" -gt "$LOG_MAX_BYTES" ] || return 0
-    tmp=$(mktemp -t vpnchain-log) || return 0
+    tmp=$(temp_file vpnchain-log) || return 0
     if tail -n "$LOG_KEEP_LINES" "$f" > "$tmp" 2>/dev/null; then
         cat "$tmp" > "$f"
         ok "trimmed $(basename "$f"): $((size / 1048576)) MB -> last $LOG_KEEP_LINES lines"
@@ -727,16 +958,12 @@ trim_log() {
     rm -f "$tmp"
 }
 
-# Read from the plists rather than guessed, so this follows the agents if
-# their logs ever move.
 trim_agent_logs() {
-    local plist key path
-    for plist in "$PLIST" "$STATUSD_PLIST"; do
-        [ -f "$plist" ] || continue
-        for key in StandardOutPath StandardErrorPath; do
-            path=$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist" 2>/dev/null) || continue
+    local file path
+    for file in "$PLIST" "$STATUSD_PLIST"; do
+        while IFS= read -r path; do
             [ -n "$path" ] && trim_log "$path"
-        done
+        done < <(agent_logs "$file")
     done
 }
 
@@ -763,7 +990,11 @@ i2p_pid() { pgrep -f "i2pd --conf $I2PD_CONF" | head -1; }
 #
 # Not the datadir from the config either: i2pd ignores that key and uses this
 # path regardless, which is why counting the configured one found nothing.
-I2PD_DATA="${I2PD_DATA:-$HOME/Library/Application Support/i2pd}"
+if [ "$OS" = mac ]; then
+    I2PD_DATA="${I2PD_DATA:-$HOME/Library/Application Support/i2pd}"
+else
+    I2PD_DATA="${I2PD_DATA:-$HOME/.i2pd}"
+fi
 
 i2p_routers() {
     [ -d "$I2PD_DATA/netDb" ] || { echo 0; return; }
@@ -774,7 +1005,7 @@ i2p_routers() {
 cmd_i2p() {
     case "${1:-status}" in
         (start)
-            [ -x "${I2PD_BIN:-}" ] || { bad "i2pd not found - brew install i2pd"; exit 1; }
+            [ -x "${I2PD_BIN:-}" ] || { bad "i2pd not found - $(install_hint i2pd i2pd)"; exit 1; }
             [ -r "$I2PD_CONF" ] || { bad "no config at $I2PD_CONF"; exit 1; }
             if i2p_running; then
                 ok "already running (pid $(i2p_pid))"
@@ -916,8 +1147,8 @@ cmd_start() {
     # Down right now, so this is the safe moment.
     trim_agent_logs
 
-    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
-        || launchctl load -w "$PLIST" 2>/dev/null
+    ensure_singbox_agent || exit 1
+    agent_start "$SINGBOX_AGENT" "$PLIST"
     sleep 2
     if agent_running; then
         ok "sing-box started"
@@ -929,34 +1160,27 @@ cmd_start() {
 
 statusd_running() { pgrep -f 'vpnchain-statusd' >/dev/null 2>&1; }
 
-# Written on first use rather than shipped, since it has to carry absolute
-# paths for this machine. Writing a file that does not exist cannot lose
-# anything, which is the same reasoning as generating a missing config.
+# Both written on first use rather than shipped, since they carry absolute
+# paths for this machine. The binary is resolved now, because neither launchd
+# nor a systemd user manager has Homebrew or ~/.local/bin on its PATH.
+ensure_singbox_agent() {
+    [ -f "$PLIST" ] && return 0
+    local bin
+    bin=$(command -v sing-box) || {
+        bad "sing-box not found - $(install_hint sing-box sing-box)"
+        return 1
+    }
+    write_agent "$SINGBOX_AGENT" "$PLIST" \
+        "$(dirname "$SINGBOX_CONFIG")/sing-box.log" \
+        "$(dirname "$SINGBOX_CONFIG")/sing-box.err.log" \
+        "$bin" run -c "$SINGBOX_CONFIG"
+}
+
 ensure_statusd_plist() {
-    [ -f "$STATUSD_PLIST" ] && return 0
-    cat > "$STATUSD_PLIST" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>$STATUSD_AGENT</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/bin/env</string>
-        <string>python3</string>
-        <string>$STATUSD_BIN</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict><key>STATUS_PORT</key><string>$STATUS_PORT</string></dict>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>$HOME/.config/vpnchain/statusd.log</string>
-    <key>StandardErrorPath</key><string>$HOME/.config/vpnchain/statusd.err.log</string>
-    <key>ProcessType</key><string>Background</string>
-</dict>
-</plist>
-PLIST
-    ok "wrote $STATUSD_PLIST"
+    write_agent "$STATUSD_AGENT" "$STATUSD_PLIST" \
+        "$HOME/.config/vpnchain/statusd.log" \
+        "$HOME/.config/vpnchain/statusd.err.log" \
+        /usr/bin/env python3 "$STATUSD_BIN"
 }
 
 start_statusd() {
@@ -969,8 +1193,7 @@ start_statusd() {
     if statusd_running; then
         ok "status server already running"
     else
-        launchctl bootstrap "gui/$(id -u)" "$STATUSD_PLIST" 2>/dev/null \
-            || launchctl load -w "$STATUSD_PLIST" 2>/dev/null
+        agent_start "$STATUSD_AGENT" "$STATUSD_PLIST"
         sleep 1
         statusd_running && ok "status server on http://127.0.0.1:$STATUS_PORT/" \
                         || bad "status server did not start - see statusd.err.log"
@@ -979,15 +1202,13 @@ start_statusd() {
 
 stop_statusd() {
     [ -z "$STATUSD_AGENT" ] && return 0
-    launchctl bootout "gui/$(id -u)/$STATUSD_AGENT" 2>/dev/null \
-        || launchctl unload -w "$STATUSD_PLIST" 2>/dev/null
+    agent_stop "$STATUSD_AGENT" "$STATUSD_PLIST"
     ok "status server stopped"
 }
 
 cmd_stop() {
     stop_statusd
-    launchctl bootout "gui/$(id -u)/$SINGBOX_AGENT" 2>/dev/null \
-        || launchctl unload -w "$PLIST" 2>/dev/null
+    agent_stop "$SINGBOX_AGENT" "$PLIST"
     ok "sing-box stopped"
 }
 
@@ -995,18 +1216,18 @@ cmd_stop() {
 webrtc_state() {
     local k v
     for k in "${WEBRTC_KEYS[@]}"; do
-        v=$(defaults read "$BROWSER_DOMAIN" "$k" 2>/dev/null)
+        v=$(pol_get "$k")
         [ "$v" = "$WEBRTC_BLOCK_VALUE" ] && { echo blocked; return; }
     done
     echo allowed
 }
 
 set_incognito_policy() {
-    defaults write "$BROWSER_DOMAIN" "$INCOGNITO_KEY" -int "$1"
+    pol_set "$INCOGNITO_KEY" int "$1"
 }
 
 set_cookie_policy() {
-    defaults write "$BROWSER_DOMAIN" "$COOKIE_KEY" -bool "$1"
+    pol_set "$COOKIE_KEY" bool "$1"
 }
 
 # Static - never relaxed, so unlike the cookie and WebRTC policies there is
@@ -1015,28 +1236,28 @@ set_cookie_policy() {
 set_hardening_policies() {
     local k
     for k in "${DEVICE_API_KEYS[@]}"; do
-        defaults write "$BROWSER_DOMAIN" "$k" -int 2
+        pol_set "$k" int 2
     done
-    defaults write "$BROWSER_DOMAIN" "$HTTPS_ONLY_KEY" -string force_enabled
+    pol_set "$HTTPS_ONLY_KEY" string force_enabled
     for k in "${TELEMETRY_OFF_KEYS[@]}"; do
-        defaults write "$BROWSER_DOMAIN" "$k" -bool false
+        pol_set "$k" bool false
     done
-    defaults write "$BROWSER_DOMAIN" "$SAFE_BROWSING_KEY" -int "$SAFE_BROWSING_STANDARD"
+    pol_set "$SAFE_BROWSING_KEY" int "$SAFE_BROWSING_STANDARD"
     for k in "${AD_PRIVACY_OFF_KEYS[@]}"; do
-        defaults write "$BROWSER_DOMAIN" "$k" -bool false
+        pol_set "$k" bool false
     done
 
     # 2 = block. The allowlist is rewritten wholesale each launch so removing
     # an entry from the env file actually removes it, rather than leaving a
     # stale permission behind.
-    defaults write "$BROWSER_DOMAIN" "$BACKGROUND_MODE_KEY" -bool false
-    defaults write "$BROWSER_DOMAIN" "$DOWNLOAD_PROMPT_KEY" -bool true
+    pol_set "$BACKGROUND_MODE_KEY" bool false
+    pol_set "$DOWNLOAD_PROMPT_KEY" bool true
 
-    defaults write "$BROWSER_DOMAIN" "$NOTIFY_DEFAULT_KEY" -int 2
-    defaults delete "$BROWSER_DOMAIN" "$NOTIFY_ALLOW_KEY" 2>/dev/null
+    pol_set "$NOTIFY_DEFAULT_KEY" int 2
+    pol_del "$NOTIFY_ALLOW_KEY"
     if [ -n "$NOTIFY_ALLOW" ]; then
         # shellcheck disable=SC2086
-        defaults write "$BROWSER_DOMAIN" "$NOTIFY_ALLOW_KEY" -array $NOTIFY_ALLOW
+        pol_set "$NOTIFY_ALLOW_KEY" array $NOTIFY_ALLOW
     fi
 }
 
@@ -1053,14 +1274,14 @@ set_webrtc() {
     local k
     if [ "$1" = block ]; then
         for k in "${WEBRTC_KEYS[@]}"; do
-            defaults write "$BROWSER_DOMAIN" "$k" -string "$WEBRTC_BLOCK_VALUE"
+            pol_set "$k" string "$WEBRTC_BLOCK_VALUE"
         done
     else
         # Delete rather than writing "default": a mandatory policy also
         # overrides extension-set privacy settings, so leaving one in place
         # would silently defeat any extension-based control later.
         for k in "${WEBRTC_KEYS[@]}"; do
-            defaults delete "$BROWSER_DOMAIN" "$k" 2>/dev/null
+            pol_del "$k"
         done
     fi
 }
@@ -1068,7 +1289,17 @@ set_webrtc() {
 # Match the binary path specifically. A looser pattern also matches the
 # osascript quit command and this script's own arguments, which would make the
 # quit-wait loop below never finish.
-browser_running() { pgrep -f "$BROWSER_BIN" >/dev/null 2>&1; }
+browser_running() { pgrep -f "$BROWSER_PROC" >/dev/null 2>&1; }
+
+# A polite quit, so the browser saves its session. Chrome on Linux treats
+# SIGTERM to the main process as exactly that.
+browser_quit() {
+    if [ "$OS" = mac ]; then
+        osascript -e "quit app \"$(basename "${BROWSER_APP%.app}")\"" >/dev/null 2>&1
+    else
+        kill -TERM "$(pgrep -o -f "$BROWSER_PROC")" 2>/dev/null
+    fi
+}
 
 # The tunnel needs time to hand shake after the agent restarts, and until it
 # does, everything through the proxy fails. A fixed sleep either wastes time or
@@ -1148,7 +1379,7 @@ PY
 maybe_switch_mode() {
     [ -z "${1:-}" ] && return 0
     if switch_mode "$1" && agent_running; then
-        launchctl kickstart -k "gui/$(id -u)/$SINGBOX_AGENT" 2>/dev/null \
+        agent_restart "$SINGBOX_AGENT" "$PLIST" \
             || { cmd_stop >/dev/null 2>&1; cmd_start >/dev/null 2>&1; }
         ok "sing-box reloaded for the new mode"
     fi
@@ -1190,7 +1421,7 @@ cmd_blocklist() {
     fi
 
     local tmp src srs u parsed d n=0 fail=0
-    tmp=$(mktemp -d -t vpnchain-blocklist) || exit 1
+    tmp=$(temp_dir vpnchain-blocklist) || exit 1
     src="$tmp/source.txt"
     srs="$tmp/blocklist.srs"
     : > "$src"
@@ -1460,9 +1691,15 @@ launch_incognito() {
     done
 
     if [ -z "$INCOGNITO_BIN" ] || [ ! -x "$INCOGNITO_BIN" ]; then
-        bad "no browser executable inside $INCOGNITO_APP"
-        echo "         install it:  brew install --cask mullvad-browser"
-        echo "         or point INCOGNITO_APP at the bundle you want"
+        if [ "$OS" = mac ]; then
+            bad "no browser executable inside $INCOGNITO_APP"
+            echo "         install it:  brew install --cask mullvad-browser"
+            echo "         or point INCOGNITO_APP at the bundle you want"
+        else
+            bad "mullvad-browser is not on PATH"
+            echo "         install it from https://mullvad.net/download/browser/linux"
+            echo "         or point INCOGNITO_BIN at the executable you want"
+        fi
         exit 1
     fi
 
@@ -1671,8 +1908,13 @@ cmd_browser() {
         return
     fi
 
-    if [ ! -x "$BROWSER_BIN" ]; then
-        bad "browser binary not found: $BROWSER_BIN"
+    if [ -z "$BROWSER_BIN" ] || [ ! -x "$BROWSER_BIN" ]; then
+        bad "browser binary not found: ${BROWSER_BIN:-google-chrome is not on PATH}"
+        exit 1
+    fi
+    if ! policy_ready; then
+        bad "cannot write $BROWSER_POLICY_FILE"
+        echo "         create it once with: vpnchain setup"
         exit 1
     fi
 
@@ -1695,7 +1937,7 @@ cmd_browser() {
     local tz="$SPOOF_TZ"
     if browser_running; then
         ok "asking the browser to quit (it will restore your session)"
-        osascript -e "quit app \"$(basename "${BROWSER_APP%.app}")\"" >/dev/null 2>&1
+        browser_quit
         local i=0
         while browser_running && [ "$i" -lt 60 ]; do
             sleep 0.25
@@ -1796,6 +2038,41 @@ cmd_browser() {
     fi
 }
 
+# One-time preparation that needs root, kept out of every other verb so that
+# nothing else ever asks for sudo. On macOS there is none: the policies live in
+# the user's own preference domain.
+cmd_setup() {
+    if [ "$OS" = mac ]; then
+        ok "nothing to do on macOS - policies go to the $BROWSER_DOMAIN domain"
+        return 0
+    fi
+    if policy_ready; then
+        ok "$BROWSER_POLICY_FILE exists and is writable"
+    else
+        local dir
+        dir=$(dirname "$BROWSER_POLICY_FILE")
+        bold "creating $BROWSER_POLICY_FILE (asks for sudo once)"
+        sudo install -d -m 755 "$dir" &&
+            sudo sh -c 'f="$1"; [ -s "$f" ] || printf "{}\n" > "$f"' _ "$BROWSER_POLICY_FILE" &&
+            sudo chown "$(id -un)" "$BROWSER_POLICY_FILE" &&
+            sudo chmod 644 "$BROWSER_POLICY_FILE" || {
+                bad "could not create it"; exit 1; }
+        ok "$BROWSER_POLICY_FILE is yours - launches rewrite it without sudo"
+    fi
+    # Policies the browser should hold even before the first launch.
+    set_hardening_policies
+    restore_policies
+    ok "hardening policies written"
+    if [ -n "$SINGBOX_AGENT" ] && ensure_singbox_agent; then
+        ok "sing-box unit: $PLIST"
+    fi
+    if command -v loginctl >/dev/null && \
+       [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" != yes ]; then
+        warn "user units stop when you log out; to keep the chain up, run:"
+        echo "           sudo loginctl enable-linger $(id -un)"
+    fi
+}
+
 # Rendering what the env file describes and diffing it is the one check the
 # status server deliberately does not do - a second copy of the generator
 # there would be two things to hold in sync. So it lives with the command that
@@ -1812,7 +2089,7 @@ cmd_config_check() {
     local mode tmpcfg
     mode=$(singbox_mode)
     [ "$mode" = unknown ] && mode=chained
-    tmpcfg=$(mktemp -t vpnchain-cfg)
+    tmpcfg=$(temp_file vpnchain-cfg)
     if ! generate_config "$tmpcfg" "$mode" 2>/dev/null; then
         rm -f "$tmpcfg"
         bad "could not render the config implied by the env file"
@@ -1840,6 +2117,7 @@ case "${1:-status}" in
     i2p)     cmd_i2p "${2:-}" ;;
     config)  [ "${2:-}" = check ] && cmd_config_check || cmd_config ;;
     blocklist) cmd_blocklist ;;
+    setup)   cmd_setup ;;
     *)
         echo "usage: vpnchain {start|restart} [chained|direct]"
         echo "       vpnchain stop"
@@ -1848,6 +2126,7 @@ case "${1:-status}" in
         echo "       vpnchain i2p [start|stop|status]"
         echo "       vpnchain config [check]"
         echo "       vpnchain blocklist"
+        echo "       vpnchain setup"
         exit 1
         ;;
 esac

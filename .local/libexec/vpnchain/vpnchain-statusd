@@ -29,7 +29,9 @@ here would be two things to hold in sync.
 import datetime
 import json
 import os
+import platform
 import plistlib
+import shlex
 import re
 import socket
 import subprocess
@@ -47,6 +49,11 @@ CONFIG = os.path.join(
 
 CACHE_TTL = 15          # exits need a request each; do not re-measure per reload
 PROBE_URL = "https://api.ipify.org"
+
+# The few facts read differently on Linux: agents are systemd user units, the
+# browser's policies a JSON file rather than a preference domain, and the
+# system proxy GNOME's rather than the network configuration's.
+LINUX = platform.system() == "Linux"
 
 
 def read_env(path):
@@ -208,12 +215,14 @@ _match_cache = {"key": None, "hosts": {}}
 
 
 def singbox_agent():
-    """The sing-box launchd agent: its binary and its log. Read from the plist,
-    as the CLI's log trimming does, so both follow the agent if it moves -
-    launchd's PATH would not find a Homebrew sing-box by name anyway."""
+    """The sing-box agent: its binary and its log. Read from the plist or the
+    unit, as the CLI's log trimming does, so both follow the agent if it moves
+    - an agent's PATH would not find a Homebrew sing-box by name anyway."""
     label = env("SINGBOX_AGENT")
     if not label:
         return None, None
+    if LINUX:
+        return _unit_agent(label)
     try:
         with open(os.path.expanduser(
                 "~/Library/LaunchAgents/%s.plist" % label), "rb") as f:
@@ -223,6 +232,28 @@ def singbox_agent():
     args = pl.get("ProgramArguments") or []
     return (args[0] if args else None,
             pl.get("StandardErrorPath") or pl.get("StandardOutPath"))
+
+
+def _unit_agent(label):
+    unit = os.path.join(os.environ.get("XDG_CONFIG_HOME",
+                                       os.path.expanduser("~/.config")),
+                        "systemd", "user", label + ".service")
+    binary = log = out = None
+    try:
+        with open(unit) as f:
+            for line in f:
+                key, _, value = line.strip().partition("=")
+                if key == "ExecStart" and value:
+                    binary = shlex.split(value)[0]
+                elif key in ("StandardError", "StandardOutput") \
+                        and value.startswith("append:"):
+                    if key == "StandardError":
+                        log = value[len("append:"):]
+                    else:
+                        out = value[len("append:"):]
+    except (OSError, ValueError):
+        return None, None
+    return binary, log or out
 
 
 def blocked_recent():
@@ -337,6 +368,20 @@ def singbox_mode():
 
 
 def system_proxy():
+    if LINUX:
+        # GNOME's, which is what most applications on a desktop follow. Its
+        # absence (no gsettings, another desktop) reads as "not set".
+        mode = run(["gsettings", "get", "org.gnome.system.proxy", "mode"], timeout=5)
+        if mode.strip("'") != "manual":
+            return {"set": False}
+        host = run(["gsettings", "get", "org.gnome.system.proxy.socks", "host"],
+                   timeout=5).strip("'")
+        port = run(["gsettings", "get", "org.gnome.system.proxy.socks", "port"],
+                   timeout=5)
+        if not host:
+            return {"set": False}
+        return {"set": True, "host": host,
+                "port": int(port) if port.isdigit() else None}
     out = run(["scutil", "--proxy"])
     enabled = re.search(r"SOCKSEnable\s*:\s*(\d+)", out)
     if not enabled or enabled.group(1) != "1":
@@ -353,8 +398,26 @@ def browser_policy():
     says what the NEXT launch gets - the dashboard measures what the current
     one actually does, which is a different question."""
     dom = env("BROWSER_DOMAIN", "com.google.Chrome")
+    policies = None
+    if LINUX:
+        try:
+            with open(env("BROWSER_POLICY_FILE",
+                          "/etc/opt/chrome/policies/managed/vpnchain.json")) as f:
+                policies = json.load(f)
+        except (OSError, ValueError):
+            policies = {}
 
     def read(key):
+        """As defaults prints it: bools as 1/0, arrays one entry per line."""
+        if policies is not None:
+            v = policies.get(key)
+            if v is None:
+                return None
+            if isinstance(v, bool):
+                return "1" if v else "0"
+            if isinstance(v, list):
+                return "\n".join('"%s"' % x for x in v)
+            return str(v)
         out = run(["defaults", "read", dom, key], timeout=5)
         return out if out else None
 
@@ -397,8 +460,7 @@ def browser_policy():
         # The value is a plist array; counting quoted entries is enough for a
         # summary and avoids dragging in a plist parser for one number.
         "notificationsAllowed": len(re.findall(
-            r'"[^"]+"', run(["defaults", "read", dom,
-                             "NotificationsAllowedForUrls"], timeout=5) or "")),
+            r'"[^"]+"', read("NotificationsAllowedForUrls") or "")),
         "webrtc": webrtc,
         "webrtcBlocked": webrtc == "disable_non_proxied_udp",
         "incognito": incog,
