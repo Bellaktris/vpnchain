@@ -364,7 +364,22 @@ def singbox_mode():
                if e.get("type") == "wireguard"), None)
     if wg is None:
         return None
+    if wg.get("detour") == "reality":
+        return "chained-reality"
     return "chained" if wg.get("detour") else "direct"
+
+
+def selector_size():
+    """How many nodes the current mode can choose between - one, in
+    chained-reality mode with a single Reality node, which makes having no
+    standbys normal rather than a fault."""
+    try:
+        with open(singbox_config_path()) as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    sel = next((o for o in cfg.get("outbounds", []) if o.get("type") == "selector"), None)
+    return len(sel.get("outbounds", [])) if sel else None
 
 
 def system_proxy():
@@ -526,6 +541,8 @@ def native_upstream(host):
     return dict(process_info("sing-box run"), native=True, port=port,
                 listening=port_open(host, port),
                 pilot=process_info("vpnchain-pilot")["running"],
+                poolSize=selector_size(),
+                trouble=bool(state.get("trouble")),
                 node=state.get("active"),
                 standbys=state.get("standbys", []),
                 active=describe(state.get("active")),

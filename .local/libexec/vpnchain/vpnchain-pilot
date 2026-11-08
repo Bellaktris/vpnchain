@@ -2,39 +2,35 @@
 """Keep vpnchain on a working node without being asked, and without showing
 the network more of the provider than it has to.
 
-sing-box holds every node of the subscription in one selector and dials none
-of them until the selector points there. This moves the selector, through the
-Clash API on loopback, and is the only thing that does.
+sing-box holds the nodes of the current mode in one selector - the CDN nodes
+in chained mode, the Reality nodes in chained-reality mode - and dials none of
+them until the selector points there. This moves the selector, through the
+Clash API on loopback, and is the only thing that does. It never crosses
+from one mode's nodes to the other's: when every node of the mode fails, it
+says so and leaves the switch to whoever reads the notification.
 
 The priorities, in order, and what each one costs the next:
 
-  1. No manual intervention. A dead node is replaced within a few minutes,
-     a dead pool is searched, the Reality node is tried when nothing else
-     connects, and if that fails too the subscription is fetched again -
-     by Tor, and directly as the last resort. Nothing waits for a person.
+  1. No manual intervention within the mode. A dead node is replaced
+     within a few minutes, a dead pool is searched, and if nothing answers
+     the subscription is fetched again - by Tor, and directly as the last
+     resort.
 
-  2. Robustness against censorship. Every probe is a TLS connection to a
-     node, with its name in the clear, so probes are few and never on a
+  2. Robustness against censorship. Probes are few and never on a
      schedule: the active node, two standbys from other domain families, and
      one unknown node every several hours. The provider's names fall into a
      handful of families that a single rule blocks together, so the
      standbys never share the active node's family, and a family whose nodes
-     keep failing is set aside. The Reality node is never touched while
-     anything else works: the node nobody sees used is the one that lasts.
-
-     Nodes whose CDN publishes ECH keys are preferred throughout, even when
-     slower: their names travel encrypted, so the wire shows only the CDN's
-     shared ECH name. On a network that blocks ECH outright - two families
-     of ECH nodes failing while ordinary ones work - the preference is
-     dropped for a while.
+     keep failing is set aside. A node that answers probes but stalls on a
+     real download - how some networks throttle - counts as failing too.
 
   3. Latency. Measured through each node, plus the distance from the node to
      the WireGuard peer, which the measurement cannot see - the probe target
      is anycast and sits next to every node alike. Both together predicted
      the real end-to-end order of eight nodes far better than either alone
-     (see geo_ms). The active node is
-     replaced on latency alone only by a clearly better one, measured twice:
-     every switch shows the network another name.
+     (see geo_ms). The active node is replaced on latency alone only by a
+     clearly better one, measured twice: every switch shows the network
+     another name, or with ECH at least another connection.
 
 The state, including recent events, is written to pilot.json beside the env
 file, for the dashboard and for whoever wants to know why the exit moved.
@@ -72,13 +68,28 @@ SUBSCRIBE_EVERY = (20 * 3600, 28 * 3600)    # the node list itself
 STANDBYS = 2
 FAILS_TO_SWITCH = 2         # consecutive failures before the active node goes
 OUTAGE_BATCH = 3            # reserve nodes tried per round while nothing works
-OUTAGE_ROUNDS_BEFORE_REALITY = 2
+OUTAGE_ROUNDS_BEFORE_REFRESH = 2   # rounds of nothing answering before a new list
 SUSPECT_FOR = 6 * 3600      # how long a failing family is set aside
 UPGRADE_RATIO, UPGRADE_MS = 0.75, 40    # "clearly better", for a latency switch
-ECH_SLOWDOWN = 2.0          # how much slower an ECH node may be and still win
 TAU_MS = 120                # how sharply the random choice favours low scores
 PROBE_TIMEOUT_MS = 6000
 UNKNOWN_DELAY_MS = 400      # prior for a node never measured
+
+# A latency probe is a few hundred bytes, and some networks - Russia's, for
+# foreign CDNs and hosting - let exactly that through and then stall a
+# connection after its first few kilobytes. So the active path also has to
+# carry a real download now and then: 256 KB through the shared port, which
+# is the active node. Inside the node's connection either way, so the network
+# sees nothing new; about 12 MB a day.
+BULK_EVERY = (900, 1800)
+# In chained-reality mode - on networks where throttling is the expected
+# failure - a stall has to be noticed in minutes, not half an hour: about
+# 35 MB a day instead of 12.
+BULK_EVERY_REALITY = (300, 900)
+BULK_BYTES = 262144
+BULK_URLS = ["https://speed.cloudflare.com/__down?bytes=%d" % BULK_BYTES]
+BULK_MIN_BPS = 20000        # below this, a stall rather than a slow line
+BULK_FAILS_TO_SWITCH = 2
 GEO_MS_PER_KM = 0.03        # see geo_ms for how this was measured
 
 # Inside the node's TLS, so the network never sees which; varied anyway since
@@ -152,6 +163,17 @@ class Api:
     def __init__(self, port, secret):
         self.base = "http://127.0.0.1:%s" % port
         self.secret = secret
+        self.selector = SELECTOR
+
+    def detect(self):
+        """The selector this config steers through: "reality" in
+        chained-reality mode, the ordinary one otherwise. Asked every round,
+        so a mode change takes effect without restarting the pilot."""
+        try:
+            self._call("GET", "/proxies/reality")
+            return "reality"
+        except urllib.error.HTTPError:
+            return SELECTOR
 
     def _call(self, method, path, body=None, timeout=10):
         req = urllib.request.Request(
@@ -166,10 +188,12 @@ class Api:
             return json.loads(data) if data else None
 
     def selected(self):
-        return self._call("GET", "/proxies/" + SELECTOR)["now"]
+        """The node in use, and every node the selector could switch to."""
+        r = self._call("GET", "/proxies/" + self.selector)
+        return r["now"], r.get("all") or []
 
     def select(self, tag):
-        self._call("PUT", "/proxies/" + SELECTOR, {"name": tag})
+        self._call("PUT", "/proxies/" + self.selector, {"name": tag})
 
     def delay(self, tag):
         """Milliseconds through this node, or None if it did not answer."""
@@ -186,8 +210,10 @@ class Api:
 
 class Pilot:
     def __init__(self):
+        self.reality_mode = False
         self.env = {}
-        self.nodes = {}             # tag -> node from nodes.json
+        self.all_nodes = {}         # tag -> node from nodes.json
+        self.nodes = {}             # the ones the current mode's selector holds
         self.nodes_mtime = None
         self.api = None
         self.state = self.load_state()
@@ -223,11 +249,24 @@ class Pilot:
         os.replace(tmp, STATE_FILE)
 
     def event(self, kind, msg, alert=False):
+        """Log it; and for an alert, notify - once per spell of trouble. A
+        throttled or dead node can go round the cycle of answering, stalling
+        and being set aside several times an hour, and one notice that it
+        started and one that it ended say all of that. The dashboard's event
+        list keeps the detail."""
         log("%s: %s" % (kind, msg))
         self.state["events"] = (self.state["events"]
                                 + [{"at": int(time.time()), "kind": kind,
                                     "msg": msg}])[-30:]
-        if alert:
+        if alert and not self.state.get("trouble"):
+            self.state["trouble"] = True
+            notify(msg)
+
+    def all_clear(self, msg):
+        """The end of a spell of trouble: a node of the mode carried a real
+        download again. Only then, since answering a probe is not working."""
+        if self.state.pop("trouble", None):
+            self.event("recovered", msg)
             notify(msg)
 
     def due(self, key, every):
@@ -255,13 +294,20 @@ class Pilot:
             return
         if mtime != self.nodes_mtime:
             with open(path) as f:
-                self.nodes = {n["tag"]: n for n in json.load(f)["nodes"]}
+                self.all_nodes = {n["tag"]: n for n in json.load(f)["nodes"]}
             self.nodes_mtime = mtime
             # Forget nodes the provider dropped, keep everything else.
-            for key in ("standbys",):
-                self.state[key] = [t for t in self.state[key] if t in self.nodes]
             self.state["stats"] = {t: v for t, v in self.state["stats"].items()
-                                   if t in self.nodes}
+                                   if t in self.all_nodes}
+        self.nodes = self.all_nodes
+
+    def narrow_to_selector(self, members):
+        """Only the nodes the current mode's selector holds are candidates:
+        the CDN nodes in chained mode, the Reality ones in chained-reality.
+        Everything below works on self.nodes, so this is the whole of the
+        difference between the modes as far as the pilot is concerned."""
+        self.nodes = {t: self.all_nodes[t] for t in members if t in self.all_nodes}
+        self.state["standbys"] = [t for t in self.state["standbys"] if t in self.nodes]
 
     def online(self):
         """Whether there is a network at all. Without this, a closed lid
@@ -409,25 +455,11 @@ class Pilot:
         measured = sorted(d)[len(d) // 2] if d else UNKNOWN_DELAY_MS
         return measured + self.geo_ms(tag)
 
-    def is_reality(self, tag):
-        return self.nodes[tag]["security"] == "reality"
-
     def family(self, tag):
         return self.nodes[tag]["family"]
 
     def suspect(self, fam):
         return self.state["suspect"].get(fam, 0) > time.time()
-
-    def is_ech(self, tag):
-        return bool(self.nodes[tag].get("ech"))
-
-    def prefer_ech(self, tags):
-        """The ECH nodes among these, if there are any and ECH is not set
-        aside. Their names never cross the wire, so a censor can block them
-        only by blocking ECH for the whole CDN - which outranks latency."""
-        if self.suspect("ech"):
-            return tags
-        return [t for t in tags if self.is_ech(t)] or tags
 
     def weighted_pick(self, tags):
         """Random, but leaning towards low scores: the order of nodes tried
@@ -449,39 +481,10 @@ class Pilot:
             st["fails"] = 0
             st["last_ok"] = st["last_try"]
             st["delays"] = (st["delays"] + [ms])[-3:]
-            # Any ECH node answering means ECH gets through, whichever path
-            # asked: a set-aside that outlived the block would keep names in
-            # the clear for hours longer than needed.
-            if self.is_ech(tag) and self.suspect("ech"):
-                del self.state["suspect"]["ech"]
-                # Families set aside during the block were blamed for ECH's
-                # failures, not their own; they get their chance back too.
-                for fam in {self.family(t) for t in self.nodes if self.is_ech(t)}:
-                    self.state["suspect"].pop(fam, None)
-                self.event("suspect", "ECH gets through again - preferring it once more")
         else:
             st["fails"] += 1
             self.judge_family(self.family(tag))
-            if self.is_ech(tag):
-                self.judge_ech()
         return ms
-
-    def judge_ech(self):
-        """ECH nodes of two families failing in the last hour, none
-        answering since, while an ordinary node did: that is a network
-        blocking ECH itself - as some do for a whole CDN - not two families
-        dying at once. ECH stops being preferred for a while, so the search
-        turns to nodes that can still connect."""
-        hour_ago = time.time() - 3600
-        failed = {self.family(t) for t in self.nodes if self.is_ech(t)
-                  and self.stat(t)["fails"] and self.stat(t)["last_try"] > hour_ago}
-        ech_ok = any(self.stat(t)["last_ok"] > hour_ago for t in self.nodes if self.is_ech(t))
-        plain_ok = any(self.stat(t)["last_ok"] > hour_ago for t in self.nodes
-                       if not self.is_ech(t))
-        if len(failed) >= 2 and not ech_ok and plain_ok and not self.suspect("ech"):
-            self.state["suspect"]["ech"] = int(time.time() + SUSPECT_FOR)
-            self.event("suspect", "ECH looks blocked on this network - "
-                       "preferring ordinary nodes for a while", alert=True)
 
     def judge_family(self, fam):
         """Two members failing in the last hour, none answering since, and the
@@ -503,19 +506,29 @@ class Pilot:
         old = self.state["active"]
         self.state["active"] = tag
         self.state["standbys"] = [t for t in self.state["standbys"] if t != tag]
+        # The new node's first real download comes soon: a node that passes
+        # latency probes and stalls on data should not hold the path for the
+        # half hour an ordinary check interval would give it.
+        self.state["due"]["bulk"] = time.time() + random.uniform(60, 180)
+        if tag == old:
+            # The only node of the mode, answering again after an outage. It
+            # is working once it carries a download, which comes next.
+            self.event("recovered", "%s answers again" % tag)
+            return
         self.event("switch", "%s -> %s (%s)" % (old, tag, why),
                    alert=why not in ("latency", "start"))
 
     def reserve(self, exclude_families=()):
-        """Ordinary nodes not in use. Suspect families only when nothing else
-        is left: a network that blocked everything for an hour - a captive
-        portal, say - must not leave the pilot shunning every family for
-        hours after it comes back."""
+        """The mode's nodes not in use. Suspect families only when nothing
+        else is left: a network that blocked everything for an hour - a
+        captive portal, say - must not leave the pilot shunning every family
+        for hours after it comes back."""
         taken = {self.state["active"], *self.state["standbys"]}
         base = [t for t in self.nodes
-                if t not in taken and not self.is_reality(t)
-                and self.family(t) not in exclude_families]
-        return [t for t in base if not self.suspect(self.family(t))] or base
+                if t not in taken and self.family(t) not in exclude_families]
+        # Nodes that recently stalled on a real download sit out the same way.
+        good = [t for t in base if not self.suspect(self.family(t)) and not self.stalled(t)]
+        return good or base
 
     def fill_standbys(self):
         """One candidate per call, measured before it is admitted, from a
@@ -525,10 +538,9 @@ class Pilot:
         if time.time() < self.state["due"].get("fill", 0):
             return
         fams = {self.family(t) for t in [self.state["active"], *self.state["standbys"]] if t}
-        # Family diversity first, ECH second: a standby that one blocking
-        # rule would take out together with the active node is no standby.
-        pool = self.prefer_ech(self.reserve(exclude_families=fams) or self.reserve())
-        tag = self.weighted_pick(pool)
+        # A standby that one blocking rule would take out together with the
+        # active node is no standby - unless no other family is left.
+        tag = self.weighted_pick(self.reserve(exclude_families=fams) or self.reserve())
         if not tag:
             return
         if self.probe(tag):
@@ -560,9 +572,11 @@ class Pilot:
         return True
 
     def failover(self):
-        """Standbys first, then the reserve in random batches, then Reality,
-        then a fresh subscription. One round per tick, so a long outage costs
-        a few probes a minute rather than a burst through the whole list."""
+        """Standbys first, then the rest of the mode's nodes in random
+        batches, then a fresh subscription - and a notification, since what
+        remains is switching modes, which is a decision for a person. One
+        round per tick, so a long outage costs a few probes a minute rather
+        than a burst through the whole list."""
         out = self.state["outage"] or {"since": int(time.time()), "rounds": 0,
                                        "tried": [], "next": 0}
         self.state["outage"] = out
@@ -572,9 +586,25 @@ class Pilot:
             # and it is what notices first that the outage was the network's
             # own - a captive portal, a dead uplink - and is over.
             last = max(self.nodes, key=lambda t: self.stat(t)["last_ok"])
-            if self.stat(last)["last_ok"] and self.due("outage-ping", (90, 240)):
+            # Not one that stalled: it would answer the probe and stall again.
+            if (self.stat(last)["last_ok"] and not self.stalled(last)
+                    and self.due("outage-ping", (90, 240))):
                 if self.probe(last):
                     self.recovered(last, "failover")
+            # A stalled node the selector still points at - the mode's only
+            # node, typically - is retested with a real download through the
+            # shared port, which reaches it without switching anything. So a
+            # throttle that lifts is noticed within minutes rather than at the
+            # end of the node's bar.
+            cur = self.state["active"]
+            if cur and self.stalled(cur) and self.due("stall-retest", (600, 1200)):
+                size, bps = self.download(self.env.get("SHARED_PORT", "20170"))
+                if self.download_ok(size, bps):
+                    st = self.stat(cur)
+                    for k in ("slow_until", "slow_backoff"):
+                        st.pop(k, None)
+                    self.recovered(cur, "stall over")
+                    self.all_clear("%s working again (%d KB/s)" % (cur, bps // 1024))
             return
         out["rounds"] += 1
         # Nodes cannot be reached without their names resolving; fix that
@@ -584,7 +614,7 @@ class Pilot:
         # Every round a minute apart at first, then backing off to half an
         # hour: a long outage should cost a few probes an hour, not a few a
         # minute for as long as it lasts.
-        backoff = 60 * 2 ** max(0, out["rounds"] - OUTAGE_ROUNDS_BEFORE_REALITY - 1)
+        backoff = 60 * 2 ** max(0, out["rounds"] - OUTAGE_ROUNDS_BEFORE_REFRESH - 1)
         out["next"] = time.time() + min(backoff, 1800) * random.uniform(0.7, 1.3)
 
         for tag in list(self.state["standbys"]):
@@ -598,7 +628,7 @@ class Pilot:
             pool = [t for t in self.reserve() if t not in out["tried"]]
             # One node per family before a second from any of them.
             fresh = [t for t in pool if self.family(t) not in tried_fams] or pool
-            tag = self.weighted_pick(self.prefer_ech(fresh))
+            tag = self.weighted_pick(fresh)
             if not tag:
                 break
             out["tried"].append(tag)
@@ -606,19 +636,17 @@ class Pilot:
             if self.probe(tag):
                 return self.recovered(tag, "failover")
 
-        if out["rounds"] >= OUTAGE_ROUNDS_BEFORE_REALITY:
-            for tag in [t for t in self.nodes if self.is_reality(t)]:
-                if tag not in out["tried"] and self.probe(tag):
-                    out["tried"].append(tag)
-                    return self.recovered(tag, "last resort: Reality")
-
         # Then a fresh list - once when the outage is established, and every
         # several hours while it lasts, since the provider may be replacing
-        # exactly the nodes that went dark.
-        if out["rounds"] > OUTAGE_ROUNDS_BEFORE_REALITY and self.due("outage-subscribe",
+        # exactly the nodes that went dark. The notification names the other
+        # mode, which is the one move left and is not the pilot's to make.
+        if out["rounds"] > OUTAGE_ROUNDS_BEFORE_REFRESH and self.due("outage-subscribe",
                                                                      (6 * 3600, 8 * 3600)):
-            self.event("down", "no node answers - fetching a fresh node list",
-                       alert=True)
+            other = "chained" if self.reality_mode else "chained-reality"
+            self.event("down", "no %s node answers - fetching a fresh node list; "
+                       "'vpnchain restart %s' switches to the %s nodes" % (
+                           "Reality" if self.reality_mode else "ECH", other,
+                           "ECH" if self.reality_mode else "Reality"), alert=True)
             self.subscribe()
             # A new list is a new chance for every node.
             out["tried"] = []
@@ -627,66 +655,24 @@ class Pilot:
         self.switch(tag, why)
         self.state["outage"] = None
         self.state["fill_fails"] = 0
-        for key in ("outage-subscribe", "outage-ping", "fill"):
+        for key in ("outage-subscribe", "outage-ping", "stall-retest", "fill"):
             self.state["due"].pop(key, None)
 
     def maybe_upgrade(self):
         """Switch for latency only when a standby beat the active node clearly
-        in each of its last two measurements - and never from an ECH node to
-        one whose name would cross the wire, since hiding names outranks
-        speed. The other way round, a working ECH standby replaces an
-        ordinary active node even when it is somewhat slower."""
+        in each of its last two measurements."""
         act = self.state["active"]
         act_score = self.score(act)
-        ech_wanted = not self.suspect("ech")
         for tag in self.state["standbys"]:
             d = self.stat(tag)["delays"][-2:]
             if len(d) < 2:
                 continue
-            if ech_wanted and self.is_ech(act) and not self.is_ech(tag):
-                continue
             geo = self.geo_ms(tag)
-            faster = all(x + geo < act_score * UPGRADE_RATIO and x + geo < act_score - UPGRADE_MS
-                         for x in d)
-            hides_name = (ech_wanted and self.is_ech(tag) and not self.is_ech(act)
-                          and all(x + geo < act_score * ECH_SLOWDOWN for x in d))
-            if faster or hides_name:
+            if all(x + geo < act_score * UPGRADE_RATIO and x + geo < act_score - UPGRADE_MS
+                   for x in d):
                 self.state["standbys"] = [t for t in self.state["standbys"] if t != tag] + [act]
-                self.switch(tag, "latency" if faster else "ECH: name hidden")
+                self.switch(tag, "latency")
                 return
-
-    def ech_return(self):
-        """On an ordinary node while ECH is not set aside, try one ECH node
-        now and then and make it a standby if it answers; maybe_upgrade then
-        moves over once it has measured well twice. Without this, standbys
-        filled during an ECH outage would hold their places for good.
-
-        Cheap in what it shows: an ECH probe puts only the CDN's shared ECH
-        name on the wire, never the node's own. So it runs even while ECH is
-        set aside, and is what ends that early once ECH gets through again -
-        rather than leaving the chain on names in the clear for hours after
-        the block has lifted."""
-        act = self.state["active"]
-        if self.is_ech(act):
-            return
-        # An ECH standby that maybe_upgrade could actually move to is enough;
-        # one too slow to ever qualify is no way back, and gets replaced.
-        limit = self.score(act) * ECH_SLOWDOWN
-        useless = [t for t in self.state["standbys"] if self.is_ech(t)]
-        if any(self.score(t) < limit for t in useless):
-            return
-        tag = self.weighted_pick([t for t in self.reserve() if self.is_ech(t)])
-        if not tag or not self.probe(tag):
-            return
-        # Its second measurement comes from the next standby check.
-        self.state["due"]["standby:" + tag] = time.time() + random.uniform(120, 600)
-        for t in useless:
-            self.state["standbys"].remove(t)
-        if len(self.state["standbys"]) >= STANDBYS:
-            out = max(self.state["standbys"], key=self.score)
-            self.state["standbys"].remove(out)
-        self.state["standbys"].append(tag)
-        self.event("standby", "%s admitted - ECH, to move back to" % tag)
 
     def explore(self):
         """One node nobody has measured, so the pool keeps up with what the
@@ -700,6 +686,62 @@ class Pilot:
         if worst and self.score(tag) < self.score(worst) and self.family(tag) not in fams:
             self.state["standbys"] = [t for t in self.state["standbys"] if t != worst] + [tag]
             self.event("standby", "%s replaces %s" % (tag, worst))
+
+    @staticmethod
+    def download(port):
+        """(bytes, bytes per second) for the test download through a local
+        port; (0, 0) when nothing came."""
+        try:
+            out = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-m", "20",
+                 "-w", "%{size_download} %{speed_download}",
+                 "--socks5-hostname", "127.0.0.1:%s" % port,
+                 random.choice(BULK_URLS)],
+                capture_output=True, text=True, timeout=30).stdout.split()
+            return int(float(out[0])), float(out[1])
+        except Exception:
+            return 0, 0.0
+
+    @staticmethod
+    def download_ok(size, bps):
+        return size >= BULK_BYTES and bps >= BULK_MIN_BPS
+
+    def bulk_check(self):
+        """A real download through the active node: 256 KB that must arrive
+        whole and faster than a stall. Two failures in a row count as the
+        node failing, which a latency probe cannot see on a network that
+        throttles rather than blocks. Returns False when the node is out."""
+        size, bps = self.download(self.env.get("SHARED_PORT", "20170"))
+        tag = self.state["active"]
+        st = self.stat(tag)
+        st["bps"] = int(bps)
+        if self.download_ok(size, bps):
+            st["slow"] = 0
+            st.pop("slow_until", None)
+            st.pop("slow_backoff", None)
+            self.all_clear("%s working again (%d KB/s)" % (tag, bps // 1024))
+            return True
+        st["slow"] = st.get("slow", 0) + 1
+        if st["slow"] < BULK_FAILS_TO_SWITCH:
+            # A second opinion soon, as for a failed latency probe.
+            self.state["due"]["bulk"] = time.time() + random.uniform(60, 120)
+            return True
+        # A throttled node still answers latency probes, so without a bar on
+        # it the search would come straight back to it and stall again.
+        # Barred for half an hour, doubling to four while it keeps stalling.
+        backoff = min(st.get("slow_backoff", 900) * 2, 4 * 3600)
+        st["slow_backoff"] = backoff
+        st["slow_until"] = int(time.time() + backoff)
+        self.event("failed", "%s answers but stalls - %d of %d KB at %d KB/s; "
+                   "not used again for %d min" % (
+                       tag, size // 1024, BULK_BYTES // 1024, bps // 1024, backoff // 60),
+                   alert=True)
+        st["slow"] = 0
+        st["fails"] = FAILS_TO_SWITCH
+        return False
+
+    def stalled(self, tag):
+        return self.stat(tag).get("slow_until", 0) > time.time()
 
     def subscribe(self):
         try:
@@ -717,21 +759,35 @@ class Pilot:
         if not self.nodes:
             return
         try:
-            now = self.api.selected()
+            self.api.selector = self.api.detect()
+            now, members = self.api.selected()
         except Exception:
             return              # sing-box down or restarting: nothing to steer
         if not self.online():
             return
+        self.narrow_to_selector(members)
+        if not self.nodes:
+            return
+
+        # The mode reads from the selector's name. A change starts the pool
+        # over: the new config's selector holds other nodes entirely.
+        reality_mode = self.api.selector == "reality"
+        if reality_mode != self.reality_mode:
+            self.reality_mode = reality_mode
+            if self.state.get("reality_mode") is not None:
+                self.event("mode", "chained-reality: Reality nodes only" if reality_mode
+                           else "chained: ECH nodes only")
+            self.state["reality_mode"] = reality_mode
+            self.state["outage"] = None
+            self.state["standbys"] = []
 
         # Adopt whatever the selector holds - after a restart that is the
         # cached choice, and a manual choice should be respected too.
         if now != self.state["active"]:
-            if self.state["active"] is None and self.is_reality(now):
-                now = None
-            self.state["active"] = now
+            self.state["active"] = now if now in self.nodes else None
             self.state["standbys"] = [t for t in self.state["standbys"] if t != now]
         if self.state["active"] is None:
-            tag = self.weighted_pick(self.prefer_ech(self.reserve()))
+            tag = self.weighted_pick(self.reserve())
             if tag and self.probe(tag):
                 self.switch(tag, "start")
             return
@@ -740,11 +796,10 @@ class Pilot:
             self.failover()
         elif self.due("active", ACTIVE_EVERY) and not self.check_active():
             self.failover()
+        elif (self.due("bulk", BULK_EVERY_REALITY if self.reality_mode else BULK_EVERY)
+              and not self.bulk_check()):
+            self.failover()
         else:
-            # Off Reality as soon as anything ordinary works again.
-            if self.is_reality(self.state["active"]) and self.state["standbys"]:
-                if self.probe(self.state["standbys"][0]):
-                    return self.switch(self.state["standbys"][0], "leaving Reality")
             self.fill_standbys()
             for tag in list(self.state["standbys"]):
                 if self.due("standby:" + tag, STANDBY_EVERY) and not self.probe(tag):
@@ -753,8 +808,6 @@ class Pilot:
             self.maybe_upgrade()
             if self.due("explore", EXPLORE_EVERY):
                 self.explore()
-            if not self.is_ech(self.state["active"]) and self.due("ech-return", (1800, 3600)):
-                self.ech_return()
             if (self.dns_current() != self.dns_choices()[0]
                     and self.due("dns-prefer", (1800, 3600))):
                 self.prefer_dns()

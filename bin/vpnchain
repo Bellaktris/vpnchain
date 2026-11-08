@@ -36,9 +36,24 @@
 #
 #   chained  the WireGuard endpoint dials through the upstream SOCKS proxy, so
 #            only ordinary TLS leaves the machine and the tunnel survives
-#            censorship. Carries UDP over TCP.
+#            censorship. Carries UDP over TCP. With a subscription, through
+#            the provider's CDN nodes whose names ECH hides, and only those.
 #   direct   the endpoint dials its peer itself. Fewer moving parts, but
 #            plainly a VPN on the wire and dead where UDP or VPNs are filtered.
+#   chained-reality
+#            with a subscription only: chained, but through the Reality
+#            node(s) only, for networks that block or throttle CDNs, DoH and
+#            ECH - Russia, China, Iran. Reality's visible server name is a
+#            real site's and the node is dialled by stored address, so
+#            neither the name nor DNS gives it away. The incognito browser
+#            and the shared port go through it too, but BitTorrent is
+#            refused: dozens of busy connections to one server is how such
+#            networks find Reality servers.
+#
+# Neither chained mode falls back on the other's nodes: when every node of
+# the mode fails, the pilot says so and leaves the choice of switching to
+# you. What the mode says is what goes on the wire - and the Reality node,
+# unused at home, is still unknown when it is needed.
 #
 # Latency is identical between them - same peer, same ocean crossing, both
 # measured ~1.8x the bare connection. Throughput measurements were too noisy
@@ -1164,8 +1179,9 @@ BLOCKLIST_MUST_PASS=(github.com accounts.google.com fonts.gstatic.com
                      mail.google.com cdn.jsdelivr.net)
 
 
-# The only difference between the modes in the config is whether the WireGuard
-# endpoint carries a "detour" key.
+# The modes differ in the config only in the WireGuard endpoint's "detour":
+# none for direct, the selector for chained - which in chained-reality mode
+# is named "reality".
 singbox_mode() {
     python3 - "$SINGBOX_CONFIG" <<'PY' 2>/dev/null || echo unknown
 import json, sys
@@ -1177,6 +1193,8 @@ eps = c.get("endpoints") or []
 wg = next((e for e in eps if e.get("type") == "wireguard"), None)
 if wg is None:
     print("unknown")
+elif wg.get("detour") == "reality":
+    print("chained-reality")
 else:
     print("chained" if wg.get("detour") else "direct")
 PY
@@ -1448,17 +1466,23 @@ wait_for_chain() {
     return 1
 }
 
-# Switch the config between chained and direct. Returns 0 if it changed.
-# Does not restart on its own; callers that already restart handle that.
+# Switch the config between chained, chained-reality and direct. Returns 0
+# if it changed. Does not restart on its own; callers that already restart
+# handle that.
 switch_mode() {
     local want="$1" cur
     cur=$(singbox_mode)
 
     case "$want" in
-        chained|direct) ;;
-        *) echo "vpnchain: unknown mode '$want' (expected chained or direct)" >&2
+        chained|direct|chained-reality) ;;
+        *) echo "vpnchain: unknown mode '$want' (expected chained, chained-reality or direct)" >&2
            exit 1 ;;
     esac
+    if [ "$want" = chained-reality ] && ! native; then
+        bad "chained-reality mode dials the subscription's Reality node itself, which"
+        bad "needs SUBSCRIPTION_URL - an upstream proxy has no Reality to choose"
+        exit 1
+    fi
     if [ "$cur" = unknown ]; then
         bad "could not read a wireguard endpoint from $SINGBOX_CONFIG"
         exit 1
@@ -1468,6 +1492,14 @@ switch_mode() {
         return 1
     fi
 
+    # Native configs are regenerated in the new mode: chained-reality renames
+    # the selector and every route through it, which is the generator's
+    # business rather than an edit's. The old one is kept for the failure
+    # path below.
+    if native; then
+        cp -p "$SINGBOX_CONFIG" "$SINGBOX_CONFIG.bak"
+        generate_config "$SINGBOX_CONFIG" "$want" || exit 1
+    else
     # Edit in place rather than keeping two config files, so the keys and the
     # peer cannot drift apart between them.
     python3 - "$SINGBOX_CONFIG" "$want" "$UPSTREAM_TAG" <<'PY' || exit 1
@@ -1484,6 +1516,7 @@ with open(path, "w") as f:
     json.dump(c, f, indent=2)
     f.write("\n")
 PY
+    fi
 
     if ! sing-box check -c "$SINGBOX_CONFIG" 2>/dev/null; then
         bad "edited config failed validation - restoring"
@@ -1497,13 +1530,20 @@ PY
         warn "the tunnel is now plainly a VPN on the wire: UDP straight to the"
         warn "peer address, with none of the upstream's cover traffic"
         warn "it will also fail outright on networks that block UDP or VPNs"
+    elif [ "$want" = chained-reality ]; then
+        ok "everything now goes through the Reality node, and only it: the"
+        ok "tunnel, the incognito browser and the shared port"
+        ok "BitTorrent is refused on the shared port while in this mode"
+        warn "if it stops answering, nothing falls back on its own - switch"
+        warn "with: vpnchain restart chained"
     fi
     return 0
 }
 
-# Optional [chained|direct] argument on the lifecycle verbs. A mode change
-# needs the agent reloaded, so if it is already running, restart it here -
-# otherwise cmd_start would see a live agent and leave the old config loaded.
+# Optional [chained|chained-reality|direct] argument on the lifecycle verbs.
+# A mode change needs the agent reloaded, so if it is already running, restart
+# it here - otherwise cmd_start would see a live agent and leave the old
+# config loaded.
 maybe_switch_mode() {
     [ -z "${1:-}" ] && return 0
     if switch_mode "$1" && agent_running; then
@@ -1868,6 +1908,30 @@ was = {n["server"]: n.get("ech") for n in old or []}
 hosts = sorted({n["server"] for n in nodes if n["security"] == "tls"})
 with concurrent.futures.ThreadPoolExecutor(8) as pool:
     found = dict(zip(hosts, pool.map(publishes_ech, hosts)))
+
+# Reality nodes are dialled by address (see the generator), so their address
+# is recorded here, over the same DoH. A failed lookup keeps the old one:
+# this is exactly what has to survive a network where lookups do not.
+def address_of(host):
+    for url in doh:
+        try:
+            req = urllib.request.Request("%s?name=%s&type=A" % (url, host),
+                                         headers={"accept": "application/dns-json"})
+            with opener.open(req, timeout=8) as r:
+                ans = json.load(r)
+            ips = [a["data"] for a in ans.get("Answer", []) if a.get("type") == 1]
+            if ips:
+                return ips[0]
+        except Exception:
+            continue
+    return None
+
+was_ip = {n["server"]: n.get("ip") for n in old or []}
+for n in nodes:
+    if n["security"] == "reality":
+        ip = address_of(n["server"]) or was_ip.get(n["server"])
+        if ip:
+            n["ip"] = ip
 for n in nodes:
     if n["security"] != "tls":
         continue
@@ -2038,6 +2102,12 @@ def node_outbound(n):
     and for Reality it has to match what the server expects, so it is kept."""
     o = {"type": n["protocol"], "tag": n["tag"],
          "server": n["server"], "server_port": n["port"]}
+    # A Reality node is dialled by its stored address when there is one:
+    # nothing about it has to be looked up, so poisoned or blocked DNS cannot
+    # misdirect it and no plain query names it to the network. Its visible
+    # server name is the cover site's, set below, never this one.
+    if n["security"] == "reality" and n.get("ip"):
+        o["server"] = n["ip"]
     if n["protocol"] == "vless":
         o["uuid"] = n["secret"]
         # XUDP is what carries the WireGuard UDP through the node; measured
@@ -2071,6 +2141,11 @@ nodes = []
 if e.get("NODES"):
     nodes = json.load(open(e["NODES"]))["nodes"]
 
+# The upstream everything detours through. In chained-reality mode the
+# selector is named "reality", which is how the mode reads back out of the
+# config - and how the pilot knows to put the Reality node first.
+up = "reality" if e["MODE"] == "chained-reality" else e["UP_TAG"]
+
 wg = {
     "type": "wireguard", "tag": "tunnel", "system": False,
     "mtu": int(e["WG_MTU"]),
@@ -2084,8 +2159,8 @@ wg = {
         "persistent_keepalive_interval": 25,
     }],
 }
-if e["MODE"] == "chained":
-    wg["detour"] = e["UP_TAG"]
+if e["MODE"] in ("chained", "chained-reality"):
+    wg["detour"] = up
 
 cfg = {
     "log": {"level": "info", "timestamp": True},
@@ -2097,7 +2172,7 @@ cfg = {
             {"type": "udp", "tag": "tunnel-dns",
              "server": e["WG_DNS"], "detour": "tunnel"},
             {"type": "udp", "tag": "upstream-dns",
-             "server": e["WG_DNS"], "detour": e["UP_TAG"]},
+             "server": e["WG_DNS"], "detour": up},
         ],
         "rules": [{"inbound": ["upstream-in"], "server": "upstream-dns"}],
         "final": "tunnel-dns",
@@ -2113,7 +2188,7 @@ cfg = {
     # Replaced below by the nodes and their selector in native mode, where
     # there is no upstream port to point at.
     "outbounds": [] if nodes else [
-        {"type": "socks", "tag": e["UP_TAG"], "server": e["UP_HOST"],
+        {"type": "socks", "tag": up, "server": e["UP_HOST"],
          "server_port": int(e["UP_PORT"]), "version": "5"},
     ],
     # BitTorrent never leaves by the pinned address. That address is the one
@@ -2131,7 +2206,7 @@ cfg = {
             {"inbound": ["pinned-in"], "protocol": ["bittorrent"],
              "action": "reject"},
             {"inbound": ["upstream-in"], "action": "route",
-             "outbound": e["UP_TAG"]},
+             "outbound": up},
         ],
         "final": "tunnel",
     },
@@ -2142,21 +2217,30 @@ cfg = {
 # detoured through the upstream - the WireGuard endpoint, the incognito
 # inbound, its DNS - now goes through whichever node the selector holds.
 if nodes:
+    # Each mode holds its own kind of node and no other: chained the nodes
+    # whose names ECH hides, chained-reality the Reality ones. Neither falls
+    # back on the other, nor chained on CDN nodes that would show their names
+    # - a network where ECH or Cloudflare fails is the kind chained-reality is
+    # for, and moving there is a decision, made with 'vpnchain restart
+    # <mode>'. So what the mode says is what goes on the wire, and the Reality
+    # node is never seen until it is the one in use. Direct mode's other
+    # ports use the chained set.
+    want_reality = e["MODE"] == "chained-reality"
+    nodes = [n for n in nodes
+             if (n["security"] == "reality" if want_reality else n.get("ech"))]
+    if not nodes:
+        raise SystemExit("the subscription has no %s node for %s mode" % (
+            "Reality" if want_reality else "ECH", e["MODE"]))
     tags = [n["tag"] for n in nodes]
-    # The default only matters before the pilot has chosen and the cache file
-    # has remembered it. Never the Reality node, which is kept unused until
-    # nothing else connects.
-    #
     # A switch closes what the old node carried. Without that the WireGuard
     # flow - one UDP association that its keepalive never lets end - would
     # stay on a dead node forever. Connections INSIDE the tunnel survive,
     # since WireGuard simply follows its peer onto the new path; only direct
     # users of the shared and incognito ports see a reset, and switches are
     # rare by design.
-    first = next(n["tag"] for n in nodes if n["security"] != "reality")
     cfg["outbounds"] = [node_outbound(n) for n in nodes] + [
-        {"type": "selector", "tag": e["UP_TAG"], "outbounds": tags,
-         "default": first, "interrupt_exist_connections": True}]
+        {"type": "selector", "tag": up, "outbounds": tags,
+         "default": tags[0], "interrupt_exist_connections": True}]
     # Node names are resolved over DoH to a server named by address, so the
     # lookup needs no lookup of its own and the names never cross the wire as
     # plain DNS. They still appear in each node's TLS server name - nothing
@@ -2178,8 +2262,19 @@ if nodes:
     cfg["inbounds"].append(
         {"type": "mixed", "tag": "shared-in", "listen": e["P_HOST"],
          "listen_port": int(e["SHARED_PORT"])})
+    # Except in chained-reality mode, where everything rides one Reality
+    # server: torrents there would be dozens of busy parallel connections to
+    # a single address presenting itself as the cover site - the pattern the
+    # networks that mode is for look for when hunting Reality servers, and
+    # the way to lose the one node that works there. Refused, by the same
+    # two rules that keep torrents off the pinned address.
+    if want_reality:
+        cfg["route"]["rules"] += [
+            {"inbound": ["shared-in"], "action": "sniff"},
+            {"inbound": ["shared-in"], "protocol": ["bittorrent"],
+             "action": "reject"}]
     cfg["route"]["rules"].append(
-        {"inbound": ["shared-in"], "action": "route", "outbound": e["UP_TAG"]})
+        {"inbound": ["shared-in"], "action": "route", "outbound": up})
     cfg["experimental"] = {
         # What the pilot steers through. Loopback only, and the secret is what
         # keeps a web page - which can reach loopback - from steering it.
@@ -2719,7 +2814,7 @@ case "${1:-status}" in
                  ok "sing-box reloaded" ;;
     setup)   cmd_setup ;;
     *)
-        echo "usage: vpnchain {start|restart} [chained|direct]"
+        echo "usage: vpnchain {start|restart} [chained|chained-reality|direct]"
         echo "       vpnchain stop"
         echo "       vpnchain browser [with-webrtc] [with-cookies]"
         echo "       vpnchain browser incognito"

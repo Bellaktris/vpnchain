@@ -231,13 +231,16 @@
     <div class="row"><dt>Node list</dt><dd id="n-list" class="pend">checking</dd></div>
     <div class="row"><dt>Recent events</dt><dd id="n-events" class="pend">checking</dd></div>
   </dl>
-  <details class="note"><summary>why this matters</summary>Every node the
-    chain could use is loaded, but only the one the pilot chose is ever dialled,
-    plus two standbys from other domain families that it checks now and then -
-    a few names a day are all the network sees. A family whose nodes keep
-    failing is set aside for a few hours, since one blocking rule takes out a
-    whole family at once. The Reality node is used only when nothing else
-    answers, so that it is still unknown when it is needed. Delays are measured
+  <details class="note"><summary>why this matters</summary>Each mode has
+    its own nodes and never borrows the other's: chained the nodes whose names
+    ECH hides, chained-reality the Reality node, which stays unknown at home
+    until it is needed. Only the node the pilot chose is ever dialled, plus
+    two standbys from other domain families that it checks now and then. A
+    family whose nodes keep failing is set aside for a few hours, since one
+    blocking rule takes out a whole family at once, and a node that answers
+    but stalls on a real download - how some networks throttle - counts as
+    failing. When every node of the mode fails, the pilot says so once and
+    leaves switching modes to you. Delays are measured
     to the node; the distance on to the WireGuard peer is estimated and added
     when the pilot chooses, so a fast node on the wrong continent does not win.
     The delays are for a fresh HTTPS request through each node, which crosses
@@ -868,20 +871,21 @@ function showNodes(u) {
     put("n-active", u.pilot ? "none chosen yet" : "none chosen, and no pilot",
         u.pilot ? "pend" : "bad");
   } else {
-    // Without ECH the node's name is on the wire for anyone to block - worth
-    // an amber when nodes with ECH exist and the pilot is not on one.
-    var plain = !u.active.ech && !u.active.reality && u.list && u.list.ech;
+    // Answering probes but failing real downloads, or recovering from that:
+    // the pilot's own spell-of-trouble flag, the same one its notices follow.
     put("n-active", nodeText(u.active) +
-          (u.active.reality ? "\nLAST RESORT - every ordinary node failed" : "") +
-          (plain ? "\nname visible on the wire - pilot moves to an ECH node when one answers" : ""),
-        u.active.reality || plain ? "warn" : "ok");
+          (u.trouble ? "\nrecovering - not yet confirmed by a real download" : ""),
+        u.trouble ? "warn" : "ok");
   }
 
   var sb = u.standbyNodes || [];
+  // A mode with a single node - one Reality node - has nothing to stand by.
+  var single = u.poolSize === 1;
   // A blank line between nodes, now that each takes two.
   put("n-standby", sb.length ? sb.map(nodeText).join("\n\n")
-                             : "none yet - admitted as they are measured",
-      sb.length >= 2 ? "ok" : "warn");
+                             : single ? "none - this mode has a single node"
+                                      : "none yet - admitted as they are measured",
+      sb.length >= 2 || single ? "ok" : "warn");
 
   put("n-pilot", u.pilot ? "running" : "NOT running - nothing replaces a failed node",
       u.pilot ? "ok" : "bad");
@@ -889,8 +893,7 @@ function showNodes(u) {
   var sus = u.suspect || [];
   put("n-suspect", sus.length
         ? sus.map(function (s) {
-            return (s.family === "ech" ? "ECH itself (blocked on this network)" : s.family) +
-                   " until " + clock(new Date(s.until * 1000));
+            return s.family + " until " + clock(new Date(s.until * 1000));
           }).join(", ")
         : "none", sus.length ? "warn" : "ok");
 
@@ -1248,13 +1251,10 @@ function conclude() {
                     detail: broken.join(" and ") + " not healthy" });
     } else if (up.native && up.outage) {
       checks.push({ state: "fail", label: "Chain",
-                    detail: "no node answers - the pilot is searching" });
+                    detail: "no node of this mode works - the pilot is searching" });
     } else if (up.native && !up.pilot) {
       checks.push({ state: "warn", label: "Chain",
                     detail: "links up, but no pilot - a failed node stays failed" });
-    } else if (up.native && up.active && up.active.reality) {
-      checks.push({ state: "warn", label: "Chain",
-                    detail: "on the Reality node - every ordinary node failed" });
     } else {
       checks.push({ state: "pass", label: "Chain",
                     detail: (hostData.mode || "?") + " mode, all links up" });
