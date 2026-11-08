@@ -22,6 +22,12 @@ The priorities, in order, and what each one costs the next:
      keep failing is set aside. The Reality node is never touched while
      anything else works: the node nobody sees used is the one that lasts.
 
+     Nodes whose CDN publishes ECH keys are preferred throughout, even when
+     slower: their names travel encrypted, so the wire shows only the CDN's
+     shared ECH name. On a network that blocks ECH outright - two families
+     of ECH nodes failing while ordinary ones work - the preference is
+     dropped for a while.
+
   3. Latency. Measured through each node, plus the distance from the node to
      the WireGuard peer, which the measurement cannot see - the probe target
      is anycast and sits next to every node alike. Both together predicted
@@ -69,6 +75,7 @@ OUTAGE_BATCH = 3            # reserve nodes tried per round while nothing works
 OUTAGE_ROUNDS_BEFORE_REALITY = 2
 SUSPECT_FOR = 6 * 3600      # how long a failing family is set aside
 UPGRADE_RATIO, UPGRADE_MS = 0.75, 40    # "clearly better", for a latency switch
+ECH_SLOWDOWN = 2.0          # how much slower an ECH node may be and still win
 TAU_MS = 120                # how sharply the random choice favours low scores
 PROBE_TIMEOUT_MS = 6000
 UNKNOWN_DELAY_MS = 400      # prior for a node never measured
@@ -411,6 +418,17 @@ class Pilot:
     def suspect(self, fam):
         return self.state["suspect"].get(fam, 0) > time.time()
 
+    def is_ech(self, tag):
+        return bool(self.nodes[tag].get("ech"))
+
+    def prefer_ech(self, tags):
+        """The ECH nodes among these, if there are any and ECH is not set
+        aside. Their names never cross the wire, so a censor can block them
+        only by blocking ECH for the whole CDN - which outranks latency."""
+        if self.suspect("ech"):
+            return tags
+        return [t for t in tags if self.is_ech(t)] or tags
+
     def weighted_pick(self, tags):
         """Random, but leaning towards low scores: the order of nodes tried
         should not be predictable, and should still favour good ones."""
@@ -431,10 +449,39 @@ class Pilot:
             st["fails"] = 0
             st["last_ok"] = st["last_try"]
             st["delays"] = (st["delays"] + [ms])[-3:]
+            # Any ECH node answering means ECH gets through, whichever path
+            # asked: a set-aside that outlived the block would keep names in
+            # the clear for hours longer than needed.
+            if self.is_ech(tag) and self.suspect("ech"):
+                del self.state["suspect"]["ech"]
+                # Families set aside during the block were blamed for ECH's
+                # failures, not their own; they get their chance back too.
+                for fam in {self.family(t) for t in self.nodes if self.is_ech(t)}:
+                    self.state["suspect"].pop(fam, None)
+                self.event("suspect", "ECH gets through again - preferring it once more")
         else:
             st["fails"] += 1
             self.judge_family(self.family(tag))
+            if self.is_ech(tag):
+                self.judge_ech()
         return ms
+
+    def judge_ech(self):
+        """ECH nodes of two families failing in the last hour, none
+        answering since, while an ordinary node did: that is a network
+        blocking ECH itself - as some do for a whole CDN - not two families
+        dying at once. ECH stops being preferred for a while, so the search
+        turns to nodes that can still connect."""
+        hour_ago = time.time() - 3600
+        failed = {self.family(t) for t in self.nodes if self.is_ech(t)
+                  and self.stat(t)["fails"] and self.stat(t)["last_try"] > hour_ago}
+        ech_ok = any(self.stat(t)["last_ok"] > hour_ago for t in self.nodes if self.is_ech(t))
+        plain_ok = any(self.stat(t)["last_ok"] > hour_ago for t in self.nodes
+                       if not self.is_ech(t))
+        if len(failed) >= 2 and not ech_ok and plain_ok and not self.suspect("ech"):
+            self.state["suspect"]["ech"] = int(time.time() + SUSPECT_FOR)
+            self.event("suspect", "ECH looks blocked on this network - "
+                       "preferring ordinary nodes for a while", alert=True)
 
     def judge_family(self, fam):
         """Two members failing in the last hour, none answering since, and the
@@ -478,7 +525,9 @@ class Pilot:
         if time.time() < self.state["due"].get("fill", 0):
             return
         fams = {self.family(t) for t in [self.state["active"], *self.state["standbys"]] if t}
-        pool = self.reserve(exclude_families=fams) or self.reserve()
+        # Family diversity first, ECH second: a standby that one blocking
+        # rule would take out together with the active node is no standby.
+        pool = self.prefer_ech(self.reserve(exclude_families=fams) or self.reserve())
         tag = self.weighted_pick(pool)
         if not tag:
             return
@@ -549,7 +598,7 @@ class Pilot:
             pool = [t for t in self.reserve() if t not in out["tried"]]
             # One node per family before a second from any of them.
             fresh = [t for t in pool if self.family(t) not in tried_fams] or pool
-            tag = self.weighted_pick(fresh)
+            tag = self.weighted_pick(self.prefer_ech(fresh))
             if not tag:
                 break
             out["tried"].append(tag)
@@ -583,19 +632,61 @@ class Pilot:
 
     def maybe_upgrade(self):
         """Switch for latency only when a standby beat the active node clearly
-        in each of its last two measurements."""
+        in each of its last two measurements - and never from an ECH node to
+        one whose name would cross the wire, since hiding names outranks
+        speed. The other way round, a working ECH standby replaces an
+        ordinary active node even when it is somewhat slower."""
         act = self.state["active"]
         act_score = self.score(act)
+        ech_wanted = not self.suspect("ech")
         for tag in self.state["standbys"]:
             d = self.stat(tag)["delays"][-2:]
             if len(d) < 2:
                 continue
+            if ech_wanted and self.is_ech(act) and not self.is_ech(tag):
+                continue
             geo = self.geo_ms(tag)
-            if all(x + geo < act_score * UPGRADE_RATIO and x + geo < act_score - UPGRADE_MS
-                   for x in d):
+            faster = all(x + geo < act_score * UPGRADE_RATIO and x + geo < act_score - UPGRADE_MS
+                         for x in d)
+            hides_name = (ech_wanted and self.is_ech(tag) and not self.is_ech(act)
+                          and all(x + geo < act_score * ECH_SLOWDOWN for x in d))
+            if faster or hides_name:
                 self.state["standbys"] = [t for t in self.state["standbys"] if t != tag] + [act]
-                self.switch(tag, "latency")
+                self.switch(tag, "latency" if faster else "ECH: name hidden")
                 return
+
+    def ech_return(self):
+        """On an ordinary node while ECH is not set aside, try one ECH node
+        now and then and make it a standby if it answers; maybe_upgrade then
+        moves over once it has measured well twice. Without this, standbys
+        filled during an ECH outage would hold their places for good.
+
+        Cheap in what it shows: an ECH probe puts only the CDN's shared ECH
+        name on the wire, never the node's own. So it runs even while ECH is
+        set aside, and is what ends that early once ECH gets through again -
+        rather than leaving the chain on names in the clear for hours after
+        the block has lifted."""
+        act = self.state["active"]
+        if self.is_ech(act):
+            return
+        # An ECH standby that maybe_upgrade could actually move to is enough;
+        # one too slow to ever qualify is no way back, and gets replaced.
+        limit = self.score(act) * ECH_SLOWDOWN
+        useless = [t for t in self.state["standbys"] if self.is_ech(t)]
+        if any(self.score(t) < limit for t in useless):
+            return
+        tag = self.weighted_pick([t for t in self.reserve() if self.is_ech(t)])
+        if not tag or not self.probe(tag):
+            return
+        # Its second measurement comes from the next standby check.
+        self.state["due"]["standby:" + tag] = time.time() + random.uniform(120, 600)
+        for t in useless:
+            self.state["standbys"].remove(t)
+        if len(self.state["standbys"]) >= STANDBYS:
+            out = max(self.state["standbys"], key=self.score)
+            self.state["standbys"].remove(out)
+        self.state["standbys"].append(tag)
+        self.event("standby", "%s admitted - ECH, to move back to" % tag)
 
     def explore(self):
         """One node nobody has measured, so the pool keeps up with what the
@@ -640,7 +731,7 @@ class Pilot:
             self.state["active"] = now
             self.state["standbys"] = [t for t in self.state["standbys"] if t != now]
         if self.state["active"] is None:
-            tag = self.weighted_pick(self.reserve())
+            tag = self.weighted_pick(self.prefer_ech(self.reserve()))
             if tag and self.probe(tag):
                 self.switch(tag, "start")
             return
@@ -662,6 +753,8 @@ class Pilot:
             self.maybe_upgrade()
             if self.due("explore", EXPLORE_EVERY):
                 self.explore()
+            if not self.is_ech(self.state["active"]) and self.due("ech-return", (1800, 3600)):
+                self.ech_return()
             if (self.dns_current() != self.dns_choices()[0]
                     and self.due("dns-prefer", (1800, 3600))):
                 self.prefer_dns()

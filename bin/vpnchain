@@ -1772,7 +1772,7 @@ cmd_subscribe() {
     [ "$via" = direct ] && notify "Node list fetched directly - no proxied route worked"
 
     local summary rc
-    summary=$(python3 - "$raw" "$tmp/nodes.json" "$NODES_FILE" "$via" <<'PY'
+    summary=$(NODE_DNS="$NODE_DNS" python3 - "$raw" "$tmp/nodes.json" "$NODES_FILE" "$via" <<'PY'
 import base64, json, os, re, sys, time, urllib.parse as up
 raw_path, out_path, old_path, via = sys.argv[1:5]
 raw = open(raw_path, "rb").read().strip()
@@ -1833,12 +1833,56 @@ try:
     old = json.load(open(old_path))["nodes"]
 except Exception:
     old = None
+
+# Which nodes publish ECH keys - an "ech" parameter in their HTTPS record.
+# For those, sing-box encrypts the node's name inside the handshake and the
+# wire shows only the CDN's shared ECH name, which a censor cannot block
+# without blocking ECH for every site behind that CDN.
+#
+# Asked over DoH, of the same resolvers that look node names up. A name
+# whose lookup fails keeps what the previous list said, so a resolver hiccup
+# during a fetch cannot quietly switch ECH off.
+import concurrent.futures, urllib.request
+JSON_DOH = {"1.1.1.1": "https://1.1.1.1/dns-query", "1.0.0.1": "https://1.0.0.1/dns-query",
+            "8.8.8.8": "https://8.8.8.8/resolve", "8.8.4.4": "https://8.8.4.4/resolve"}
+doh = [JSON_DOH[ip] for ip in os.environ.get("NODE_DNS", "").split() if ip in JSON_DOH] \
+      or list(JSON_DOH.values())[:3:2]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+def publishes_ech(host):
+    for url in doh:
+        try:
+            req = urllib.request.Request("%s?name=%s&type=HTTPS" % (url, host),
+                                         headers={"accept": "application/dns-json"})
+            with opener.open(req, timeout=8) as r:
+                ans = json.load(r)
+            if ans.get("Status") not in (0, 3):
+                continue
+            return any(a.get("type") == 65 and "ech=" in a.get("data", "")
+                       for a in ans.get("Answer", []))
+        except Exception:
+            continue
+    return None
+
+was = {n["server"]: n.get("ech") for n in old or []}
+hosts = sorted({n["server"] for n in nodes if n["security"] == "tls"})
+with concurrent.futures.ThreadPoolExecutor(8) as pool:
+    found = dict(zip(hosts, pool.map(publishes_ech, hosts)))
+for n in nodes:
+    if n["security"] != "tls":
+        continue
+    ech = found.get(n["server"])
+    if ech is None:
+        ech = was.get(n["server"])
+    if ech:
+        n["ech"] = True
 fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
     json.dump({"fetched_at": int(time.time()), "via": via, "nodes": nodes}, f, indent=1)
 fams = len({n["family"] for n in nodes})
-print("%d nodes in %d families%s; %s" % (
-    len(nodes), fams, ", %d skipped" % skipped if skipped else "",
+print("%d nodes in %d families, %d with ECH%s; %s" % (
+    len(nodes), fams, sum(1 for n in nodes if n.get("ech")),
+    ", %d skipped" % skipped if skipped else "",
     "unchanged" if old == nodes else "changed"))
 PY
 )
@@ -2011,6 +2055,12 @@ def node_outbound(n):
     else:
         tls["alpn"] = n.get("alpn") or ["http/1.1"]
         tls["utls"] = {"enabled": True, "fingerprint": "chrome"}
+        # The node's name goes inside the handshake, encrypted, and the
+        # wire shows the CDN's shared ECH name instead. sing-box fetches the
+        # key from the node's HTTPS record when it dials, so it follows the
+        # CDN's key rotation without a regenerate.
+        if n.get("ech"):
+            tls["ech"] = {"enabled": True}
     o["tls"] = tls
     if n["transport"] == "ws":
         o["transport"] = {"type": "ws", "path": n.get("path") or "/",
@@ -2177,6 +2227,16 @@ if bl:
     cfg["route"]["rule_set"] = [{"type": "local", "tag": "blocklist",
                                  "format": "binary", "path": bl}]
     cfg["route"]["rules"].insert(0, {"rule_set": "blocklist", "action": "reject"})
+
+# Every lookup of a node's name - its address and, for ECH, its key - goes
+# to the node resolver, ahead of every other rule. Without this an ECH key
+# lookup takes the DNS default, which in chained mode resolves through the
+# tunnel: through a node, which cannot be dialled until the lookup is done.
+# Measured: ten seconds and a failed connection, every time.
+if nodes:
+    cfg["dns"]["rules"].insert(0, {
+        "domain": sorted({n["server"] for n in nodes}),
+        "server": cfg["route"]["default_domain_resolver"]})
 
 out = e["OUT"]
 with open(out, "w") as f:

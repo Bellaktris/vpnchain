@@ -848,6 +848,7 @@ function showBlocked(b) {
 function nodeText(n) {
   if (!n) return "-";
   var bits = [n.region, n.family].filter(Boolean);
+  if (n.ech) bits.push("name hidden by ECH");
   // A fresh HTTPS request through the node: several round trips to the
   // node's real server, not a ping to the CDN edge in front of it - which
   // answers in a few ms whichever node it fronts, and so ranks nothing.
@@ -867,9 +868,13 @@ function showNodes(u) {
     put("n-active", u.pilot ? "none chosen yet" : "none chosen, and no pilot",
         u.pilot ? "pend" : "bad");
   } else {
+    // Without ECH the node's name is on the wire for anyone to block - worth
+    // an amber when nodes with ECH exist and the pilot is not on one.
+    var plain = !u.active.ech && !u.active.reality && u.list && u.list.ech;
     put("n-active", nodeText(u.active) +
-          (u.active.reality ? "\nLAST RESORT - every ordinary node failed" : ""),
-        u.active.reality ? "warn" : "ok");
+          (u.active.reality ? "\nLAST RESORT - every ordinary node failed" : "") +
+          (plain ? "\nname visible on the wire - pilot moves to an ECH node when one answers" : ""),
+        u.active.reality || plain ? "warn" : "ok");
   }
 
   var sb = u.standbyNodes || [];
@@ -884,7 +889,8 @@ function showNodes(u) {
   var sus = u.suspect || [];
   put("n-suspect", sus.length
         ? sus.map(function (s) {
-            return s.family + " until " + clock(new Date(s.until * 1000));
+            return (s.family === "ech" ? "ECH itself (blocked on this network)" : s.family) +
+                   " until " + clock(new Date(s.until * 1000));
           }).join(", ")
         : "none", sus.length ? "warn" : "ok");
 
@@ -902,7 +908,8 @@ function showNodes(u) {
     put("n-list", "no node list - run: vpnchain subscribe", "bad");
   } else {
     var age = (Date.now() / 1000 - (l.fetchedAt || 0)) / 3600;
-    put("n-list", l.count + " nodes in " + l.families + " families, fetched " +
+    put("n-list", l.count + " nodes in " + l.families + " families" +
+          (l.ech ? ", " + l.ech + " with ECH" : "") + ", fetched " +
           (l.fetchedAt ? clock(new Date(l.fetchedAt * 1000)) : "?") +
           " via " + (l.via || "?"),
         // Refreshed about daily; two days means the refresh is failing.

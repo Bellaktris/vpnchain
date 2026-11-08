@@ -492,6 +492,7 @@ def native_upstream(host):
         nodes = {n["tag"]: n for n in doc.get("nodes", [])}
         listing = {"count": len(nodes),
                    "families": len({n.get("family") for n in nodes.values()}),
+                   "ech": sum(1 for n in nodes.values() if n.get("ech")),
                    "fetchedAt": doc.get("fetched_at"), "via": doc.get("via")}
     except (OSError, ValueError, KeyError):
         pass
@@ -505,6 +506,7 @@ def native_upstream(host):
         delays = sorted(st.get("delays") or [])
         return {"tag": tag, "family": n.get("family"), "region": n.get("region"),
                 "reality": n.get("security") == "reality",
+                "ech": bool(n.get("ech")),
                 "delay": delays[len(delays) // 2] if delays else None,
                 "lastOk": st.get("last_ok") or None}
 
@@ -528,6 +530,8 @@ def native_upstream(host):
                 standbys=state.get("standbys", []),
                 active=describe(state.get("active")),
                 standbyNodes=[describe(t) for t in state.get("standbys", [])],
+                # "ech" here is not a family: it is ECH itself set aside, on
+                # a network that blocks it. The page names it as such.
                 suspect=[{"family": fam, "until": until}
                          for fam, until in (state.get("suspect") or {}).items()
                          if until > now],
