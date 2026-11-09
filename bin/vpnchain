@@ -1956,7 +1956,7 @@ keep_out_probe() {
 }
 KEEP_OUT_MUST_PASS=(google.com wikipedia.org github.com 8.8.8.8 1.1.1.1
                     ssl.gstatic.com fonts.googleapis.com www.apple.com
-                    ocsp.apple.com ocsp.pki.goog)
+                    ocsp.apple.com ocsp.pki.goog aliexpress.com lenovo.com)
 
 # Global services the country lists carry because they are also served from
 # inside that country. The CN list holds 21 google.com names and 143 apple.com
@@ -1983,6 +1983,9 @@ KEEP_OUT_SHARED=(
     globalsigncdn.com
     # Vendors' download hosts
     nvidia.com amd.com dell.com jetbrains.com steamcontent.com
+    # Chinese companies' international storefronts, which expect foreign
+    # visitors - unlike their domestic sites, which stay refused
+    aliexpress.com lenovo.com
 )
 
 # Rewrites a geosite .srs in place without KEEP_OUT_SHARED: decompile, drop
