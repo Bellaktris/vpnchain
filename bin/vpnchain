@@ -53,6 +53,9 @@
 #            connections to one server is how such networks find Reality
 #            servers. The incognito browser uses the subscription's Reality
 #            nodes only, never one of your own, whose address is yours alone.
+#            The pilot moves between the Reality nodes every 20-60 minutes,
+#            yours among them, so that no one address carries the whole day;
+#            ROTATE_MINUTES sets the range, or turns it off.
 #
 # Neither chained mode falls back on the other's nodes: when every node of
 # the mode fails, the pilot says so and leaves the choice of switching to
@@ -295,7 +298,13 @@
 #            dead ad server. Unattributable, not undetectable.
 #
 #   setup
-#            one-time preparation. On Linux, Chrome reads policies only from
+#            one-time preparation. First the env file: setup asks for every
+#            value it lacks that has no default right for anyone - the
+#            subscription or upstream proxy, the WireGuard credentials (or a
+#            .conf to import them from), the exit address - offers the
+#            optional EXIT_REGION and SPOOF_TZ, and writes the agent names
+#            and local proxy address without asking. Values already there are
+#            never asked for or changed. On Linux, Chrome reads policies only from
 #            /etc/opt/chrome/policies/managed, so this creates vpnchain.json
 #            there with sudo and makes it yours; no other verb ever needs
 #            root. It also writes the sing-box user unit if there is none.
@@ -356,18 +365,153 @@ set -uo pipefail
 
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/env"
 
+# 'vpnchain setup' fills in what the env file lacks, before anything reads it,
+# so it also works where there is no env file yet. It asks only for what has
+# no value that would be right for anyone - the way out, the WireGuard
+# credentials, the address the chain should present - and writes the names
+# that do have one (the agents, the local proxy) without asking, saying so.
+# Everything else stays optional and is described in the template below.
+env_put() {     # VAR VALUE: appended to the env file, and set for this run
+    printf '%s=%q\n' "$1" "$2" >> "$CONFIG"
+    printf -v "$1" '%s' "$2"
+    env_added=$((env_added + 1))
+}
+env_default() { # VAR VALUE: written without asking, if missing
+    [ -n "${!1:-}" ] && return 0
+    env_put "$1" "$2"
+    printf '  %s=%s (default)\n' "$1" "$2" >&2
+}
+env_ask() {     # VAR PROMPT [hidden] [suggestion]: asked for, if missing
+    local val
+    [ -n "${!1:-}" ] && return 0
+    if [ ! -t 0 ]; then
+        echo "vpnchain setup: $1 is missing - run setup in a terminal to be asked" >&2
+        env_missing=1
+        return 1
+    fi
+    printf '%s%s: ' "$2" "${4:+ [$4]}" >&2
+    if [ "${3:-}" = hidden ]; then read -rs val; echo >&2; else read -r val; fi
+    val=${val:-${4:-}}
+    [ -n "$val" ] || return 1
+    env_put "$1" "$val"
+}
+
+env_optional() { # VAR PROMPT: env_ask, remembering a skip
+    [ -n "${!1:-}" ] && return 0
+    grep -q "^#$1=" "$CONFIG" 2>/dev/null && return 0
+    # Without a terminal there is no one to skip it.
+    [ -t 0 ] || return 0
+    env_ask "$1" "$2" || printf '#%s=\n' "$1" >> "$CONFIG"
+}
+
+# A WireGuard .conf, as the provider hands it out, into the WG_* values.
+wg_import() {
+    local f=$1 addr ep
+    [ -r "$f" ] || { echo "  cannot read $f" >&2; return 1; }
+    # Everything after the first '=': keys are base64 and end in one.
+    wg_field() { awk -v k="$1" '{
+        key = substr($0, 1, index($0, "=") - 1); gsub(/[ \t]/, "", key)
+        if (index($0, "=") && tolower(key) == tolower(k)) {
+            v = substr($0, index($0, "=") + 1); gsub(/^[ \t]+|[ \t\r]+$/, "", v)
+            print v; exit
+        } }' "$f"; }
+    addr=$(wg_field Address | tr ',' '\n' | tr -d ' ' | grep -m1 '\.')
+    [ -n "$addr" ] && [ "${addr#*/}" = "$addr" ] && addr="$addr/32"
+    ep=$(wg_field Endpoint)
+    [ -n "$(wg_field PrivateKey)" ] && [ -n "$addr" ] && [ -n "$(wg_field PublicKey)" ] && [ -n "$ep" ] || {
+        echo "  $f lacks PrivateKey, Address, PublicKey or Endpoint" >&2; return 1; }
+    [ -n "${WG_PRIVATE_KEY:-}" ] || env_put WG_PRIVATE_KEY "$(wg_field PrivateKey)"
+    [ -n "${WG_ADDRESS:-}" ] || env_put WG_ADDRESS "$addr"
+    [ -n "${WG_PEER_PUBLIC_KEY:-}" ] || env_put WG_PEER_PUBLIC_KEY "$(wg_field PublicKey)"
+    [ -n "${WG_PEER_HOST:-}" ] || env_put WG_PEER_HOST "${ep%:*}"
+    [ -n "${WG_PEER_PORT:-}" ] || env_put WG_PEER_PORT "${ep##*:}"
+    [ -n "$(wg_field MTU)" ] && [ -z "${WG_MTU:-}" ] && env_put WG_MTU "$(wg_field MTU)"
+    echo "  imported the WireGuard values from $f" >&2
+}
+
+setup_env() {
+    mkdir -p "$(dirname "$CONFIG")" && ( umask 077 && touch "$CONFIG" ) || return 1
+    # shellcheck source=/dev/null
+    . "$CONFIG"
+    env_added=0 env_missing=0
+    local me prefix wg_missing=0 v conf
+    me=$(id -un)
+    case "$(uname -s)" in (Darwin) prefix="com.$me." ;; (*) prefix="vpnchain-" ;; esac
+
+    # The way out: the provider's subscription, or a proxy run by something else.
+    if [ -z "${SUBSCRIPTION_URL:-}" ] && [ -z "${UPSTREAM_PORT:-}" ]; then
+        if ! env_ask SUBSCRIPTION_URL "Subscription URL (hidden; Enter if an upstream proxy is used instead)" hidden \
+                && [ -t 0 ]; then
+            env_default UPSTREAM_HOST 127.0.0.1
+            env_ask UPSTREAM_PORT "Port of the upstream SOCKS proxy"
+            env_ask UPSTREAM_PROCESS "Process name of the upstream proxy core"
+        fi
+    fi
+
+    # The WireGuard exit: from the provider's .conf when there is one.
+    for v in WG_PRIVATE_KEY WG_ADDRESS WG_PEER_PUBLIC_KEY WG_PEER_HOST WG_PEER_PORT; do
+        [ -z "${!v:-}" ] && wg_missing=1
+    done
+    if [ $wg_missing = 1 ]; then
+        if [ -t 0 ]; then
+            printf 'WireGuard config file to import (Enter to type the values): ' >&2
+            read -r conf
+            [ -n "$conf" ] && wg_import "${conf/#\~/$HOME}"
+        fi
+        env_ask WG_PRIVATE_KEY "WireGuard private key (hidden)" hidden
+        env_ask WG_ADDRESS "WireGuard address, e.g. 10.0.0.2/32"
+        env_ask WG_PEER_PUBLIC_KEY "WireGuard peer public key"
+        env_ask WG_PEER_HOST "WireGuard peer host"
+        env_ask WG_PEER_PORT "WireGuard peer port"
+    fi
+
+    # The peer's address is usually the exit's own, for a dedicated address.
+    case "${WG_PEER_HOST:-}" in
+        (*[!0-9.]*|"") env_ask EXPECTED_EXIT_IP "Address the chain should present" ;;
+        (*) env_ask EXPECTED_EXIT_IP "Address the chain should present" "" "$WG_PEER_HOST" ;;
+    esac
+
+    # Optional, and worth having. Enter skips, and a skip is written down as a
+    # commented-out line - asked once, not at every setup, and the place to
+    # fill it in later.
+    env_optional EXIT_REGION "City of the WireGuard peer, for the pilot's choice of nodes (Enter skips)"
+    env_optional SPOOF_TZ "Time zone the browser should report, e.g. America/Denver (Enter skips)"
+
+    env_default PROXY_HOST 127.0.0.1
+    env_default PROXY_PORT 1080
+    env_default SINGBOX_AGENT "${prefix}singbox"
+    env_default STATUSD_AGENT "${prefix}vpnchain-statusd"
+    [ -n "${SUBSCRIPTION_URL:-}" ] && env_default PILOT_AGENT "${prefix}vpnchain-pilot"
+
+    if [ "$env_added" -gt 0 ]; then
+        echo "  $env_added value(s) written to $CONFIG" >&2
+    elif [ "$env_missing" = 0 ]; then
+        echo "  $CONFIG has every value setup asks for" >&2
+    fi
+    [ "$env_missing" = 0 ]
+}
+[ "${1:-}" = setup ] && { setup_env || exit 1; }
 
 if [ ! -r "$CONFIG" ]; then
     cat >&2 <<EOF
 vpnchain: missing config at $CONFIG
 
-Create it with your site-local values:
+Run 'vpnchain setup' to be asked for the values below, or create it with
+your site-local values:
 
     PROXY_HOST=127.0.0.1
     PROXY_PORT=1080
     EXPECTED_EXIT_IP=<the address the chain should present>
     SINGBOX_AGENT=<launchd label (macOS) or systemd user unit name (Linux)
              of the sing-box agent; written for you if it does not exist>
+
+the WireGuard exit (setup imports them from the provider's .conf file):
+
+    WG_PRIVATE_KEY=<the interface's private key>
+    WG_ADDRESS=<the interface's address, with its prefix, e.g. 10.0.0.2/32>
+    WG_PEER_PUBLIC_KEY=<the peer's public key>
+    WG_PEER_HOST=<the peer's address>
+    WG_PEER_PORT=<the peer's port>
 
 and either the provider's subscription, which sing-box then dials itself:
 
@@ -428,6 +572,9 @@ Optional:
     KEEP_OUT_COUNTRIES=<countries whose sites the pinned browser refuses,
              so they get a separate unproxied browser; default "ru cn ir",
              empty turns it off. Lists come with 'vpnchain get-blocklist'>
+    ROTATE_MINUTES=<chained-reality only: minutes on one Reality node before
+             the pilot moves to another, as a range drawn from afresh each
+             time; default "20-60", "off" to stay put>
     NOTIFY_ALLOW=<space-separated origins allowed to show notifications,
              e.g. "https://mail.example.com https://chat.example.com";
              everything else is blocked>
@@ -2973,7 +3120,7 @@ cmd_browser() {
 # the user's own preference domain.
 cmd_setup() {
     if [ "$OS" = mac ]; then
-        ok "nothing to do on macOS - policies go to the $BROWSER_DOMAIN domain"
+        ok "no policy file on macOS - policies go to the $BROWSER_DOMAIN domain"
         return 0
     fi
     if policy_ready; then

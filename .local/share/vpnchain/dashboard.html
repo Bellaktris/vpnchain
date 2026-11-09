@@ -877,9 +877,13 @@ function showNodes(u) {
     // And in chained mode, a node without ECH: its name is on the wire until
     // the pilot gets back to one with it.
     var plain = !u.active.ech && !u.active.reality && u.list && u.list.ech;
+    // Rotation moves on at a drawn time, later while traffic is heavy.
+    var left = u.rotateAt ? u.rotateAt - Date.now() / 1000 : null;
     put("n-active", nodeText(u.active) +
           (u.trouble ? "\nrecovering - not yet confirmed by a real download" : "") +
-          (plain ? "\nname visible on the wire - back to an ECH node when one answers" : ""),
+          (plain ? "\nname visible on the wire - back to an ECH node when one answers" : "") +
+          (left !== null ? "\nmoves to another node " +
+                           (left > 60 ? "in about " + dur(left) : "shortly") : ""),
         u.trouble || plain ? "warn" : "ok");
   }
 

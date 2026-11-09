@@ -554,6 +554,9 @@ def native_upstream(host):
                          if until > now],
                 outage={"since": outage.get("since"), "rounds": outage.get("rounds")}
                        if outage else None,
+                # When the pilot next moves to another Reality node, if it
+                # rotates at all - only in chained-reality mode.
+                rotateAt=(state.get("rotation") or {}).get("next"),
                 events=(state.get("events") or [])[-10:],
                 list=listing,
                 dns={"current": dns, "preferred": dns_choices[0]})

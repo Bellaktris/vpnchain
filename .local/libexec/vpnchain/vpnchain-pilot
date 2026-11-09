@@ -33,7 +33,10 @@ The priorities, in order, and what each one costs the next:
      Above both come nodes you run yourself (own-nodes.json), in
      chained-reality mode beside the provider's Reality node: their setup
      is yours to get right, so the active node is one of them whenever one
-     answers, and the pilot returns to one as soon as it does.
+     answers, and the pilot returns to one as soon as it does - unless
+     rotation is on, as it is by default: then every Reality node, yours
+     included, takes turns of a random 20 to 60 minutes, so that no one
+     address carries the whole day (see ROTATE_DEFAULT).
 
   3. Latency. Measured through each node, plus the distance from the node to
      the WireGuard peer, which the measurement cannot see - the probe target
@@ -102,6 +105,24 @@ BULK_URLS = ["https://speed.cloudflare.com/__down?bytes=%d" % BULK_BYTES]
 BULK_MIN_BPS = 20000        # below this, a stall rather than a slow line
 BULK_FAILS_TO_SWITCH = 2
 GEO_MS_PER_KM = 0.03        # see geo_ms for how this was measured
+
+# Rotation, in chained-reality mode: a censor that adds up hours and bytes per
+# address sees one user on one server all day, the pattern that gets a server
+# looked at. Moving between the Reality nodes every so often, at random
+# intervals, leaves each address a part of the day - and most of them are the
+# provider's, shared with everyone else on them. ROTATE_MINUTES in the env
+# file ("20-60" by default, "off" to stop) is the range each stay is drawn
+# from. A move costs WireGuard a second or two of reconnecting, so it waits
+# while traffic is heavy - a download, a call - for up to half an hour.
+ROTATE_DEFAULT = "20-60"
+ROTATE_BUSY_BPS = 200000            # both directions, measured between ticks
+ROTATE_POSTPONE = (180, 420)
+ROTATE_MAX_HOLD = 1800
+ROTATE_RETRY = (120, 300)           # after the candidate did not answer
+# Latency leans the choice of the next node, but far less than TAU_MS leans a
+# failover: with that weighting the two fastest nodes would take the whole day
+# between them, which is the opposite of the point.
+ROTATE_TAU_MS = 400
 
 # Inside the node's TLS, so the network never sees which; varied anyway since
 # it costs nothing. All anycast, so each answers from next to the node.
@@ -206,6 +227,11 @@ class Api:
     def select(self, tag):
         self._call("PUT", "/proxies/" + self.selector, {"name": tag})
 
+    def traffic(self):
+        """Bytes through sing-box since it started, both directions."""
+        r = self._call("GET", "/connections")
+        return (r.get("downloadTotal") or 0) + (r.get("uploadTotal") or 0)
+
     def delay(self, tag):
         """Milliseconds through this node, or None if it did not answer."""
         q = urllib.parse.urlencode({"url": random.choice(PROBE_URLS),
@@ -227,6 +253,8 @@ class Pilot:
         self.nodes = {}             # the ones the current mode's selector holds
         self.nodes_mtime = None
         self.api = None
+        self.traffic_seen = None    # (time, bytes) at the previous tick
+        self.busy = False
         self.state = self.load_state()
 
     # --- state -------------------------------------------------------------
@@ -559,7 +587,8 @@ class Pilot:
         plain_pool = not self.reality_mode and any(self.is_ech(t) for t in self.nodes)
         going_plain = plain_pool and not self.is_ech(tag) and not self.state.get("plain")
         self.event("switch", "%s -> %s (%s)" % (old, tag, why),
-                   alert=why not in ("latency", "start", "back to ECH", "back to own node")
+                   alert=why not in ("latency", "start", "back to ECH", "back to own node",
+                                     "rotation")
                    and not going_plain)
         if going_plain:
             self.state["plain"] = True
@@ -741,6 +770,8 @@ class Pilot:
     def recovered(self, tag, why):
         self.switch(tag, why)
         self.state["outage"] = None
+        # A full stay on the node that brought the chain back.
+        self.state.pop("rotation", None)
         self.state["fill_fails"] = 0
         for key in ("outage-subscribe", "outage-ping", "stall-retest", "fill"):
             self.state["due"].pop(key, None)
@@ -795,6 +826,87 @@ class Pilot:
         if tag and self.probe(tag):
             self.state["standbys"] = [t for t in self.state["standbys"] if t != tag]
             self.switch(tag, "back to own node" if self.is_own(tag) else "back to ECH")
+
+    # --- rotation ----------------------------------------------------------
+
+    def rotate_range(self):
+        """Seconds to stay on a node, as (low, high), or None when off."""
+        raw = self.env.get("ROTATE_MINUTES", ROTATE_DEFAULT).strip().lower()
+        if raw in ("", "0", "off", "no"):
+            return None
+        try:
+            lo, _, hi = raw.partition("-")
+            lo, hi = float(lo), float(hi or lo)
+        except ValueError:
+            lo, hi = (float(x) for x in ROTATE_DEFAULT.split("-"))
+        return (min(lo, hi) * 60, max(lo, hi) * 60)
+
+    def rotating(self):
+        """Rotation applies in chained-reality mode with somewhere to go. It
+        replaces the pull back to your own node and the switch on latency
+        alone, which would otherwise undo each move within minutes: your own
+        node takes its turn like the others, and the latency weighting
+        chooses among them."""
+        return (self.reality_mode and self.rotate_range() is not None
+                and len(self.nodes) > 1)
+
+    def sample_traffic(self):
+        """Whether traffic has been heavy since the previous tick."""
+        try:
+            now, total = time.time(), self.api.traffic()
+        except Exception:
+            self.traffic_seen, self.busy = None, False
+            return
+        if self.traffic_seen and total >= self.traffic_seen[1]:
+            dt = max(now - self.traffic_seen[0], 1)
+            self.busy = (total - self.traffic_seen[1]) / dt > ROTATE_BUSY_BPS
+        self.traffic_seen = (now, total)
+
+    def maybe_rotate(self):
+        """Move to another Reality node once the drawn stay is over: probed
+        first, from a family other than the current one where there is one,
+        and weighted towards low latency like every other choice. The node
+        left behind becomes a standby if there is room for its family."""
+        rng = self.rotate_range()
+        rot = self.state.setdefault("rotation", {})
+        now = time.time()
+        if not rot.get("next"):
+            rot["next"] = now + random.uniform(*rng)
+            return
+        if now < rot["next"]:
+            return
+        if self.busy:
+            held = rot.setdefault("held_since", now)
+            if now - held < ROTATE_MAX_HOLD:
+                rot["next"] = now + random.uniform(*ROTATE_POSTPONE)
+                return
+        act = self.state["active"]
+        pool = [t for t in self.nodes if t != act
+                and not self.stalled(t) and not self.suspect(self.family(t))]
+        # Not straight back to the node before this one while there is a
+        # third: two nodes taking turns is barely better than one.
+        onward = [t for t in pool if t != rot.get("prev")] or pool
+        fresh = [t for t in onward if self.family(t) != self.family(act)] or onward
+        tag = self.rotate_pick(fresh)
+        if not tag or not self.probe(tag):
+            rot["next"] = now + random.uniform(*ROTATE_RETRY)
+            return
+        self.switch(tag, "rotation")
+        sb = self.state["standbys"]
+        fams = {self.family(t) for t in [tag, *sb]}
+        if len(sb) < STANDBYS and self.family(act) not in fams:
+            sb.append(act)
+            self.state["due"]["standby:" + act] = now + random.uniform(*STANDBY_EVERY)
+        self.state["rotation"] = {"next": now + random.uniform(*rng), "prev": act}
+
+    def rotate_pick(self, tags):
+        """weighted_pick with the gentler lean of ROTATE_TAU_MS."""
+        if not tags:
+            return None
+        scores = {t: self.score(t) for t in tags}
+        best = min(scores.values())
+        return random.choices(
+            tags, [math.exp(-(scores[t] - best) / ROTATE_TAU_MS) for t in tags])[0]
 
     @staticmethod
     def download(port):
@@ -874,6 +986,7 @@ class Pilot:
             return              # sing-box down or restarting: nothing to steer
         if not self.online():
             return
+        self.sample_traffic()
         self.narrow_to_selector(members)
         if not self.nodes:
             return
@@ -893,6 +1006,7 @@ class Pilot:
             self.state["outage"] = None
             self.state["standbys"] = []
             self.state.pop("trouble", None)
+            self.state.pop("rotation", None)
 
         # Adopt whatever the selector holds - after a restart that is the
         # cached choice, and a manual choice should be respected too.
@@ -913,16 +1027,21 @@ class Pilot:
               and not self.bulk_check()):
             self.failover()
         else:
+            rotating = self.rotating()
             self.fill_standbys()
             for tag in list(self.state["standbys"]):
                 if self.due("standby:" + tag, STANDBY_EVERY) and not self.probe(tag):
                     self.state["standbys"].remove(tag)
                     self.event("standby", "%s dropped" % tag)
-            self.maybe_upgrade()
+            if rotating:
+                self.maybe_rotate()
+            else:
+                self.state.pop("rotation", None)
+                self.maybe_upgrade()
             if self.due("explore", EXPLORE_EVERY):
                 self.explore()
             act = self.state["active"]
-            if (any(self.tier(t) < self.tier(act) for t in self.nodes)
+            if (not rotating and any(self.tier(t) < self.tier(act) for t in self.nodes)
                     and self.due("better-return", (180, 600))):
                 self.better_return()
             if (self.dns_current() != self.dns_choices()[0]
