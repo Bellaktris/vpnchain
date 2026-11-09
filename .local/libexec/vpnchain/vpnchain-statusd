@@ -129,6 +129,48 @@ def exit_through(port):
     return out if re.match(r"^[0-9a-fA-F:.]+$", out or "") else None
 
 
+# DoH endpoints that answer in JSON, by the IPs NODE_DNS lists them under -
+# the same table 'vpnchain' keeps for its ECH probe.
+JSON_DOH = {"1.1.1.1": "https://1.1.1.1/dns-query", "1.0.0.1": "https://1.0.0.1/dns-query",
+            "8.8.8.8": "https://8.8.8.8/resolve", "8.8.4.4": "https://8.8.4.4/resolve"}
+
+
+def is_address(s):
+    return bool(re.match(r"^[0-9.]+$", s)) or ":" in s
+
+
+def expected_exit(port):
+    """EXPECTED_EXIT_IP as (address, name).
+
+    It may name a host instead of giving an address: an exit at home sits on
+    a dynamic address, reached by its dynamic-DNS name, and the address to
+    expect is whatever that name resolves to now. Resolved over DoH through
+    the pinned inbound rather than by the system resolver, which would show
+    the local network a lookup of the home's name at every refresh. Without
+    the inbound there is no address, but the name is still reported, so the
+    page shows what it is waiting for instead of 'not supplied'."""
+    want = env("EXPECTED_EXIT_IP")
+    if not want or is_address(want):
+        return want, None
+    if port is None:
+        return None, want
+    doh = [JSON_DOH[ip] for ip in env("NODE_DNS", "").split() if ip in JSON_DOH] \
+          or list(JSON_DOH.values())[:3:2]
+    for url in doh:
+        out = run(["curl", "-s", "-m", "8", "--socks5-hostname",
+                   "%s:%s" % (env("PROXY_HOST", "127.0.0.1"), port),
+                   "-H", "accept: application/dns-json",
+                   "%s?name=%s&type=A" % (url, want)])
+        try:
+            answers = json.loads(out or "{}").get("Answer") or []
+        except ValueError:
+            continue
+        for a in answers:
+            if a.get("type") == 1:
+                return a.get("data"), want
+    return None, want
+
+
 def singbox_config_path():
     return env("SINGBOX_CONFIG",
                os.path.expanduser("~/.config/sing-box/config.json"))
@@ -582,6 +624,8 @@ def collect():
     if real_address == "auto":
         real_address = None
 
+    expected, expected_name = expected_exit(pinned if pinned_up else None)
+
     return {
         "mode": singbox_mode(),
         # No default: naming a particular upstream here would disclose the
@@ -600,7 +644,9 @@ def collect():
         "blocked": blocked_recent(),
         "hidden": hidden_services(),
         "exits": {
-            "expected": env("EXPECTED_EXIT_IP"),
+            "expected": expected,
+            # The dynamic-DNS name it was resolved from, when it was one.
+            "expectedName": expected_name,
             # Measured, not pattern-matched: the upstream exit rotates with the
             # node, so a prefix would go stale.
             "pinned": exit_through(pinned) if pinned_up else None,

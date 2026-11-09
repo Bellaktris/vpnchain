@@ -480,11 +480,9 @@ setup_env() {
         env_ask WG_PEER_PORT "WireGuard peer port"
     fi
 
-    # The peer's address is usually the exit's own, for a dedicated address.
-    case "${WG_PEER_HOST:-}" in
-        (*[!0-9.]*|"") env_ask EXPECTED_EXIT_IP "Address the chain should present" ;;
-        (*) env_ask EXPECTED_EXIT_IP "Address the chain should present" "" "$WG_PEER_HOST" ;;
-    esac
+    # The peer's address is usually the exit's own, for a dedicated address -
+    # and for an exit at home its dynamic-DNS name is, so a name is offered too.
+    env_ask EXPECTED_EXIT_IP "Address (or dynamic-DNS name) the chain should present" "" "${WG_PEER_HOST:-}"
 
     # Optional, and worth having. Enter skips, and a skip is written down as a
     # commented-out line - asked once, not at every setup, and the place to
@@ -516,7 +514,9 @@ your site-local values:
 
     PROXY_HOST=127.0.0.1
     PROXY_PORT=1080
-    EXPECTED_EXIT_IP=<the address the chain should present>
+    EXPECTED_EXIT_IP=<the address the chain should present, or a dynamic-DNS
+             name for an exit on a changing address (an exit at home); a
+             name is resolved over DoH through the chain at each check>
     SINGBOX_AGENT=<launchd label (macOS) or systemd user unit name (Linux)
              of the sing-box agent; written for you if it does not exist>
 
@@ -2979,7 +2979,7 @@ launch_incognito() {
     # The fragment rather than the server's copy, so the check survives a
     # status server that is down, and so REAL_ADDRESS=auto - which only this
     # launch knows the answer to - reaches the page at all.
-    local dash real frag=
+    local dash real expect frag=
     real=$(real_address)
     if [ -n "$real" ]; then
         frag="#real=$real"
@@ -3001,8 +3001,23 @@ launch_incognito() {
     else
         # No server configured, so the page cannot be served and cannot read
         # host status either. The expectation has to come from the fragment,
-        # and the Chain section will be empty.
-        dash="file://$DASHBOARD_PAGE#expect=$EXPECTED_EXIT_IP${frag:+&real=$real}"
+        # and the Chain section will be empty. A dynamic-DNS name is resolved
+        # first, over DoH through the pinned inbound as the server would -
+        # the page compares addresses, and the local resolver must not see
+        # the home's name looked up.
+        expect=$EXPECTED_EXIT_IP
+        case "$expect" in
+            (*:*|"") ;;
+            (*[!0-9.]*)
+                expect=$(curl -s -m 8 --socks5-hostname "$PROXY_HOST:$PROXY_PORT" \
+                        -H 'accept: application/dns-json' \
+                        "https://1.1.1.1/dns-query?name=$expect&type=A" |
+                    python3 -c 'import json, sys
+print(next((a["data"] for a in json.load(sys.stdin).get("Answer") or [] if a.get("type") == 1), ""))' \
+                    2>/dev/null)
+                [ -n "$expect" ] || warn "could not resolve $EXPECTED_EXIT_IP - the startup page has no exit to expect" ;;
+        esac
+        dash="file://$DASHBOARD_PAGE#expect=$expect${frag:+&real=$real}"
         warn "no STATUSD_AGENT - the startup page cannot show host-side status"
     fi
 

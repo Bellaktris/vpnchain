@@ -399,6 +399,13 @@ function effectiveExpected() {
   return (hostData && hostData.exits && hostData.exits.expected) || null;
 }
 
+// The dynamic-DNS name the server resolved the expectation from, if any - an
+// exit at home is configured by name, since its address changes.
+function expectedName() {
+  if (expectedFragment) return null;
+  return (hostData && hostData.exits && hostData.exits.expectedName) || null;
+}
+
 // The incognito instance exits elsewhere on purpose and its address rotates
 // with the upstream node, so this is MEASURED by the server rather than
 // pattern-matched. Without it the page cries "wrong exit" at a browser
@@ -1141,7 +1148,9 @@ function conclude() {
             : real ? "warn"
             : sameNetwork(findings.exitIp, inc) ? "warn" : "bad";
     if (findings.exitIp) put("exit-ip", findings.exitIp, cls);
-    put("exit-expect", exp || "not supplied", exp ? cls : "pend");
+    var name = expectedName();
+    put("exit-expect", name ? name + (exp ? " (" + exp + ")" : " - not resolved") : exp || "not supplied",
+        exp ? cls : name ? "bad" : "pend");
   }
 
   // Exit. An unmeasured exit is a failure, never a pass - concluding from a
@@ -1152,6 +1161,12 @@ function conclude() {
   } else if (!findings.exitIp) {
     checks.push({ state: "fail", label: "Exit address",
                   detail: "could not be determined" });
+  } else if (!exp && expectedName()) {
+    // Expected by name, and the name did not resolve - the pinned inbound is
+    // down or every DoH server failed. Not a pass: nothing was compared.
+    checks.push({ state: "warn", label: "Exit address",
+                  detail: findings.exitIp + " - could not resolve " + expectedName()
+                          + " to compare against" });
   } else if (!exp && !inc) {
     checks.push({ state: "warn", label: "Exit address",
                   detail: findings.exitIp + " - nothing to compare against" });
