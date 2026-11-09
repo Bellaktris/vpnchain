@@ -71,6 +71,37 @@
 # Omit it to keep whatever the config already has; the dashboard reports the
 # active mode, so there is no separate command to query it.
 #
+#   home [learn]
+#            whether this machine is behind the home router, judged by the
+#            default gateway's hardware address against HOME_GATEWAY_MAC -
+#            the ARP cache only, so nothing leaves the local network to find
+#            out. When the exit is at home, the chain could only carry the
+#            pinned traffic out to a node and back in through the front door,
+#            and direct mode would need the router to hairpin, which few home
+#            routers do. So at home the pinned browser and its DNS reach the
+#            exit over the home network instead - a second WireGuard profile,
+#            dialled at the exit's LAN address, HOME_WG_HOST - in every mode.
+#            The mode itself is kept and is back in use on leaving. The
+#            incognito browser and the shared port are untouched - they exist
+#            to leave by somewhere else.
+#
+#            Both routes are in the config all the time, behind a selector
+#            named "exit", and the pilot moves it: it watches the routing
+#            table, so losing the home network's default route switches to
+#            the chain before the next network is even joined, and checks
+#            again at every look at the state in case a change went unseen.
+#            Nothing is regenerated or restarted. Without the pilot the
+#            selector stays where it was.
+#
+#            Never a way straight out. Away from home the LAN address is
+#            nobody's or a stranger's, where no handshake completes without
+#            the exit's key, so a selector left on the home route stalls the
+#            pinned browser and cannot put it on the network it is on. The
+#            same goes for a network whose router copies your router's
+#            hardware address, which is taken for home.
+#
+#            'learn' records the current gateway as home.
+#
 #   browser [with-webrtc] [with-cookies]
 #            quit and relaunch the PINNED browser from this shell with
 #            SPOOF_TZ and the WebRTC policy applied. Both are read only at
@@ -555,6 +586,16 @@ Optional:
              'vpnchain browser'
     INCOGNITO_PORT=<sing-box inbound that bypasses the WireGuard endpoint,
              default 1081; must exist in SINGBOX_CONFIG>
+    HOME_GATEWAY_MAC=<hardware address of the home router, recorded by
+             'vpnchain home learn'; behind it the pinned browser reaches the
+             exit over the home network instead of through the chain>
+    HOME_WG_HOST=<the exit's address on the home LAN, e.g. 192.168.0.50 -
+             reserve it in the router so it stays put; same port and peer
+             key as WG_*>
+    HOME_WG_PRIVATE_KEY=<the home route's own WireGuard profile on the exit:
+    HOME_WG_ADDRESS=     its private key and interface address. Its own, not
+             the tunnel's - with one key the exit would follow whichever
+             route spoke last. Without all three, there is no home route>
     REAL_ADDRESS=auto (the default), a fixed address, or "off"
              The address this machine presents with no proxy, which is how
              the dashboard names the one failure it otherwise cannot see: a
@@ -1452,6 +1493,84 @@ elif wg.get("detour") == "reality":
 else:
     print("chained" if wg.get("detour") else "direct")
 PY
+}
+
+# The default gateway's hardware address, lower-case with two digits per
+# octet, or nothing. Read from the ARP cache, so nothing leaves the local
+# network to ask - after one ping to the gateway when the cache has no entry
+# yet, as it may not just after joining a network.
+gateway_mac() {
+    local gw= mac= try o out=
+    for try in 1 2; do
+        if [ "$OS" = mac ]; then
+            gw=$(route -n get default 2>/dev/null | awk '/gateway:/ {print $2; exit}')
+            [ -n "$gw" ] && mac=$(arp -n "$gw" 2>/dev/null | awk '{print $4; exit}')
+        else
+            gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+            [ -n "$gw" ] && mac=$(ip neigh show "$gw" 2>/dev/null |
+                awk '{for (i = 1; i < NF; i++) if ($i == "lladdr") {print $(i + 1); exit}}')
+        fi
+        case "$mac" in (*:*:*:*:*:*) break ;; esac
+        mac=
+        [ -n "$gw" ] && [ "$try" = 1 ] || return 0
+        if [ "$OS" = mac ]; then ping -c 1 -t 1 "$gw"; else ping -c 1 -W 1 "$gw"; fi >/dev/null 2>&1
+    done
+    # macOS prints 0:1a:... - padded here so the comparison is exact.
+    local IFS=:
+    for o in $mac; do out+=$(printf '%02x' "0x$o"):; done
+    printf '%s\n' "${out%:}"
+}
+
+# The home route exists only when all of it is set: the exit's LAN address
+# and the second WireGuard profile the home endpoint dials it with.
+home_configured() {
+    [ -n "${HOME_WG_HOST:-}" ] && [ -n "${HOME_WG_PRIVATE_KEY:-}" ] &&
+        [ -n "${HOME_WG_ADDRESS:-}" ]
+}
+
+# True behind the home router, which is where the exit is.
+at_home() {
+    [ -n "${HOME_GATEWAY_MAC:-}" ] && home_configured || return 1
+    [ "$(gateway_mac)" = "$(printf '%s' "$HOME_GATEWAY_MAC" | tr 'A-F' 'a-f')" ]
+}
+
+cmd_home() {
+    case "${1:-}" in
+        ("")
+            if ! home_configured; then
+                warn "no home route - set HOME_WG_HOST, HOME_WG_PRIVATE_KEY and"
+                warn "HOME_WG_ADDRESS, then: vpnchain reload"
+            elif [ -z "${HOME_GATEWAY_MAC:-}" ]; then
+                warn "no HOME_GATEWAY_MAC - record it from home with: vpnchain home learn"
+            elif at_home; then
+                ok "at home, behind $HOME_GATEWAY_MAC - the pilot sends the pinned"
+                ok "browser to the exit over the home network"
+            else
+                ok "away from home - the gateway is not $HOME_GATEWAY_MAC; the pilot"
+                ok "keeps the pinned browser on the $(singbox_mode) chain"
+            fi
+            ;;
+        (learn)
+            local mac
+            mac=$(gateway_mac)
+            if [ -z "$mac" ]; then
+                bad "could not read the default gateway's hardware address"
+                exit 1
+            fi
+            # Replaced in place when present, commented out or not, so a
+            # new router means running this again rather than editing.
+            if grep -q '^#\{0,1\}HOME_GATEWAY_MAC=' "$CONFIG"; then
+                sed -i.bak -E "s|^#?HOME_GATEWAY_MAC=.*|HOME_GATEWAY_MAC=$mac|" "$CONFIG" &&
+                    rm -f "$CONFIG.bak"
+            else
+                printf 'HOME_GATEWAY_MAC=%s\n' "$mac" >> "$CONFIG"
+            fi
+            ok "home is the network behind $mac - the pilot reads it at its next look"
+            ;;
+        # For the pilot: the answer as an exit status, and nothing printed.
+        (test) at_home ;;
+        (*) echo "usage: vpnchain home [learn]" >&2; exit 1 ;;
+    esac
 }
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
@@ -2567,6 +2686,8 @@ generate_config() {
     KEEP_OUT="$KEEP_OUT_COUNTRIES" KEEP_OUT_DIR="$KEEP_OUT_DIR" \
     KEEP_OUT_TLDS="$(for cc in $KEEP_OUT_COUNTRIES; do keep_out_tlds "$cc"; done)" \
     TOR_PORT="$TOR_PORT" I2P_PORT="$I2P_PORT" \
+    HOME_WG_HOST="${HOME_WG_HOST:-}" HOME_WG_PRIVATE_KEY="${HOME_WG_PRIVATE_KEY:-}" \
+    HOME_WG_ADDRESS="${HOME_WG_ADDRESS:-}" \
     OUT="$out" \
     python3 - <<'PY' || { restore_config_backup; bad "generation failed"; exit 1; }
 import json, os
@@ -2879,6 +3000,38 @@ if nodes:
     cfg["dns"]["rules"].insert(0, {
         "domain": sorted({n["server"] for n in nodes}),
         "server": cfg["route"]["default_domain_resolver"]})
+
+# The home route, when it is configured: a second WireGuard endpoint to the
+# same exit, dialled at its address on the home LAN with a profile of its
+# own, and a selector between it and the tunnel that the pinned traffic and
+# its lookups go through. The pilot moves the selector as this machine comes
+# and goes - see 'home' in the header - so a move changes nothing here.
+#
+# Never a way straight out. Away from home the LAN address is nobody's or a
+# stranger's, where no handshake completes without the exit's key, so a
+# selector left on "home" stalls the pinned browser and cannot put it on the
+# network it is on. A profile of its own, not the tunnel's: with one key, the
+# exit would follow whichever endpoint spoke last and the two would take the
+# session from each other. No keepalive, since a LAN holds nothing open and
+# away from home it would only knock on a stranger's address.
+#
+# The tunnel is untouched, so the mode still reads back from it, and the
+# incognito and shared inbounds keep leaving by the upstream.
+if e.get("HOME_WG_HOST") and e.get("HOME_WG_PRIVATE_KEY") and e.get("HOME_WG_ADDRESS"):
+    home = json.loads(json.dumps(wg))
+    home["tag"] = "home"
+    home.pop("detour", None)
+    home["private_key"] = e["HOME_WG_PRIVATE_KEY"]
+    home["address"] = [e["HOME_WG_ADDRESS"]]
+    home["peers"][0]["address"] = e["HOME_WG_HOST"]
+    home["peers"][0].pop("persistent_keepalive_interval", None)
+    cfg["endpoints"].append(home)
+    cfg["outbounds"].append(
+        {"type": "selector", "tag": "exit", "outbounds": ["tunnel", "home"],
+         "default": "tunnel", "interrupt_exist_connections": True})
+    cfg["route"]["final"] = "exit"
+    next(s for s in cfg["dns"]["servers"]
+         if s["tag"] == "tunnel-dns")["detour"] = "exit"
 
 out = e["OUT"]
 with open(out, "w") as f:
@@ -3446,11 +3599,13 @@ case "${1:-status}" in
     reload)  refuse_if_port_blocked
              cmd_config >/dev/null && agent_restart "$SINGBOX_AGENT" "$PLIST" &&
                  ok "sing-box reloaded" ;;
+    home)    cmd_home "${2:-}" ;;
     setup)   cmd_setup ;;
     ssh-reality) shift; cmd_ssh_reality "$@" ;;
     *)
         echo "usage: vpnchain {start|restart} [chained|chained-reality|direct]"
         echo "       vpnchain {stop|reload}"
+        echo "       vpnchain home [learn]"
         echo "       vpnchain browser [with-webrtc] [with-cookies]"
         echo "       vpnchain browser incognito"
         echo "       vpnchain i2p [start|stop|status]"

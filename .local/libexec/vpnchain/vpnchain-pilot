@@ -55,9 +55,11 @@ import json
 import math
 import os
 import random
+import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -968,6 +970,54 @@ class Pilot:
     def stalled(self, tag):
         return self.stat(tag).get("slow_until", 0) > time.time()
 
+    def follow_home(self):
+        """Point the "exit" selector at the home route behind the home router
+        and at the tunnel everywhere else. 'vpnchain home test' answers from
+        the ARP cache; the selector is moved only when it disagrees, and
+        configs without a home route have no selector to move."""
+        try:
+            now = self.api._call("GET", "/proxies/exit")["now"]
+        except Exception:
+            return              # no home route configured, or sing-box down
+        try:
+            home = subprocess.run([VPNCHAIN, "home", "test"],
+                                  capture_output=True, timeout=30).returncode == 0
+        except Exception as e:
+            log("home test failed to run: %r" % e)
+            return
+        want = "home" if home else "tunnel"
+        self.state["home"] = now == "home"
+        if now == want:
+            return
+        try:
+            self.api._call("PUT", "/proxies/exit", {"name": want})
+        except Exception as e:
+            self.event("home", "could not move the exit selector: %r" % e, alert=True)
+            return
+        self.state["home"] = home
+        self.event("home", "at home - the pinned browser reaches the exit over the home network"
+                   if home else "away from home - the pinned browser is back on the chain")
+
+    def watch_routes(self):
+        """Wake the loop when the default route changes. The routing table
+        is read, never the network: 'route -n monitor' on macOS, 'ip monitor
+        route' on Linux, both streaming the kernel's own announcements. Only
+        lines naming the default route count - the stream also carries every
+        ARP entry - and losing it is what matters most: it goes with the
+        home network, before the next one is joined."""
+        cmd = ["route", "-n", "monitor"] if sys.platform == "darwin" \
+            else ["ip", "monitor", "route"]
+        while True:
+            try:
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, text=True)
+                for line in p.stdout:
+                    if re.search(r"\bdefault\b", line):
+                        self.wake.set()
+            except Exception as e:
+                log("route watch failed: %r" % e)
+            time.sleep(5)       # the monitor exited: start it again
+
     def subscribe(self):
         try:
             p = subprocess.run([VPNCHAIN, "subscribe"],
@@ -981,6 +1031,7 @@ class Pilot:
 
     def tick(self):
         self.refresh_inputs()
+        self.follow_home()
         if not self.nodes:
             return
         try:
@@ -1057,13 +1108,19 @@ class Pilot:
 
     def run(self):
         log("vpnchain-pilot started")
+        self.wake = threading.Event()
+        threading.Thread(target=self.watch_routes, daemon=True).start()
         while True:
             try:
                 self.tick()
             except Exception as e:
                 log("tick failed: %r" % e)
             self.save_state()
-            time.sleep(random.uniform(*TICK))
+            # A route change cuts the wait short. Changing networks comes as
+            # a burst of them, so the burst is let settle before looking.
+            if self.wake.wait(random.uniform(*TICK)):
+                time.sleep(2)
+                self.wake.clear()
 
 
 if __name__ == "__main__":

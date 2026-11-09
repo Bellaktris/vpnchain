@@ -71,5 +71,13 @@ them from the provider's `.conf` - and the exit address.
 - `direct`: WireGuard straight to the peer. Simplest, and plainly a VPN on
   the wire.
 
+With the exit at home, give it a second WireGuard profile for the home route
+(`HOME_WG_HOST`, `HOME_WG_PRIVATE_KEY`, `HOME_WG_ADDRESS`) and run
+`vpnchain home learn` once from there. Behind the home router the pilot then
+sends the pinned browser to the exit over the home network, in whichever
+mode is set, and back onto the chain the moment the home network goes -
+nothing needs switching by hand, and nothing is restarted. The home route
+is WireGuard too, so a late switch stalls; it never leaks.
+
 `vpnchain` with no arguments lists the verbs; the header of `bin/vpnchain`
 explains each.

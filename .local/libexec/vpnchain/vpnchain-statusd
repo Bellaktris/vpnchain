@@ -413,6 +413,18 @@ def singbox_mode():
     return "chained" if wg.get("detour") else "direct"
 
 
+def home_route():
+    """Whether the pinned browser is on the home route - reaching the exit
+    over the home network while the mode waits for the next move away. The
+    pilot moves the selector and records where it left it; read from its
+    state file for the same reason as the node, the Clash API's secret."""
+    try:
+        with open(os.path.join(os.path.dirname(CONFIG), "pilot.json")) as f:
+            return bool(json.load(f).get("home"))
+    except (OSError, ValueError):
+        return False
+
+
 def selector_size():
     """How many nodes the current mode can choose between - one, in
     chained-reality mode with a single Reality node, which makes having no
@@ -628,6 +640,7 @@ def collect():
 
     return {
         "mode": singbox_mode(),
+        "home": home_route(),
         # No default: naming a particular upstream here would disclose the
         # stack in a public repo, and the env file always supplies it.
         "upstream": native_upstream(host) if env("SUBSCRIPTION_URL") else

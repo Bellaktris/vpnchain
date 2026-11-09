@@ -672,7 +672,10 @@ function checkHost() {
     })
     .then(function (d) {
       hostData = d;
-      put("h-mode", d.mode || "unknown", d.mode ? "" : "warn");
+      // At home the mode is kept but not in use: the pinned browser reaches
+      // the exit over the home network until the next move away.
+      put("h-mode", (d.mode || "unknown") + (d.home ? " - at home, over the LAN" : ""),
+          d.mode ? "" : "warn");
 
       var u = d.upstream || {};
       if (u.native) {
@@ -1291,7 +1294,10 @@ function conclude() {
                     detail: "links up, but no pilot - a failed node stays failed" });
     } else {
       checks.push({ state: "pass", label: "Chain",
-                    detail: (hostData.mode || "?") + " mode, all links up" });
+                    detail: hostData.home
+                            ? "at home - the pinned browser reaches the exit over the LAN; "
+                              + (hostData.mode || "?") + " mode resumes on leaving"
+                            : (hostData.mode || "?") + " mode, all links up" });
     }
   }
 
