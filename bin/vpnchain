@@ -2086,6 +2086,16 @@ notify() {
 # over plain UDP the tunnel's long random-looking query names are there for
 # any DPI box to read, while over DoH they are inside the resolver's TLS.
 #
+# The one exception is the dnstt-udp route, tried after Tor and before the
+# direct fetch: plain DNS through the system's own resolver, which forwards
+# the queries to the tunnel's nameserver. It is for whitelist shutdowns,
+# where no foreign TLS gets out but the ISP's resolver still recurses. The
+# network then sees, and its resolver logs, a burst of tunnel queries under
+# the provider's domain - no more than the direct fetch after it would show,
+# and only ever once everything quieter has failed. The system resolver
+# rather than a public one on port 53, which censors commonly redirect and
+# which is odd traffic in itself.
+#
 # Resolvers are tried by the tier in their note (T<n>, as the provider grades
 # them): large global ones first, whose traffic a tunnel can hide in and
 # which do not throttle it; small independent ones next, which a censor may
@@ -2106,29 +2116,61 @@ dnstt_available() {
     grep -q '^server .* socks' "$DNSTT_LIST" 2>/dev/null && [ -n "$(dnstt_bin)" ]
 }
 
-# dnstt_fetch OUT - one attempt per DNSTT_TIERS entry, each with a different
-# server key where the list allows (two domains with one key are one server
-# under two names) and a resolver drawn at random from that entry's tiers, so
-# no two fetches look alike to a resolver.
+# The system's first resolver as host:port for dnstt-client -udp, brackets
+# around an IPv6 address. On Linux that may be systemd-resolved's stub,
+# which forwards to the network's resolver all the same.
+system_resolver() {
+    local ns
+    if [ "$OS" = mac ]; then
+        ns=$(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/ { print $3; exit }')
+    else
+        ns=$(awk '$1 == "nameserver" { print $2; exit }' /etc/resolv.conf 2>/dev/null)
+    fi
+    ns="${ns%%\%*}"   # an IPv6 zone index, which dnstt-client does not take
+    [ -n "$ns" ] || return 1
+    case "$ns" in
+        (*:*) echo "[$ns]:53" ;;
+        (*)   echo "$ns:53" ;;
+    esac
+}
+
+# dnstt_fetch OUT [udp] - over DoH, one attempt per DNSTT_TIERS entry, each
+# with a different server key where the list allows (two domains with one key
+# are one server under two names) and a resolver drawn at random from that
+# entry's tiers, so no two fetches look alike to a resolver. With udp, a
+# single attempt through the system resolver, kept short so a dead tunnel
+# does not hold up the direct fetch after it.
 dnstt_fetch() {
-    local out="$1" bin region domain key doh port pid i
+    local out="$1" transport="${2:-doh}" bin region domain key via port pid i limit=120 udp=
     bin=$(dnstt_bin)
-    while read -r region domain key doh; do
+    if [ "$transport" = udp ]; then
+        udp=$(system_resolver) || { warn "dnstt: no system resolver found"; return 1; }
+        limit=60
+    fi
+    while read -r region domain key via; do
         port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
-        "$bin" -doh "$doh" -pubkey "$key" "$domain" "127.0.0.1:$port" >/dev/null 2>&1 &
+        "$bin" "-$transport" "$via" -pubkey "$key" "$domain" "127.0.0.1:$port" >/dev/null 2>&1 &
         pid=$!
         i=0
         while [ "$i" -lt 20 ] && ! port_listening 127.0.0.1 "$port"; do
             sleep 0.25; i=$((i + 1))
         done
-        ok "dnstt: trying the $region server (DoH, slow - up to two minutes)"
-        if curl -fsS -m 120 --socks5-hostname "127.0.0.1:$port" \
+        if [ "$transport" = udp ]; then
+            ok "dnstt: trying the $region server (plain DNS via $via, slow - up to a minute)"
+        else
+            ok "dnstt: trying the $region server (DoH, slow - up to two minutes)"
+        fi
+        if curl -fsS -m "$limit" --socks5-hostname "127.0.0.1:$port" \
                 -o "$out" "$SUBSCRIPTION_URL" 2>/dev/null && [ -s "$out" ]; then
             kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
             return 0
         fi
         kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-    done < <(python3 - "$DNSTT_LIST" $DNSTT_TIERS <<'PY'
+    done < <(if [ -n "$udp" ]; then
+                 python3 - "$DNSTT_LIST" udp "$udp"
+             else
+                 python3 - "$DNSTT_LIST" $DNSTT_TIERS
+             fi <<'PY'
 import random, re, sys
 servers, resolvers = [], []
 for line in open(sys.argv[1]):
@@ -2138,9 +2180,13 @@ for line in open(sys.argv[1]):
     elif len(f) >= 3 and f[0] == "resolver" and f[1] == "doh":
         tier = re.search(r"/(T\d+)\b", f[3] if len(f) > 3 else "")
         resolvers.append((f[2], tier.group(1) if tier else "T?"))
-if not servers or not resolvers:
+udp = sys.argv[2] == "udp"
+if not servers or not (resolvers or udp):
     sys.exit()
 random.shuffle(servers)
+if udp:
+    print(*servers[0], sys.argv[3])
+    sys.exit()
 # Distinct keys first: a second name for a server that just failed is the
 # same server failing again.
 seen, first, rest = set(), [], []
@@ -2174,6 +2220,10 @@ PY
 #   tor     for when no node works, which is also when a fresh list matters
 #           most. Hides the provider's name from the network at the cost of
 #           Tor's own visibility, which it has anyway.
+#   dnstt-udp  the same tunnel as plain DNS through the system resolver,
+#           for whitelist shutdowns where nothing foreign gets out but local
+#           DNS still recurses. Shows the network a DNS tunnel, and its
+#           resolver logs the tunnel's name - see dnstt_fetch.
 #   direct  the last resort: the provider's name in plain sight. Taken
 #           automatically, because a chain that cannot repair itself without
 #           someone noticing is worse than one that shows the network once
@@ -2192,13 +2242,18 @@ cmd_subscribe() {
     local tmp raw route via= args
     tmp=$(temp_dir vpnchain-sub) || exit 1
     raw="$tmp/raw"
-    for route in chain dnstt tor direct; do
+    for route in chain dnstt tor dnstt-udp direct; do
         case "$route" in
             (chain)  port_listening 127.0.0.1 "$SHARED_PORT" || continue
                      args=(--socks5-hostname "127.0.0.1:$SHARED_PORT") ;;
             (dnstt)  dnstt_available || continue
                      if dnstt_fetch "$raw"; then via=dnstt; break; fi
                      warn "fetch via dnstt failed"
+                     continue ;;
+            (dnstt-udp)
+                     dnstt_available || continue
+                     if dnstt_fetch "$raw" udp; then via=dnstt-udp; break; fi
+                     warn "fetch via dnstt-udp failed"
                      continue ;;
             (tor)    [ -n "$TOR_PORT" ] && port_listening 127.0.0.1 "$TOR_PORT" || continue
                      args=(--socks5-hostname "127.0.0.1:$TOR_PORT") ;;
@@ -2220,6 +2275,7 @@ cmd_subscribe() {
     fi
     ok "fetched via $via"
     [ "$via" = direct ] && notify "Node list fetched directly - no proxied route worked"
+    [ "$via" = dnstt-udp ] && notify "Node list fetched over a plain-DNS tunnel - no quieter route worked"
 
     local summary rc
     summary=$(NODE_DNS="$NODE_DNS" OWN_NODES="$OWN_NODES_FILE" \

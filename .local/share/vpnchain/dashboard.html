@@ -926,7 +926,7 @@ function showNodes(u) {
           " via " + (l.via || "?"),
         // Refreshed about daily; two days means the refresh is failing.
         // Fetched directly means every proxied route was down at the time.
-        age > 48 ? "warn" : (l.via === "direct" ? "warn" : "ok"));
+        age > 48 ? "warn" : (l.via === "direct" || l.via === "dnstt-udp" ? "warn" : "ok"));
   }
 
   // Newest first, one per line. Coloured by the newest only: older trouble
