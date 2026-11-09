@@ -41,8 +41,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-PAGE = os.path.join(HERE, "vpnchain-dashboard.html")
+# This file sits in .local/libexec/vpnchain of the vpnchain tree, the page in
+# .local/share/vpnchain; found from the real file, so a link to this one works.
+ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", ".."))
+PAGE = os.path.join(ROOT, ".local", "share", "vpnchain", "dashboard.html")
 CONFIG = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
     "vpnchain", "env")

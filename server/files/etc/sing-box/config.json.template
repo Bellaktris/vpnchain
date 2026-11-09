@@ -1,0 +1,90 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "reality-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "name": "owner-mux",
+          "uuid": "@OWNER_UUID@"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "@HOST@",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "127.0.0.1",
+            "server_port": 8443
+          },
+          "private_key": "@REALITY_PRIVATE_KEY@",
+          "short_id": [
+            "@OWNER_SHORT_ID@"
+          ]
+        }
+      },
+      "multiplex": {
+        "enabled": true,
+        "padding": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "auth_user": [
+          "owner-mux"
+        ],
+        "invert": true,
+        "action": "sniff"
+      },
+      {
+        "protocol": [
+          "bittorrent"
+        ],
+        "action": "reject"
+      },
+      {
+        "auth_user": [
+          "owner-mux"
+        ],
+        "invert": true,
+        "action": "resolve"
+      },
+      {
+        "type": "logical",
+        "mode": "and",
+        "action": "reject",
+        "rules": [
+          {
+            "auth_user": [
+              "owner-mux"
+            ],
+            "invert": true
+          },
+          {
+            "ip_is_private": true,
+            "ip_cidr": [
+              "127.0.0.0/8",
+              "::1/128",
+              "@IPV4@/32",
+              "@IPV6_PREFIX@"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

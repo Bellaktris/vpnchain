@@ -1,0 +1,2 @@
+// See /usr/local/sbin/sing-box-guard.
+DPkg::Post-Invoke { "[ -x /usr/local/sbin/sing-box-guard ] && /usr/local/sbin/sing-box-guard || true"; };

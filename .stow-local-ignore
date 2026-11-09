@@ -1,0 +1,20 @@
+# A package's own list replaces stow's built-in one, so that is repeated
+# here, followed by what in this repo is not meant for $HOME.
+RCS
+.+,v
+CVS
+\.\#.+
+\.cvsignore
+\.svn
+_darcs
+\.hg
+\.git
+\.gitignore
+\.gitmodules
+.+~
+\#.*\#
+^/README.*
+^/LICENSE.*
+^/COPYING
+^/server
+^/\.stow-local-ignore

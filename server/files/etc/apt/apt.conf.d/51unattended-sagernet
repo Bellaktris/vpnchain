@@ -1,0 +1,2 @@
+// sing-box from its own signed repository, updated nightly with the rest.
+Unattended-Upgrade::Origins-Pattern { "origin=sagernet_apt_fury_io"; };

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Run by apt after every dpkg run (DPkg::Post-Invoke). The service runs a
+# known-good copy of sing-box, not /usr/bin/sing-box: a new release is only
+# taken once it accepts the live config, and put back if it will not stay up.
+# Upgrades stay unattended; one that breaks the config cannot take the node
+# down. A refusal is left in HELD and shown at login.
+NEW=${SING_BOX_NEW:-/usr/bin/sing-box}
+GOOD=/usr/local/lib/sing-box-guard/sing-box
+HELD=/var/lib/sing-box-guard/held
+log() { logger -t sing-box-guard "$*"; echo "sing-box-guard: $*"; }
+
+[ -x "$NEW" ] || exit 0
+cmp -s "$NEW" "$GOOD" && exit 0
+ver() { "$1" version 2>/dev/null | head -1 | awk "{print \$3}"; }
+
+if [ ! -x "$GOOD" ]; then
+    install -m 755 "$NEW" "$GOOD"; rm -f "$HELD"
+    log "seeded with $(ver "$GOOD")"; exit 0
+fi
+if ! out=$("$NEW" check -C /etc/sing-box 2>&1); then
+    printf "%s rejects the config, %s kept running:\n%s\n" "$(ver "$NEW")" "$(ver "$GOOD")" "$out" > "$HELD"
+    log "held at $(ver "$GOOD"): $(ver "$NEW") rejects the config"; exit 0
+fi
+cp -p "$GOOD" "$GOOD.prev"
+install -m 755 "$NEW" "$GOOD.tmp" && mv -f "$GOOD.tmp" "$GOOD"
+systemctl restart sing-box; sleep 5
+if systemctl is-active -q sing-box; then
+    rm -f "$GOOD.prev" "$HELD"; log "now running $(ver "$GOOD")"
+else
+    mv -f "$GOOD.prev" "$GOOD"; systemctl restart sing-box
+    printf "%s passed check but would not stay up; %s restored\n" "$(ver "$NEW")" "$(ver "$GOOD")" > "$HELD"
+    log "rolled back to $(ver "$GOOD"): $(ver "$NEW") would not stay up"
+fi

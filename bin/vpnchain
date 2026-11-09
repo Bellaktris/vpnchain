@@ -338,11 +338,11 @@
 # Browser-side facts are NOT reported here. The shell cannot see them: macOS
 # hides other processes' environments, so the timezone a running browser was
 # launched with is unreadable, and no process inspection reveals whether
-# WebRTC is actually leaking. vpnchain-dashboard.html, alongside this script,
+# WebRTC is actually leaking. The dashboard page, .local/share/vpnchain/dashboard.html,
 # measures all of it from inside the browser - open it as a plain file in the
 # browser you want to inspect:
 #
-#     file://<this directory>/vpnchain-dashboard.html#expect=<exit address>
+#     file://<this tree>/.local/share/vpnchain/dashboard.html#expect=<exit address>
 #
 # The incognito instance exits elsewhere by design, and that address rotates
 # with the upstream node, so it is not something a fragment could pin: the
@@ -362,6 +362,18 @@
 # place that can actually observe it.
 
 set -uo pipefail
+
+# Where this tree is, whether run from it or through a link stow made: the
+# helpers and the dashboard page are found from the real file, so the same
+# checkout works installed or not.
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case "$link" in (/*) self=$link ;; (*) self=$(dirname "$self")/$link ;; esac
+done
+VPNCHAIN_ROOT=$(cd "$(dirname "$self")/.." && pwd)
+LIBEXEC="$VPNCHAIN_ROOT/.local/libexec/vpnchain"
+unset self link
 
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/env"
 
@@ -675,12 +687,10 @@ agent_logs() {
 # writing a file that does not exist cannot lose anything - the same reasoning
 # as generating a missing config.
 write_agent() {
-    local label="$1" file="$2" out="$3" err="$4" a
+    local label="$1" file="$2" out="$3" err="$4" a body
     shift 4
-    [ -f "$file" ] && return 0
-    mkdir -p "$(dirname "$file")" "$(dirname "$out")" "$(dirname "$err")"
     if [ "$OS" = mac ]; then
-        {
+        body=$(
             cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -703,12 +713,13 @@ PLIST
 </dict>
 </plist>
 PLIST
-        } > "$file"
+        )
     else
         # systemd splits ExecStart on spaces, so each argument is quoted.
         local cmd=
         for a in "$@"; do cmd="$cmd \"$a\""; done
-        cat > "$file" <<UNIT
+        body=$(
+            cat <<UNIT
 [Unit]
 Description=$label (vpnchain)
 
@@ -723,7 +734,20 @@ StandardError=append:$err
 [Install]
 WantedBy=default.target
 UNIT
+        )
     fi
+    # Kept as it is when it already says this. When it says something else -
+    # the program moved, as when this tree left ~/.files/main/bin, or the
+    # port changed - the old agent is stopped and the file rewritten, and the
+    # caller starts it again. Otherwise it would keep pointing at a program
+    # that is no longer there, and nothing would say why it never starts.
+    if [ -f "$file" ]; then
+        [ "$(cat "$file")" = "$body" ] && return 0
+        agent_stop "$label" "$file"
+        warn "$(basename "$file") pointed elsewhere - rewriting it"
+    fi
+    mkdir -p "$(dirname "$file")" "$(dirname "$out")" "$(dirname "$err")"
+    printf '%s\n' "$body" > "$file"
     ok "wrote $file"
 }
 
@@ -789,8 +813,8 @@ PLIST=$(agent_file "$SINGBOX_AGENT")
 STATUSD_AGENT="${STATUSD_AGENT:-}"
 STATUSD_PLIST=$(agent_file "$STATUSD_AGENT")
 STATUS_PORT="${STATUS_PORT:-8787}"
-STATUSD_BIN="$(cd "$(dirname "$0")" && pwd)/vpnchain-statusd"
-DASHBOARD_PAGE="$(cd "$(dirname "$0")" && pwd)/vpnchain-dashboard.html"
+STATUSD_BIN="$LIBEXEC/vpnchain-statusd"
+DASHBOARD_PAGE="$VPNCHAIN_ROOT/.local/share/vpnchain/dashboard.html"
 
 # Chromium-family preference domain whose WebRTC policy we toggle.
 # Override in the env file for Brave, Edge, Chromium, etc.
@@ -870,7 +894,7 @@ COOKIE_KEY=BlockThirdPartyCookies
 # PROBE LIST - a script can only detect faces whose names it already thought to
 # try, while queryLocalFonts() has perfect recall and returns names nobody
 # would guess. Measured on this machine: Cover Your Tracks reported 27 fonts
-# while vpnchain-dashboard.html found 37 of its 53 candidates, same machine,
+# while the dashboard page found 37 of its 53 candidates, same machine,
 # the whole difference being that one list includes developer faces and the
 # other does not.
 #
@@ -1362,7 +1386,7 @@ CLASH_PORT="${CLASH_PORT:-9090}"
 CLASH_SECRET_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/clash-secret"
 PILOT_AGENT="${PILOT_AGENT:-}"
 PILOT_PLIST=$(agent_file "$PILOT_AGENT")
-PILOT_BIN="$(cd "$(dirname "$0")" && pwd)/vpnchain-pilot"
+PILOT_BIN="$LIBEXEC/vpnchain-pilot"
 native && UPSTREAM_TAG=shared
 
 # Generated once and kept: the pilot reads it from the same file, and
@@ -3107,7 +3131,7 @@ cmd_browser() {
     fi
     if [ -n "$tz" ]; then
         ok "timezone: $tz"
-        echo "         confirm with vpnchain-dashboard.html - it measures the"
+        echo "         confirm with the dashboard page - it measures the"
         echo "         main thread, a Worker and an iframe, which is what"
         echo "         distinguishes a real spoof from a cosmetic one"
     else

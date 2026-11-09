@@ -63,7 +63,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# This file sits in .local/libexec/vpnchain of the vpnchain tree; the command
+# it calls is the tree's bin/vpnchain, found from the real file so that a
+# link to this one still finds it.
+ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", ".."))
+VPNCHAIN = os.path.join(ROOT, "bin", "vpnchain")
 CONF_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "vpnchain")
 ENV_FILE = os.path.join(CONF_DIR, "env")
@@ -424,7 +428,7 @@ class Pilot:
         with open(tmp, "w") as f:
             f.write(choice + "\n")
         os.replace(tmp, os.path.join(CONF_DIR, "node-dns"))
-        p = subprocess.run([os.path.join(HERE, "vpnchain"), "reload"],
+        p = subprocess.run([VPNCHAIN, "reload"],
                            capture_output=True, text=True, timeout=120)
         plain = choice == "local"
         self.event("dns", "node names now resolved by %s (%s)%s" % (
@@ -966,7 +970,7 @@ class Pilot:
 
     def subscribe(self):
         try:
-            p = subprocess.run([os.path.join(HERE, "vpnchain"), "subscribe"],
+            p = subprocess.run([VPNCHAIN, "subscribe"],
                                capture_output=True, text=True, timeout=600)
             self.event("subscribe", "exit %d: %s" % (
                 p.returncode, (p.stdout.strip().splitlines() or ["?"])[-1][-120:]))

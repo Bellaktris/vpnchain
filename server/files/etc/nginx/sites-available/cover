@@ -1,0 +1,12 @@
+server {
+    listen 127.0.0.1:8443 ssl;
+    http2 on;
+    server_name @HOST@;
+    ssl_certificate     /etc/letsencrypt/live/@HOST@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/@HOST@/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ecdh_curve X25519:prime256v1:secp384r1;
+    root /var/www/html;
+    index index.html index.nginx-debian.html;
+    location / { try_files $uri $uri/ =404; }
+}

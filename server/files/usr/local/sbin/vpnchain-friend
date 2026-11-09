@@ -1,0 +1,85 @@
+#!/bin/sh
+# Friends on this Reality node. Each is a VLESS user with Vision and a short
+# ID of its own, so one can be revoked without touching the others, and each
+# gets a vless:// link that v2rayA, Hiddify and the like import as is.
+#
+#   vpnchain-friend add NAME      create, and print the link
+#   vpnchain-friend link NAME     print the link again
+#   vpnchain-friend remove NAME   revoke
+#   vpnchain-friend list
+#
+# The Reality public key is read from /etc/sing-box/reality.secret (a line
+# PUBLIC=...), written when the node was set up. A change restarts sing-box a
+# moment later, from systemd rather than from this process: run over
+# 'vpnchain ssh-reality', the restart ends the very session it came from.
+set -eu
+CONF=/etc/sing-box/config.json
+DIR=/etc/sing-box/friends
+SECRET=/etc/sing-box/reality.secret
+
+usage() { sed -n '6,9p' "$0" | sed 's/^# *//' >&2; exit 2; }
+[ $# -ge 1 ] || usage
+cmd=$1 name=${2:-}
+case "$cmd" in (add|link|remove) [ -n "$name" ] || usage ;; (list) ;; (*) usage ;; esac
+case "$name" in (*[!A-Za-z0-9_-]*) echo "a name is letters, digits, - and _" >&2; exit 2 ;; esac
+[ "$name" = owner-mux ] && { echo "owner-mux is yours, not a friend" >&2; exit 2; }
+
+restart_later() {
+    cp -p "$CONF" "$CONF.bak"
+    systemd-run --quiet --collect --on-active=2 systemctl restart sing-box
+}
+
+link() {
+    . "$DIR/$1"
+    pbk=$(sed -n 's/^PUBLIC=//p' "$SECRET")
+    host=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(next(i for i in c["inbounds"] if i["tag"]=="reality-in")["tls"]["server_name"])' "$CONF")
+    ip=$(ip -4 -o route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')
+    printf 'vless://%s@%s:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
+        "$UUID" "$ip" "$host" "$pbk" "$SID" "$1"
+}
+
+case "$cmd" in
+(list)
+    ls "$DIR" 2>/dev/null || true
+    ;;
+(link)
+    [ -f "$DIR/$name" ] || { echo "no friend $name" >&2; exit 1; }
+    link "$name"
+    ;;
+(add)
+    [ -e "$DIR/$name" ] && { echo "$name exists - 'link $name' prints it" >&2; exit 1; }
+    install -d -m 700 "$DIR"
+    ( umask 077; printf 'UUID=%s\nSID=%s\n' "$(sing-box generate uuid)" \
+        "$(sing-box generate rand --hex 8)" > "$DIR/$name" )
+    . "$DIR/$name"
+    restart_later
+    python3 - "$CONF" "$name" "$UUID" "$SID" <<'EOF'
+import json, sys
+path, name, uuid, sid = sys.argv[1:5]
+c = json.load(open(path))
+r = next(i for i in c["inbounds"] if i["tag"] == "reality-in")
+r["users"].append({"name": name, "uuid": uuid, "flow": "xtls-rprx-vision"})
+r["tls"]["reality"]["short_id"].append(sid)
+json.dump(c, open(path, "w"), indent=2)
+EOF
+    sing-box check -C /etc/sing-box || { cp -p "$CONF.bak" "$CONF"; rm -f "$DIR/$name"; exit 1; }
+    link "$name"
+    ;;
+(remove)
+    [ -f "$DIR/$name" ] || { echo "no friend $name" >&2; exit 1; }
+    . "$DIR/$name"
+    restart_later
+    python3 - "$CONF" "$name" "$SID" <<'EOF'
+import json, sys
+path, name, sid = sys.argv[1:4]
+c = json.load(open(path))
+r = next(i for i in c["inbounds"] if i["tag"] == "reality-in")
+r["users"] = [u for u in r["users"] if u.get("name") != name]
+r["tls"]["reality"]["short_id"] = [s for s in r["tls"]["reality"]["short_id"] if s != sid]
+json.dump(c, open(path, "w"), indent=2)
+EOF
+    sing-box check -C /etc/sing-box || { cp -p "$CONF.bak" "$CONF"; exit 1; }
+    rm -f "$DIR/$name"
+    echo "$name revoked; sing-box restarts in a moment"
+    ;;
+esac
