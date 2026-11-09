@@ -262,7 +262,10 @@
 #            fetch the domain lists and address ranges of KEEP_OUT_COUNTRIES
 #            into KEEP_OUT_DIR, each smoke-tested before it replaces the
 #            installed copy - see KEEP_OUT_COUNTRIES on why the pinned browser
-#            refuses those countries' sites. Then
+#            refuses those countries' sites. Global services the lists carry
+#            only because they are also served there (Google, Apple, Microsoft,
+#            certificate authorities) are filtered out first - see
+#            KEEP_OUT_SHARED. Then
 #            fetch the tracker lists named by BLOCKLIST_URL, convert them to a
 #            sing-box rule-set and install it at BLOCKLIST_PATH. Rejection then
 #            happens INSIDE the chain rather than in the browser, which is the
@@ -1951,7 +1954,72 @@ keep_out_probe() {
         (ir) echo digikala.com 2.144.0.1 ;;
     esac
 }
-KEEP_OUT_MUST_PASS=(google.com wikipedia.org github.com 8.8.8.8 1.1.1.1)
+KEEP_OUT_MUST_PASS=(google.com wikipedia.org github.com 8.8.8.8 1.1.1.1
+                    ssl.gstatic.com fonts.googleapis.com www.apple.com
+                    ocsp.apple.com ocsp.pki.goog)
+
+# Global services the country lists carry because they are also served from
+# inside that country. The CN list holds 21 google.com names and 143 apple.com
+# ones, OCSP and CRL hosts among them, and refusing those is not keeping a
+# country out but breaking the web: Google Docs reports "No connection" when
+# its ssl.gstatic.com connectivity probe is refused, and certificate checks
+# fail closed. Entries at or under these are taken out of each geosite list
+# before it is verified, so the generated config and its rules are untouched.
+#
+# Trackers among them (doubleclick, google-analytics) are left in, since the
+# blocklist refuses those anyway. akamaized.net is left in too: its entries
+# are Kinopoisk and miHoYo, both the countries' own.
+KEEP_OUT_SHARED=(
+    # Google
+    google.com gstatic.com googleapis.com googlevideo.com gvt1.com gvt2.com
+    goog
+    # Apple
+    apple.com mzstatic.com cdn-apple.com apple-mapkit.com
+    # Microsoft
+    microsoft.com windowsupdate.com office.net live.com bing.com bing.net
+    windowssearch.com
+    # CDNs and certificate authorities
+    akadns.net edgekey.net cloudflare.net globalsign.com globalsign.net
+    globalsigncdn.com
+    # Vendors' download hosts
+    nvidia.com amd.com dell.com jetbrains.com steamcontent.com
+)
+
+# Rewrites a geosite .srs in place without KEEP_OUT_SHARED: decompile, drop
+# matching names and the regexes that spell one out, compile. A rule left
+# with no condition is dropped rather than kept, as an empty rule would match
+# every name.
+keep_out_unshare() {
+    local srs=$1 json=$1.json
+    sing-box rule-set decompile -o "$json" "$srs" || return 1
+    python3 - "$json" "${KEEP_OUT_SHARED[@]}" <<'PY' || return 1
+import json, sys
+path, shared = sys.argv[1], sys.argv[2:]
+spelled = [s.replace(".", "\\.") for s in shared]
+
+def shared_name(d):
+    d = d.lstrip(".")
+    return any(d == s or d.endswith("." + s) for s in shared)
+
+with open(path) as f:
+    data = json.load(f)
+rules = []
+for rule in data.get("rules", []):
+    for key in ("domain", "domain_suffix"):
+        if key in rule:
+            rule[key] = [d for d in rule[key] if not shared_name(d)]
+    if "domain_regex" in rule:
+        rule["domain_regex"] = [r for r in rule["domain_regex"]
+                                if not any(s in r for s in spelled)]
+    rule = {k: v for k, v in rule.items() if v != []}
+    if rule:
+        rules.append(rule)
+data["rules"] = rules
+with open(path, "w") as f:
+    json.dump(data, f)
+PY
+    sing-box rule-set compile -o "$srs" "$json"
+}
 
 # Fetch, verify, install, one file at a time: a list that fails keeps the
 # installed copy, and a country without one is still refused by its TLDs.
@@ -1968,6 +2036,10 @@ cmd_keep_out() {
             f="$tmp/$kind-$cc.srs"
             if ! curl -fsSL -m 120 -o "$f" "$url" || [ ! -s "$f" ]; then
                 bad "could not fetch $kind for $cc - $url"; rc=1; continue
+            fi
+            if [ "$kind" = geosite ] && ! keep_out_unshare "$f"; then
+                bad "could not filter shared names out of $kind-$cc; keeping the installed one"
+                rc=1; continue
             fi
             bad_one=
             # The probe pair is "name address"; each list must hold its half.
