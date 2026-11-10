@@ -607,6 +607,8 @@ Optional:
              directly, so your ISP can see that you use it; Socks5Proxy
              through the upstream does not survive, and a bridge (obfs4,
              snowflake) is the route if that matters - see the header>
+    DNSTT_USER=<the provider's proxy username and password, which the SOCKS
+    DNSTT_PASS=  proxy behind its DNS tunnels asks for; see dnstt.list>
     I2P_PORT=<i2pd's SOCKS port, usually 4447, for .i2p names. Note that an
              I2P router carries other people's traffic by default; see
              notransit and share in i2pd.conf>
@@ -2223,6 +2225,15 @@ notify() {
 # operators read every query and answer to the censor.
 DNSTT_LIST="${DNSTT_LIST:-${XDG_CONFIG_HOME:-$HOME/.config}/vpnchain/dnstt.list}"
 DNSTT_TIERS="${DNSTT_TIERS:-T6,T7 T6,T7 T4,T5 T2,T3}"   # one attempt per entry
+DNSTT_USER="${DNSTT_USER:-}"
+DNSTT_PASS="${DNSTT_PASS:-}"
+
+# The SOCKS proxy at the tunnel's far end wants the provider's proxy
+# credentials. As a curl config on stdin, so the password stays out of ps.
+dnstt_auth() {
+    [ -n "$DNSTT_USER" ] || return 0
+    printf 'proxy-user = "%s:%s"\n' "$DNSTT_USER" "$DNSTT_PASS"
+}
 
 # launchd's PATH has neither Homebrew nor ~/.local/bin, and the pilot runs
 # subscribe from there.
@@ -2279,7 +2290,7 @@ dnstt_fetch() {
         else
             ok "dnstt: trying the $region server (DoH, slow - up to two minutes)"
         fi
-        if curl -fsS -m "$limit" --socks5-hostname "127.0.0.1:$port" \
+        if dnstt_auth | curl -fsS -m "$limit" -K - --socks5-hostname "127.0.0.1:$port" \
                 -o "$out" "$SUBSCRIPTION_URL" 2>/dev/null && [ -s "$out" ]; then
             kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
             return 0
