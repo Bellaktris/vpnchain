@@ -129,6 +129,36 @@ def exit_through(port):
     return out if re.match(r"^[0-9a-fA-F:.]+$", out or "") else None
 
 
+# address -> where databases place it. The incognito exit moves with the node,
+# so it is looked up once per address rather than at every refresh: the
+# provider rate-limits, and the page refreshes every few seconds.
+_places = {}
+
+
+def exit_place(port, ip):
+    """Where the exit this inbound presents is placed, as ipinfo has it.
+
+    Asked through the same inbound, so the lookup comes from the address it
+    is about and tells the provider nothing the exit does not. Kept only if
+    the address it reports is the one just measured: the exit may have moved
+    in between, and a place filed under the wrong address would stick."""
+    if not ip:
+        return None
+    if ip in _places:
+        return _places[ip]
+    out = run(["curl", "-s", "-m", "12", "--socks5-hostname",
+               "%s:%s" % (env("PROXY_HOST", "127.0.0.1"), port),
+               "https://ipinfo.io/json"])
+    try:
+        d = json.loads(out or "{}")
+    except ValueError:
+        return None
+    if d.get("ip") != ip:
+        return None
+    _places[ip] = {k: d.get(k) for k in ("city", "region", "country", "org")}
+    return _places[ip]
+
+
 # DoH endpoints that answer in JSON, by the IPs NODE_DNS lists them under -
 # the same table 'vpnchain' keeps for its ECH probe.
 JSON_DOH = {"1.1.1.1": "https://1.1.1.1/dns-query", "1.0.0.1": "https://1.0.0.1/dns-query",
@@ -645,6 +675,7 @@ def collect():
         real_address = None
 
     expected, expected_name = expected_exit(pinned if pinned_up else None)
+    incog_exit = exit_through(incog) if incog_up else None
 
     return {
         "mode": singbox_mode(),
@@ -671,7 +702,8 @@ def collect():
             # Measured, not pattern-matched: the upstream exit rotates with the
             # node, so a prefix would go stale.
             "pinned": exit_through(pinned) if pinned_up else None,
-            "incognito": exit_through(incog) if incog_up else None,
+            "incognito": incog_exit,
+            "incognitoPlace": exit_place(incog, incog_exit),
             # Configured, never measured. Learning it would mean making an
             # UNPROXIED request from this daemon, which is the one thing the
             # whole arrangement exists to avoid doing by accident. It is here

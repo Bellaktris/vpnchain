@@ -704,7 +704,12 @@ function checkHost() {
           b.incognitoListening ? "ok" : "warn");
 
       var ex = d.exits || {};
-      put("h-incexit", ex.incognito || "unreachable",
+      var ip = ex.incognitoPlace;
+      put("h-incexit", ex.incognito
+            ? ex.incognito + (ip ? " - " + ([ip.city, ip.region, ip.country]
+                .filter(Boolean).join(", ") || "location not reported") +
+                (ip.org ? " (" + ip.org + ")" : "") : "")
+            : "unreachable",
           ex.incognito ? "" : "warn");
 
       var bp = d.browserPolicy || {};
