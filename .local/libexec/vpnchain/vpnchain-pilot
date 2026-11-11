@@ -433,9 +433,12 @@ class Pilot:
         p = subprocess.run([VPNCHAIN, "reload"],
                            capture_output=True, text=True, timeout=120)
         plain = choice == "local"
+        # The reason, or "reload FAILED" repeats with nothing to go on.
+        err = (p.stderr or p.stdout).strip().splitlines()
         self.event("dns", "node names now resolved by %s (%s)%s" % (
             "the system resolver - plain DNS" if plain else "DoH to " + choice, why,
-            "" if p.returncode == 0 else " - reload FAILED"),
+            "" if p.returncode == 0 else
+            " - reload FAILED" + (": " + err[-1] if err else "")),
             alert=plain or p.returncode != 0)
 
     def check_dns(self):

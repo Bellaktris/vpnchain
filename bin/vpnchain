@@ -681,6 +681,17 @@ case "$(uname -s)" in
     (*) echo "vpnchain: unsupported platform $(uname -s)" >&2; exit 1 ;;
 esac
 
+# The pilot runs reload and subscribe from launchd or a systemd user manager,
+# whose PATH has neither Homebrew nor ~/.local/bin. Without this, sing-box
+# check is not found there, the config fails validation and is restored, and
+# every reload the pilot asks for - a resolver change included - quietly
+# does nothing.
+for d in /opt/homebrew/bin /usr/local/bin /home/linuxbrew/.linuxbrew/bin \
+         "$HOME/.local/bin"; do
+    case ":$PATH:" in (*":$d:"*) ;; (*) [ -d "$d" ] && PATH="$PATH:$d" ;; esac
+done
+export PATH
+
 if [ "$OS" = mac ]; then
     agent_file() { printf '%s\n' "$HOME/Library/LaunchAgents/$1.plist"; }
 else
