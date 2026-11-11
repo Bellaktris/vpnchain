@@ -824,8 +824,11 @@ function checkHost() {
 // for, so they are only ever set as text.
 function showBlocked(b) {
   if (!b.available) {
-    put("b-summary", "unavailable - no blocklist, or the sing-box log " +
-        "cannot be found", "pend");
+    put("b-summary", b.logLevel
+        ? "not recorded - sing-box logs at " + b.logLevel +
+          ", which keeps no connections; LOG_LEVEL=info lists them"
+        : "unavailable - no blocklist, or the sing-box log cannot be found",
+        "pend");
     return;
   }
   var window = b.since ? " in the last " + dur(Date.now() / 1000 - b.since) : "";

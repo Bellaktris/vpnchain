@@ -633,6 +633,10 @@ Optional:
     ROTATE_MINUTES=<chained-reality only: minutes on one Reality node before
              the pilot moves to another, as a range drawn from afresh each
              time; default "20-60", "off" to stay put>
+    LOG_LEVEL=<sing-box's log level, default "warn". "info" logs every
+             connection's host name with a timestamp, the incognito
+             browser's included, which the dashboard needs to list blocked
+             trackers; see the note on LOG_LEVEL in the script>
     NOTIFY_ALLOW=<space-separated origins allowed to show notifications,
              e.g. "https://mail.example.com https://chat.example.com";
              everything else is blocked>
@@ -1225,6 +1229,21 @@ RETIRED_VARS=(INCOGNITO_TZ INCOGNITO_TZ_FOLLOW_EXIT INCOGNITO_FLAGS)
 # each name goes.
 TOR_PORT="${TOR_PORT:-}"
 I2P_PORT="${I2P_PORT:-}"
+
+# sing-box's log level. At "info" it writes a line for every connection - the
+# host name, the inbound and the time - for both browsers, the incognito one
+# included, into a log that is only trimmed when the chain stops. That is a
+# browsing history on disk, which is the one thing the incognito browser's
+# throwaway profile exists not to keep. "warn" keeps failures and drops the
+# per-connection lines. sing-box cannot log one inbound and not the other, so
+# the dashboard's list of blocked trackers, read from those lines, goes with
+# them; "info" brings it back for both.
+LOG_LEVEL="${LOG_LEVEL:-warn}"
+case "$LOG_LEVEL" in
+    trace|debug|info|warn|error|fatal|panic) ;;
+    *) echo "vpnchain: LOG_LEVEL=$LOG_LEVEL is not a sing-box log level" >&2
+       exit 1 ;;
+esac
 
 port_listening() { nc -z "$1" "$2" >/dev/null 2>&1; }
 
@@ -2707,7 +2726,7 @@ generate_config() {
     BL="$(blocklist_active && echo "$BLOCKLIST_PATH")" \
     KEEP_OUT="$KEEP_OUT_COUNTRIES" KEEP_OUT_DIR="$KEEP_OUT_DIR" \
     KEEP_OUT_TLDS="$(for cc in $KEEP_OUT_COUNTRIES; do keep_out_tlds "$cc"; done)" \
-    TOR_PORT="$TOR_PORT" I2P_PORT="$I2P_PORT" \
+    TOR_PORT="$TOR_PORT" I2P_PORT="$I2P_PORT" LOG_LEVEL="$LOG_LEVEL" \
     HOME_WG_HOST="${HOME_WG_HOST:-}" HOME_WG_PRIVATE_KEY="${HOME_WG_PRIVATE_KEY:-}" \
     HOME_WG_ADDRESS="${HOME_WG_ADDRESS:-}" \
     OUT="$out" \
@@ -2796,7 +2815,7 @@ if e["MODE"] in ("chained", "chained-reality"):
     wg["detour"] = up
 
 cfg = {
-    "log": {"level": "info", "timestamp": True},
+    "log": {"level": e["LOG_LEVEL"], "timestamp": True},
     # Names for the incognito inbound resolve through the upstream too.
     # Resolving them through the tunnel would have the site see one origin
     # while its authoritative DNS saw another.

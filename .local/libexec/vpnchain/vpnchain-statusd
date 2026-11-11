@@ -241,7 +241,8 @@ def blocklist():
 
 # How much of the sing-box log to read back. It logs every connection at info
 # level, so this is roughly the last hour or two of browsing; the log itself is
-# only trimmed when the chain stops.
+# only trimmed when the chain stops. Below info (LOG_LEVEL, "warn" by default)
+# there are no connection lines to read.
 BLOCKED_TAIL = 4 * 1024 * 1024
 BLOCKED_SHOWN = 50
 
@@ -323,6 +324,13 @@ def blocked_recent():
                os.path.expanduser("~/.config/sing-box/blocklist.srs"))
     if not binary or not log or not os.path.exists(path):
         return {"available": False}
+    try:
+        with open(singbox_config_path()) as f:
+            level = json.load(f).get("log", {}).get("level", "info")
+    except (OSError, ValueError):
+        level = "info"
+    if level not in ("trace", "debug", "info"):
+        return {"available": False, "logLevel": level}
     try:
         with open(log, "rb") as f:
             f.seek(0, os.SEEK_END)
