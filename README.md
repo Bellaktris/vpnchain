@@ -21,6 +21,7 @@ actually do.
 | `.local/libexec/vpnchain/vpnchain-pilot` | `~/.local/libexec/vpnchain/` | Picks and replaces nodes through sing-box's Clash API; rotates between Reality nodes |
 | `.local/libexec/vpnchain/vpnchain-statusd` | `~/.local/libexec/vpnchain/` | Serves the dashboard and the host-side status it cannot see itself |
 | `.local/share/vpnchain/dashboard.html` | `~/.local/share/vpnchain/` | The dashboard page |
+| `.local/share/vpnchain/link-unwrap/` | `~/.local/share/vpnchain/` | A Chrome extension for the pinned browser: a link through a blocked tracker that carries its destination opens the destination directly, the tracker never contacted |
 | `server/` | not installed | A Reality node of your own: config templates, firewall, and the friend-link script |
 
 The tree mirrors `$HOME`, so it is a GNU Stow package; `.stow-local-ignore`
@@ -78,6 +79,16 @@ sends the pinned browser to the exit over the home network, in whichever
 mode is set, and back onto the chain the moment the home network goes -
 nothing needs switching by hand, and nothing is restarted. The home route
 is WireGuard too, so a late switch stalls; it never leaks.
+
+## Tracker links
+
+The tracker blocklist also refuses the click-tracking wrappers that email and
+affiliate links go through, which breaks the link. Many carry the
+destination inside them, and `link-unwrap` reads it off before any request is
+made. Chrome no longer loads extensions from the command line, so load it
+once by hand: `chrome://extensions`, Developer mode, Load unpacked,
+`~/.local/share/vpnchain/link-unwrap`. Wrappers whose links hold only an ID
+stay blocked; `rules.js` lists both kinds.
 
 `vpnchain` with no arguments lists the verbs; the header of `bin/vpnchain`
 explains each.
