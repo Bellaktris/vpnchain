@@ -30,7 +30,8 @@
 #
 #   start [mode]    load the sing-box agent
 #   stop            unload it
-#   restart [mode]  unload and load it again, pilot and status server too
+#   restart [mode]  unload and load it again, pilot and status server too;
+#                   regenerates the config first if the env file is newer
 #   reload          regenerate the config and restart sing-box alone, for
 #                   applying an edit; the pilot keeps running
 #
@@ -2694,8 +2695,9 @@ cmd_config() {
     fi
     ok "config written and valid: $SINGBOX_CONFIG"
     # Only worth saying when something is already running the old one; during
-    # bootstrap the caller starts the agent immediately after this.
-    agent_running && echo "         apply it with: vpnchain reload"
+    # bootstrap and restart the caller starts the agent right after this.
+    agent_running && [ -z "${RESTARTING:-}" ] &&
+        echo "         apply it with: vpnchain reload"
 }
 
 # Renders the config implied by the env file to $1. Kept separate from
@@ -3616,7 +3618,15 @@ case "${1:-status}" in
     stop)    cmd_stop ;;
              # switch_mode, not maybe_switch_mode: this verb restarts the agent
              # itself, so reloading inside the switch would do it twice.
-    restart) if [ -n "${2:-}" ]; then switch_mode "$2" || true; fi
+             # An env file newer than the config was edited since the last
+             # generation, so the config is regenerated first - before the
+             # mode switch, which would otherwise make it the newer file.
+             # A config edited by hand after the env file is left alone.
+    restart) if [ "$CONFIG" -nt "$SINGBOX_CONFIG" ]; then
+                 ok "the env file changed since the config was generated"
+                 RESTARTING=1 cmd_config
+             fi
+             if [ -n "${2:-}" ]; then switch_mode "$2" || true; fi
              # Checked before stopping anything, so a refused start cannot
              # leave the browser with no tunnel at all.
              refuse_if_port_blocked
