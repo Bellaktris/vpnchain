@@ -140,6 +140,29 @@ const BADGE = {
     unknown: { text: "?",   color: "#6e6e73" },
 };
 
+// Drawn rather than shipped: with no icon Chrome shows a letter of its own,
+// which the badge covers half of. While a badge is up the letter shrinks into
+// the top left corner, clear of it.
+function icon(small) {
+    const images = {};
+    for (const size of [16, 32]) {
+        const c = new OffscreenCanvas(size, size);
+        const g = c.getContext("2d");
+        const box = small ? size * 0.62 : size;
+        g.fillStyle = "#5f6368";
+        g.beginPath();
+        g.roundRect(0, 0, box, box, box * 0.22);
+        g.fill();
+        g.fillStyle = "#fff";
+        g.font = `bold ${Math.round(box * 0.8)}px -apple-system, BlinkMacSystemFont, sans-serif`;
+        g.textAlign = "center";
+        g.textBaseline = "middle";
+        g.fillText("v", box / 2, box * 0.44);
+        images[size] = g.getImageData(0, 0, size, size);
+    }
+    return chrome.action.setIcon({ imageData: images });
+}
+
 function judge(s) {
     const lines = [];
     const sb = s.singbox || {}, up = s.upstream || {}, ex = s.exits || {};
@@ -175,6 +198,7 @@ async function refreshBadge() {
         level = "off";
         lines = ["NOT on the chain - pages are blocked"];
     }
+    await icon(Boolean(BADGE[level].text));
     await chrome.action.setBadgeText({ text: BADGE[level].text });
     await chrome.action.setBadgeBackgroundColor({ color: BADGE[level].color });
     await chrome.action.setTitle({ title: ["vpnchain", ...lines].join("\n") });
