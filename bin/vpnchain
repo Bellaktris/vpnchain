@@ -167,7 +167,8 @@
 #
 #            Run again while it is up, it opens a new window in the running
 #            instance rather than a second one, so the shortcut the vpnchain
-#            extension maps to this works as Chrome's own did.
+#            extension maps to this works as Chrome's own did. On macOS
+#            either way brings it to the front.
 #
 #            'upstream' is accepted as a synonym, that being what the exit
 #            is. The name 'incognito' belongs to this verb and to the
@@ -3145,8 +3146,8 @@ have_wg_creds() {
 
 # The pid of the incognito browser, or nothing.
 #
-# The profile path is the precise match: only our own launch names it on a
-# command line. The binary is a fallback for the case where the bundle re-execs
+# The main process first, then anything naming the profile path: only our
+# own launch names it on a command line. The binary is a fallback for the case where the bundle re-execs
 # and the argv we passed does not survive into the running process - a false
 # negative there would report a launch that worked as a failure. It is NOT
 # used for the already-running gate, since it would also match an instance
@@ -3154,9 +3155,32 @@ have_wg_creds() {
 # separate from ours anyway.
 incognito_pid() {
     local pid
-    pid=$(pgrep -f "$INCOGNITO_PROFILE" 2>/dev/null | head -1)
+    pid=$(incognito_main_pid)
+    [ -z "$pid" ] && pid=$(pgrep -f "$INCOGNITO_PROFILE" 2>/dev/null | head -1)
     [ -z "$pid" ] && pid=$(pgrep -f "$INCOGNITO_BIN" 2>/dev/null | head -1)
     printf '%s\n' "$pid"
+}
+
+# The main process of the instance this script started, matched on its whole
+# command line. Not just the profile path: the watcher below names it too,
+# and outlives the browser by up to five seconds, so a gate on the path saw
+# an instance that had already quit. Nor anything started from the Dock.
+incognito_main_pid() {
+    pgrep -fx "$INCOGNITO_BIN -no-remote -profile $INCOGNITO_PROFILE" 2>/dev/null | head -1
+}
+
+# Started in the background, from a shell or the extension's native host,
+# neither launch nor new window takes the front on macOS, so it is asked for
+# by pid. NSRunningApplication rather than System Events, which would need
+# Accessibility permission. Elsewhere the window manager decides.
+incognito_front() {
+    [ "$OS" = mac ] || return 0
+    local pid
+    pid=$(incognito_main_pid)
+    [ -n "$pid" ] || return 0
+    osascript -l JavaScript -e "ObjC.import('AppKit');
+        \$.NSRunningApplication.runningApplicationWithProcessIdentifier($pid)
+            .activateWithOptions(\$.NSApplicationActivateAllWindows)" >/dev/null 2>&1
 }
 
 # The incognito browser. Everything this configures lives in the profile it
@@ -3190,11 +3214,12 @@ launch_incognito() {
     # -no-remote this reaches the instance holding the profile, and so the
     # proxy that profile was given; failing that, it would start a second
     # instance on a profile in use, which Firefox refuses with a dialog.
-    pid=$(pgrep -f "$INCOGNITO_PROFILE" | head -1)
+    pid=$(incognito_main_pid)
     if [ -n "$pid" ]; then
         if "$INCOGNITO_BIN" -profile "$INCOGNITO_PROFILE" -new-window about:blank \
                 >/dev/null 2>&1; then
             ok "already running (pid $pid) - opened a new window in it"
+            incognito_front
         else
             warn "an instance is ALREADY running on this profile (pid $pid)"
         fi
@@ -3347,6 +3372,7 @@ EOF
         echo "           '$INCOGNITO_BIN' -no-remote -profile '$INCOGNITO_PROFILE'"
         exit 1
     fi
+    incognito_front
 
     # Wiped when it quits as well as before it starts, so between sessions
     # there is nothing on disk to find. The browser is in permanent private
