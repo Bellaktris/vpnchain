@@ -129,6 +129,10 @@
 #            address - the one thing that actually identifies you - so it
 #            looks anonymous while being nothing of the sort. The unlinked
 #            exit is a separate browser, below, not a window in this one.
+#            The vpnchain extension takes the incognito shortcut over and
+#            opens that browser instead; each launch registers the native
+#            host it does that through (NATIVE_HOST_DIR), for the
+#            extension's ID alone.
 #
 #            Third-party cookies are blocked by default too - they are the
 #            cross-site join key, and the browser does not block them on its
@@ -160,6 +164,10 @@
 #            browser. That exit is a shared datacenter address flagged as a
 #            proxy by IP databases, so expect CAPTCHAs - the trade is that
 #            the session is not linked to the pinned address.
+#
+#            Run again while it is up, it opens a new window in the running
+#            instance rather than a second one, so the shortcut the vpnchain
+#            extension maps to this works as Chrome's own did.
 #
 #            'upstream' is accepted as a synonym, that being what the exit
 #            is. The name 'incognito' belongs to this verb and to the
@@ -637,6 +645,9 @@ Optional:
     BROWSER_POLICY_FILE=<Linux: the policy file, defaults to
              /etc/opt/chrome/policies/managed/vpnchain.json; create it with
              'vpnchain setup'>
+    NATIVE_HOST_DIR=<the pinned browser's NativeMessagingHosts directory,
+             where the extension's incognito shortcut is registered;
+             defaults to Google Chrome's>
     KEEP_OUT_COUNTRIES=<countries whose sites the pinned browser refuses,
              so they get a separate unproxied browser; default "ru cn ir",
              empty turns it off. Lists come with 'vpnchain get-blocklist'>
@@ -895,6 +906,21 @@ BROWSER_DOMAIN="${BROWSER_DOMAIN:-com.google.Chrome}"
 # mandatory policy. Chromium uses /etc/chromium/policies/managed, Brave
 # /etc/brave/policies/managed.
 BROWSER_POLICY_FILE="${BROWSER_POLICY_FILE:-/etc/opt/chrome/policies/managed/vpnchain.json}"
+
+# The vpnchain extension (.local/share/vpnchain/extension) sends the
+# incognito shortcut to a native host, which Chrome starts only for the
+# extension IDs its manifest in this directory lists. The ID is fixed by the
+# key in the extension's manifest, and must match ORIGIN in the host.
+# Chromium keeps its hosts under Chromium, Brave under
+# BraveSoftware/Brave-Browser.
+if [ "$OS" = mac ]; then
+    NATIVE_HOST_DIR="${NATIVE_HOST_DIR:-$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts}"
+else
+    NATIVE_HOST_DIR="${NATIVE_HOST_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/google-chrome/NativeMessagingHosts}"
+fi
+NATIVE_HOST_NAME=vpnchain
+NATIVE_HOST_BIN="$LIBEXEC/vpnchain-native-host"
+EXTENSION_ID=pfdkgojmnemffpmlgdbjogdcfinenfom
 
 # Chrome renamed this policy; write and read both so either vintage works.
 WEBRTC_KEYS=(WebRtcIPHandlingPolicy WebRtcIPHandling)
@@ -1820,6 +1846,21 @@ set_hardening_policies() {
         # shellcheck disable=SC2086
         pol_set "$NOTIFY_ALLOW_KEY" array $NOTIFY_ALLOW
     fi
+}
+
+# Written at every launch rather than linked by stow, since the manifest has
+# to name the host by absolute path - and so a moved checkout is picked up.
+register_native_host() {
+    mkdir -p "$NATIVE_HOST_DIR" || return 1
+    cat > "$NATIVE_HOST_DIR/$NATIVE_HOST_NAME.json" <<EOF
+{
+    "name": "$NATIVE_HOST_NAME",
+    "description": "vpnchain: the incognito shortcut opens the incognito browser",
+    "path": "$NATIVE_HOST_BIN",
+    "type": "stdio",
+    "allowed_origins": ["chrome-extension://$EXTENSION_ID/"]
+}
+EOF
 }
 
 # The resting state both policies should be left in. Called on the normal path
@@ -3144,9 +3185,19 @@ launch_incognito() {
     # are silently discarded, so report that rather than a launch that did
     # not happen. Wiping the profile under a running instance is also how you
     # corrupt it.
+    #
+    # A new window in it instead, which is what the shortcut wants. Without
+    # -no-remote this reaches the instance holding the profile, and so the
+    # proxy that profile was given; failing that, it would start a second
+    # instance on a profile in use, which Firefox refuses with a dialog.
     pid=$(pgrep -f "$INCOGNITO_PROFILE" | head -1)
     if [ -n "$pid" ]; then
-        warn "an instance is ALREADY running on this profile (pid $pid)"
+        if "$INCOGNITO_BIN" -profile "$INCOGNITO_PROFILE" -new-window about:blank \
+                >/dev/null 2>&1; then
+            ok "already running (pid $pid) - opened a new window in it"
+        else
+            warn "an instance is ALREADY running on this profile (pid $pid)"
+        fi
         warn "it keeps the proxy it started with - quit it and rerun to change"
         return 0
     fi
@@ -3377,6 +3428,11 @@ cmd_browser() {
 
     set_hardening_policies
     ok "device APIs denied, HTTPS-only on, vendor telemetry reduced"
+    if register_native_host; then
+        ok "incognito shortcut registered for the vpnchain extension"
+    else
+        warn "could not write $NATIVE_HOST_DIR - the incognito shortcut will do nothing"
+    fi
     ok "font, screen-layout and sensor enumeration denied"
     ok "ad topics, ad auctions and ad measurement off"
     ok "background mode off, downloads prompt for a location"
@@ -3498,6 +3554,7 @@ cmd_browser() {
 # nothing else ever asks for sudo. On macOS there is none: the policies live in
 # the user's own preference domain.
 cmd_setup() {
+    register_native_host && ok "incognito shortcut registered in $NATIVE_HOST_DIR"
     if [ "$OS" = mac ]; then
         ok "no policy file on macOS - policies go to the $BROWSER_DOMAIN domain"
         return 0

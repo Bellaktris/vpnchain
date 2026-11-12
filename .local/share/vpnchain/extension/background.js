@@ -14,7 +14,7 @@ async function register() {
     for (const [i, r] of RULES.entries()) {
         const ok = await chrome.declarativeNetRequest.isRegexSupported({ regex: r.filter + ".*" });
         if (!ok.isSupported) {
-            console.warn(`link-unwrap: ${r.name}: filter rejected (${ok.reason})`);
+            console.warn(`vpnchain: ${r.name}: filter rejected (${ok.reason})`);
             continue;
         }
         rules.push({
@@ -32,3 +32,18 @@ async function register() {
 
 chrome.runtime.onInstalled.addListener(register);
 chrome.runtime.onStartup.addListener(register);
+
+// The incognito shortcut, which the browser's own incognito mode no longer
+// answers (vpnchain disables it), opens the incognito browser instead. An
+// extension cannot start a program, so the native host does: 'vpnchain
+// browser' registers it for this extension's ID alone, which the manifest's
+// key fixes. A web page cannot reach it the way it could a loopback port.
+chrome.commands.onCommand.addListener(async (command) => {
+    if (command !== "incognito") return;
+    try {
+        const reply = await chrome.runtime.sendNativeMessage("vpnchain", { action: "incognito" });
+        if (!reply?.ok) console.warn(`vpnchain: native host refused: ${reply?.error}`);
+    } catch (e) {
+        console.warn(`vpnchain: native host unreachable (run 'vpnchain browser' once): ${e.message}`);
+    }
+});

@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Native messaging host for the vpnchain Chrome extension: the incognito
+shortcut arrives here and leaves as 'vpnchain browser incognito'.
+
+Chrome starts this for one message and closes it after the reply, so the
+launch is detached into a session of its own, with its output in
+~/.config/vpnchain/incognito.log, and the reply does not wait for it. A launch
+that fails says so in a notification, since nothing else is watching.
+
+SECURITY: Chrome starts this only for the extension IDs in the host manifest
+'vpnchain browser' writes, and that is ours alone - no web page can reach it,
+which is why this is not an endpoint of the status server. It still checks
+the caller and accepts the one action, so it can be made to do nothing but
+what the shortcut does.
+"""
+
+import json
+import os
+import struct
+import subprocess
+import sys
+
+# This file sits in .local/libexec/vpnchain of the vpnchain tree, the command
+# in bin; found from the real file, so a link to this one works.
+ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", ".."))
+VPNCHAIN = os.path.join(ROOT, "bin", "vpnchain")
+LOG = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "vpnchain", "incognito.log")
+
+# Must match EXTENSION_ID in bin/vpnchain, which the manifest's key fixes.
+ORIGIN = "chrome-extension://pfdkgojmnemffpmlgdbjogdcfinenfom/"
+
+# A browser started from the Dock has launchd's PATH, which has none of
+# Homebrew - where curl, sing-box and the rest may live.
+PATH_EXTRA = ["/opt/homebrew/bin", "/usr/local/bin"]
+
+# Fixed strings only: nothing from the message reaches the shell.
+LAUNCH = r'''
+"$1" browser incognito >"$2" 2>&1 && exit 0
+msg="incognito browser did not start - see $2"
+if command -v osascript >/dev/null; then
+    osascript -e "display notification \"$msg\" with title \"vpnchain\""
+else
+    notify-send vpnchain "$msg"
+fi
+'''
+
+
+def read_message():
+    head = sys.stdin.buffer.read(4)
+    if len(head) < 4:
+        return None
+    (size,) = struct.unpack("=I", head)
+    return json.loads(sys.stdin.buffer.read(size))
+
+
+def reply(obj):
+    body = json.dumps(obj).encode()
+    sys.stdout.buffer.write(struct.pack("=I", len(body)) + body)
+    sys.stdout.buffer.flush()
+
+
+def launch():
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join(PATH_EXTRA + [env.get("PATH", "/usr/bin:/bin")])
+    subprocess.Popen(["/bin/sh", "-c", LAUNCH, "sh", VPNCHAIN, LOG],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+
+
+def main():
+    if ORIGIN not in sys.argv[1:]:
+        reply({"ok": False, "error": "unknown caller"})
+        return
+    try:
+        msg = read_message()
+    except ValueError:
+        msg = None
+    if not isinstance(msg, dict) or msg.get("action") != "incognito":
+        reply({"ok": False, "error": "unknown action"})
+        return
+    launch()
+    reply({"ok": True})
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,21 @@
+{
+    "manifest_version": 3,
+    "name": "vpnchain",
+    "version": "2",
+    "description": "Opens the destination of a blocked tracker's link directly, read off the link without contacting the tracker; the incognito shortcut opens the vpnchain incognito browser.",
+    "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAhl8y5IsUD83+AbLlTxZzL9i0P5m+WvqJgR82u4rSbAvDjXjr/NB4UVjZJR4lq5QhDt3oB6CkH4gXP265GfZSdMgI6sa5oysD573gZwPlek6K7znPuZLHPzeBSOOzeFE803qJb6j3lRw1gE8HiKEsmd2LxPuklqTuEq+xgfaW6rqiwLH05RX1smhDTGs0ob5REdHmpHSWU6DAIadsaqf0L/ffMUQL/ih/h3dSkNtvvFGBpPGcblS/V3uQRqwn7ra/VdbDJ6U6BDsQRoocrSKJ93hp1QWGdbrObZ1vRZbSWz55rkXJvBv9lzrB7YrwDM/kvkRyIjAMHmCiI3/xNL1NawIDAQAB",
+    "permissions": ["declarativeNetRequest", "nativeMessaging"],
+    "host_permissions": ["<all_urls>"],
+    "background": { "service_worker": "background.js", "type": "module" },
+    "commands": {
+        "incognito": {
+            "suggested_key": { "default": "Ctrl+Shift+N", "mac": "Command+Shift+N" },
+            "description": "Open the vpnchain incognito browser"
+        }
+    },
+    "web_accessible_resources": [{
+        "resources": ["unwrap.html"],
+        "matches": ["<all_urls>"],
+        "use_dynamic_url": true
+    }]
+}
