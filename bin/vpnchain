@@ -143,6 +143,15 @@
 #            protected again - no timer, nothing to remember. Use it when a
 #            call needs to connect.
 #
+#            Private addresses (LAN, link-local) bypass the proxy as loopback
+#            does, so a router's or printer's page opens here rather than at
+#            the exit, where it means nothing. Only addresses typed as such:
+#            a name still goes to the proxy and resolves at the far end, so
+#            no DNS leaves locally. Local Network Access makes a public page
+#            ask before reaching either. Not 100.64.0.0/10, where CGNAT and
+#            Tailscale put hosts that are on the internet, and not the
+#            incognito browser, which stays as stock as it can.
+#
 #   browser incognito
 #            launch Mullvad Browser against the inbound that bypasses the
 #            WireGuard endpoint, so the session exits at the upstream instead
@@ -3422,12 +3431,16 @@ cmd_browser() {
     local bpid
     local proxy_flag="--proxy-server=socks5://$PROXY_HOST:$PROXY_PORT"
     ok "proxy pinned to this launch: $PROXY_HOST:$PROXY_PORT"
+    # IP ranges here match only addresses typed as such, never a name that
+    # resolves into them; loopback stays exempt implicitly.
+    local bypass_flag="--proxy-bypass-list=10.0.0.0/8;172.16.0.0/12;192.168.0.0/16;169.254.0.0/16;[fe80::]/10;[fc00::]/7"
+    ok "private addresses bypass the proxy (LAN pages open locally)"
     if [ -n "$tz" ]; then
         ok "launching with TZ=$tz"
-        TZ="$tz" nohup "$BROWSER_BIN" "$proxy_flag" >/dev/null 2>&1 &
+        TZ="$tz" nohup "$BROWSER_BIN" "$proxy_flag" "$bypass_flag" >/dev/null 2>&1 &
     else
         warn "no timezone configured - launching with the system timezone"
-        nohup "$BROWSER_BIN" "$proxy_flag" >/dev/null 2>&1 &
+        nohup "$BROWSER_BIN" "$proxy_flag" "$bypass_flag" >/dev/null 2>&1 &
     fi
     bpid=$!
     disown 2>/dev/null
