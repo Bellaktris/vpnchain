@@ -385,8 +385,10 @@
 # pointing at a dead port.
 #
 # The trade is that this fails OPEN, not safe: a browser started from the Dock
-# or Spotlight carries no proxy flag and browses on your real address. Nothing
-# prevents that.
+# or Spotlight carries no proxy flag and browses on your real address. The
+# vpnchain extension closes that for pages: it blocks them until its native
+# host has read this flag off the browser's own command line. The browser's
+# own traffic - sync, updates, Safe Browsing - is beyond its reach.
 #
 # Browser-side facts are NOT reported here. The shell cannot see them: macOS
 # hides other processes' environments, so the timezone a running browser was
@@ -908,9 +910,10 @@ BROWSER_DOMAIN="${BROWSER_DOMAIN:-com.google.Chrome}"
 # /etc/brave/policies/managed.
 BROWSER_POLICY_FILE="${BROWSER_POLICY_FILE:-/etc/opt/chrome/policies/managed/vpnchain.json}"
 
-# The vpnchain extension (.local/share/vpnchain/extension) sends the
-# incognito shortcut to a native host, which Chrome starts only for the
-# extension IDs its manifest in this directory lists. The ID is fixed by the
+# The vpnchain extension (.local/share/vpnchain/extension) asks a native host
+# what it cannot see from the browser - its command line, the sing-box
+# config - and sends it the incognito shortcut. Chrome starts the host only
+# for the extension IDs its manifest in this directory lists. The ID is fixed by the
 # key in the extension's manifest, and must match ORIGIN in the host.
 # Chromium keeps its hosts under Chromium, Brave under
 # BraveSoftware/Brave-Browser.
@@ -1856,7 +1859,7 @@ register_native_host() {
     cat > "$NATIVE_HOST_DIR/$NATIVE_HOST_NAME.json" <<EOF
 {
     "name": "$NATIVE_HOST_NAME",
-    "description": "vpnchain: the incognito shortcut opens the incognito browser",
+    "description": "vpnchain: what the vpnchain extension cannot see from inside the browser",
     "path": "$NATIVE_HOST_BIN",
     "type": "stdio",
     "allowed_origins": ["chrome-extension://$EXTENSION_ID/"]
@@ -3455,9 +3458,9 @@ cmd_browser() {
     set_hardening_policies
     ok "device APIs denied, HTTPS-only on, vendor telemetry reduced"
     if register_native_host; then
-        ok "incognito shortcut registered for the vpnchain extension"
+        ok "native host registered for the vpnchain extension"
     else
-        warn "could not write $NATIVE_HOST_DIR - the incognito shortcut will do nothing"
+        warn "could not write $NATIVE_HOST_DIR - the vpnchain extension will keep pages blocked"
     fi
     ok "font, screen-layout and sensor enumeration denied"
     ok "ad topics, ad auctions and ad measurement off"
@@ -3580,7 +3583,7 @@ cmd_browser() {
 # nothing else ever asks for sudo. On macOS there is none: the policies live in
 # the user's own preference domain.
 cmd_setup() {
-    register_native_host && ok "incognito shortcut registered in $NATIVE_HOST_DIR"
+    register_native_host && ok "native host for the vpnchain extension registered in $NATIVE_HOST_DIR"
     if [ "$OS" = mac ]; then
         ok "no policy file on macOS - policies go to the $BROWSER_DOMAIN domain"
         return 0

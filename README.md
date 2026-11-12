@@ -21,8 +21,8 @@ actually do.
 | `.local/libexec/vpnchain/vpnchain-pilot` | `~/.local/libexec/vpnchain/` | Picks and replaces nodes through sing-box's Clash API; rotates between Reality nodes |
 | `.local/libexec/vpnchain/vpnchain-statusd` | `~/.local/libexec/vpnchain/` | Serves the dashboard and the host-side status it cannot see itself |
 | `.local/share/vpnchain/dashboard.html` | `~/.local/share/vpnchain/` | The dashboard page |
-| `.local/libexec/vpnchain/vpnchain-native-host` | `~/.local/libexec/vpnchain/` | Started by Chrome for the extension's incognito shortcut; runs `vpnchain browser incognito` |
-| `.local/share/vpnchain/extension/` | `~/.local/share/vpnchain/` | The Chrome extension for the pinned browser: a link through a blocked tracker that carries its destination opens the destination directly, the tracker never contacted; the incognito shortcut opens the incognito browser |
+| `.local/libexec/vpnchain/vpnchain-native-host` | `~/.local/libexec/vpnchain/` | Started by Chrome for the extension: whether the browser has the pinned proxy, why the chain refuses a host, and the incognito shortcut |
+| `.local/share/vpnchain/extension/` | `~/.local/share/vpnchain/` | The Chrome extension for the pinned browser - see [The extension](#the-extension) |
 | `server/` | not installed | A Reality node of your own: config templates, firewall, and the friend-link script |
 
 The tree mirrors `$HOME`, so it is a GNU Stow package; `.stow-local-ignore`
@@ -81,23 +81,39 @@ mode is set, and back onto the chain the moment the home network goes -
 nothing needs switching by hand, and nothing is restarted. The home route
 is WireGuard too, so a late switch stalls; it never leaks.
 
-## Tracker links
+## The extension
 
-The tracker blocklist also refuses the click-tracking wrappers that email and
-affiliate links go through, which breaks the link. Many carry the
-destination inside them, and the vpnchain extension reads it off before any
-request is made. Chrome no longer loads extensions from the command line, so
-load it once by hand: `chrome://extensions`, Developer mode, Load unpacked,
-`~/.local/share/vpnchain/extension`. Wrappers whose links hold only an ID
-stay blocked; `rules.js` lists both kinds.
+`.local/share/vpnchain/extension` is a Chrome extension for the pinned
+browser. Chrome no longer loads extensions from the command line, so load it
+once by hand: `chrome://extensions`, Developer mode, Load unpacked,
+`~/.local/share/vpnchain/extension`. What it cannot see from inside the
+browser it asks a native messaging host, which `vpnchain browser` (and
+`vpnchain setup`) registers for this extension's ID alone.
 
-The same extension takes over the incognito shortcut (Cmd-Shift-N, Ctrl-Shift-N
-on Linux), which the pinned browser no longer answers, and opens the incognito
-browser instead - or a new window in it, when it is already up. An extension
-cannot start a program, so it asks a native messaging host, which
-`vpnchain browser` (and `vpnchain setup`) registers for this extension's ID
-alone. If Chrome keeps the key for itself, pick another at
-`chrome://extensions/shortcuts`.
+- **Fails closed.** The pinned browser takes its proxy from the command line,
+  so one opened from the Dock or Spotlight browses on the real address. The
+  extension blocks every page until the host confirms this browser was
+  launched with the pinned proxy, and the block is in force before session
+  restore loads a tab. A browser launched without it shows a page saying so,
+  and `OFF` on the toolbar. Loopback stays open, and the browser's own traffic
+  (sync, updates, Safe Browsing) is not the extension's to block.
+- **Shows the chain.** The toolbar badge reads the status server once a
+  minute: `OK`, `~` when the upstream is in trouble, `!` when the chain is
+  down or the exit is not the expected address, `?` with no status server.
+  Hover for the mode, node and exits; click for the dashboard.
+- **Explains refusals.** A page the chain refuses - on the tracker list, or
+  in a `KEEP_OUT_COUNTRIES` site list or domain - says which, instead of a
+  bare connection error. By name only: a host refused by address range keeps
+  the browser's error, since resolving it here would ask the local resolver.
+- **Unwraps tracker links.** The tracker blocklist also refuses the
+  click-tracking wrappers that email and affiliate links go through. Many
+  carry the destination inside them, and the extension reads it off before
+  any request is made. Wrappers whose links hold only an ID stay blocked;
+  `rules.js` lists both kinds.
+- **Takes the incognito shortcut** (Cmd-Shift-N, Ctrl-Shift-N on Linux),
+  which the pinned browser no longer answers, and opens the incognito browser
+  instead - or a new window in it, when it is already up. If Chrome keeps the
+  key for itself, pick another at `chrome://extensions/shortcuts`.
 
 `vpnchain` with no arguments lists the verbs; the header of `bin/vpnchain`
 explains each.

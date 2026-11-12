@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
-"""Native messaging host for the vpnchain Chrome extension: the incognito
-shortcut arrives here and leaves as 'vpnchain browser incognito'.
+"""Native messaging host for the vpnchain Chrome extension: what the extension
+needs and cannot do itself, which is to look outside the browser.
+
+  incognito  'vpnchain browser incognito', for the incognito shortcut.
+  proxied    whether the browser asking was launched with the pinned proxy,
+             which is what lets the extension fail closed: its pages stay
+             blocked until this says yes. The browser is this process's
+             parent, and its command line is readable, where its proxy
+             settings are not - a --proxy-server flag is invisible to
+             chrome.proxy.
+  classify   whether the live sing-box config refuses a host, and why, so a
+             refused page can say so instead of showing a bare connection
+             error.
 
 Chrome starts this for one message and closes it after the reply, so the
 launch is detached into a session of its own, with its output in
@@ -9,20 +20,26 @@ that fails says so in a notification, since nothing else is watching.
 
 SECURITY: Chrome starts this only for the extension IDs in the host manifest
 'vpnchain browser' writes, and that is ours alone - no web page can reach it,
-which is why this is not an endpoint of the status server. It still checks
-the caller and accepts the one action, so it can be made to do nothing but
-what the shortcut does.
+which is why none of this is an endpoint of the status server. It still
+checks the caller, accepts only these actions, and takes nothing from a
+message but a host name it validates, passed as an argument, never to a
+shell.
 """
 
+import importlib.machinery
+import importlib.util
 import json
 import os
+import platform
+import re
 import struct
 import subprocess
 import sys
 
 # This file sits in .local/libexec/vpnchain of the vpnchain tree, the command
 # in bin; found from the real file, so a link to this one works.
-ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", ".."))
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
 VPNCHAIN = os.path.join(ROOT, "bin", "vpnchain")
 LOG = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
@@ -46,6 +63,22 @@ else
 fi
 '''
 
+# A host name as the browser hands it to the proxy: IDNs arrive in punycode.
+HOST_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9_-]+(\.[a-z0-9_-]+)*\.?$")
+
+
+def statusd():
+    """The status server, as a module, for its env reader and its way of
+    finding the sing-box agent - one copy of each rather than two to keep in
+    sync. Importing it starts nothing: the server runs only as __main__."""
+    path = os.path.join(HERE, "vpnchain-statusd")
+    loader = importlib.machinery.SourceFileLoader("vpnchain_statusd", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    mod.refresh_env()
+    return mod
+
 
 def read_message():
     head = sys.stdin.buffer.read(4)
@@ -68,6 +101,113 @@ def launch():
     subprocess.Popen(["/bin/sh", "-c", LAUNCH, "sh", VPNCHAIN, LOG],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+    return {"ok": True}
+
+
+def parent_args():
+    ppid = os.getppid()
+    if platform.system() == "Linux":
+        try:
+            with open("/proc/%d/cmdline" % ppid, "rb") as f:
+                return f.read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            return []
+    p = subprocess.run(["/bin/ps", "-o", "args=", "-p", str(ppid)],
+                       capture_output=True, text=True)
+    return p.stdout.split()
+
+
+def proxied():
+    """Exactly the flag 'vpnchain browser' passes. A browser holding some
+    other proxy is not on the chain either."""
+    sd = statusd()
+    flag = "--proxy-server=socks5://%s:%s" % (sd.env("PROXY_HOST", "127.0.0.1"),
+                                              sd.env("PROXY_PORT", "1080"))
+    return {"ok": True, "proxied": flag in parent_args(),
+            "statusPort": int(sd.env("STATUS_PORT", "8787"))}
+
+
+def suffix_match(host, suffixes):
+    for s in suffixes:
+        if s.startswith("."):
+            if host.endswith(s):
+                return s
+        elif host == s or host.endswith("." + s):
+            return s
+    return None
+
+
+def classify(host):
+    """Walks the live config's route rules as sing-box would for the pinned
+    inbound, by name only, and reports the first one that decides the host.
+
+    Refusals that cover every inbound are looked for first, ahead of the
+    pinned inbound's own: the country lists carry trackers such as
+    doubleclick.net, which sing-box then refuses by country, but the tracker
+    list is the truer reason - it refuses them in either browser.
+
+    Address ranges are skipped: they match the address the name resolves to,
+    and resolving it here would ask the local resolver about a name the
+    chain was keeping from it. A host refused only by those is reported as
+    not refused, and keeps the browser's own error page."""
+    host = host.lower().rstrip(".")
+    if not HOST_RE.match(host):
+        return {"ok": False, "error": "bad host"}
+    sd = statusd()
+    binary, _ = sd.singbox_agent()
+    try:
+        with open(sd.singbox_config_path()) as f:
+            route = json.load(f).get("route", {})
+    except (OSError, ValueError):
+        return {"ok": False, "error": "no sing-box config"}
+    sets = {s.get("tag"): s.get("path") for s in route.get("rule_set", [])
+            if s.get("type") == "local"}
+
+    def in_set(tag):
+        path = sets.get(tag)
+        if not binary or not path or "geoip" in tag:
+            return False
+        try:
+            p = subprocess.run([binary, "rule-set", "match", "-f", "binary",
+                                path, host], capture_output=True, text=True,
+                               timeout=10)
+        except Exception:
+            return False
+        # Exit status is 0 either way; a match is reported as text.
+        return bool((p.stdout + p.stderr).strip())
+
+    rules = [r for r in route.get("rules", []) if r.get("type") != "logical"
+             and "pinned-in" in r.get("inbound", ["pinned-in"])]
+    everywhere = [r for r in rules if "inbound" not in r and r.get("action") == "reject"]
+    for rule in everywhere + rules:
+        hit = None
+        s = suffix_match(host, rule.get("domain_suffix", []))
+        if s:
+            hit = {"by": "suffix", "suffix": s}
+        elif host in rule.get("domain", []):
+            hit = {"by": "domain"}
+        else:
+            tags = rule.get("rule_set", [])
+            for tag in [tags] if isinstance(tags, str) else tags:
+                if in_set(tag):
+                    hit = {"by": "list", "list": tag}
+                    break
+        if not hit:
+            continue
+        if rule.get("action") != "reject":
+            return {"ok": True, "refused": False}
+        tag = hit.get("list", "")
+        m = re.match(r"keep-out-geosite-(\w+)$", tag)
+        if tag == "blocklist":
+            hit["kind"] = "tracker"
+        elif m:
+            hit.update(kind="country", country=m.group(1))
+        elif hit["by"] == "suffix":
+            hit["kind"] = "country"
+        else:
+            hit["kind"] = "other"
+        return dict(ok=True, refused=True, host=host, **hit)
+    return {"ok": True, "refused": False}
 
 
 def main():
@@ -78,11 +218,17 @@ def main():
         msg = read_message()
     except ValueError:
         msg = None
-    if not isinstance(msg, dict) or msg.get("action") != "incognito":
+    if not isinstance(msg, dict):
+        msg = {}
+    action = msg.get("action")
+    if action == "incognito":
+        reply(launch())
+    elif action == "proxied":
+        reply(proxied())
+    elif action == "classify" and isinstance(msg.get("host"), str):
+        reply(classify(msg["host"]))
+    else:
         reply({"ok": False, "error": "unknown action"})
-        return
-    launch()
-    reply({"ok": True})
 
 
 if __name__ == "__main__":
