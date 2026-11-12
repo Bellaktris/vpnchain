@@ -95,12 +95,13 @@ browser it asks a native messaging host, which `vpnchain browser` (and
   extension blocks every page until the host confirms this browser was
   launched with the pinned proxy, and the block is in force before session
   restore loads a tab. A browser launched without it shows a page saying so,
-  and `OFF` on the toolbar. Loopback stays open, and the browser's own traffic
+  and a red dot with a bar on the toolbar icon. Loopback stays open, and the browser's own traffic
   (sync, updates, Safe Browsing) is not the extension's to block.
-- **Shows the chain.** The toolbar badge reads the status server once a
-  minute: `OK`, `~` when the upstream is in trouble, `!` when the chain is
-  down or the exit is not the expected address, `?` with no status server.
-  Hover for the mode, node and exits; click for the dashboard.
+- **Shows the chain.** A dot on the toolbar icon, from the status server
+  once a minute: green when on the chain, amber `~` when the upstream is in
+  trouble, red `!` when the chain is down or the exit is not the expected
+  address, grey `?` with no status server. Hover for the mode, node and
+  exits; click for the dashboard.
 - **Explains refusals.** A page the chain refuses - on the tracker list, or
   in a `KEEP_OUT_COUNTRIES` site list or domain - says which, instead of a
   bare connection error. By name only: a host refused by address range keeps

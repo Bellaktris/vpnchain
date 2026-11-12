@@ -3,7 +3,7 @@
 //   - fail closed: pages stay blocked until the native host confirms this
 //     browser was launched with the pinned proxy
 //   - unwrap: tracker links that carry their destination open it directly
-//   - status: the toolbar badge shows the chain's state, from the status server
+//   - status: the toolbar icon shows the chain's state, from the status server
 //   - explain: a page the chain refuses says why, instead of a bare error
 //
 // plus the incognito shortcut. What the extension cannot see from inside the
@@ -100,7 +100,7 @@ async function lift(state) {
         chrome.tabs.reload(id).catch(() => {});
     }
     await session.set("blockedTabs", []);
-    refreshBadge();
+    refreshStatus();
 }
 
 // One at a time: startup and a waking service worker both ask, and two
@@ -121,7 +121,7 @@ async function check() {
     }
     await session.set("state", "off");
     await session.set("why", reply.ok ? "" : reply.error);
-    refreshBadge();
+    refreshStatus();
     // Once per session, so a browser opened from the Dock says why nothing
     // loads rather than leaving a window of blocked tabs to puzzle over.
     if (!(await session.get("explained", false))) {
@@ -132,23 +132,25 @@ async function check() {
 
 // --- status ------------------------------------------------------------------
 
-const BADGE = {
-    off:     { text: "OFF", color: "#d70015" },
-    bad:     { text: "!",   color: "#d70015" },
-    warn:    { text: "~",   color: "#b25000" },
-    ok:      { text: "OK",  color: "#248a3d" },
-    unknown: { text: "?",   color: "#6e6e73" },
+// The state is drawn into the icon rather than shown as a badge: Chrome's
+// badge is a pill across the bottom of the icon that cannot be moved, and
+// covers it. So the letter sits small in the top left and the state is a dot
+// in the bottom right; the tooltip carries the words.
+const STATUS = {
+    off:     { color: "#d70015", mark: "bar" },
+    bad:     { color: "#d70015", mark: "!" },
+    warn:    { color: "#b25000", mark: "~" },
+    ok:      { color: "#248a3d", mark: "" },
+    unknown: { color: "#6e6e73", mark: "?" },
 };
 
-// Drawn rather than shipped: with no icon Chrome shows a letter of its own,
-// which the badge covers half of. While a badge is up the letter shrinks into
-// the top left corner, clear of it.
-function icon(small) {
+function icon(level) {
+    const { color, mark } = STATUS[level];
     const images = {};
     for (const size of [16, 32]) {
         const c = new OffscreenCanvas(size, size);
         const g = c.getContext("2d");
-        const box = small ? size * 0.62 : size;
+        const box = size * 0.62;
         g.fillStyle = "#5f6368";
         g.beginPath();
         g.roundRect(0, 0, box, box, box * 0.22);
@@ -158,6 +160,27 @@ function icon(small) {
         g.textAlign = "center";
         g.textBaseline = "middle";
         g.fillText("v", box / 2, box * 0.44);
+
+        // Cut out a ring around the dot, so it reads as separate from the
+        // letter's corner on any toolbar colour.
+        const r = size * 0.25, x = size - r, y = size - r;
+        g.globalCompositeOperation = "destination-out";
+        g.beginPath();
+        g.arc(x, y, r + size * 0.06, 0, 2 * Math.PI);
+        g.fill();
+        g.globalCompositeOperation = "source-over";
+        g.fillStyle = color;
+        g.beginPath();
+        g.arc(x, y, r, 0, 2 * Math.PI);
+        g.fill();
+        g.fillStyle = "#fff";
+        if (mark === "bar") {
+            g.fillRect(x - r * 0.55, y - r * 0.16, r * 1.1, r * 0.32);
+        } else if (mark && size >= 32) {
+            // At 16px a glyph in a 4px dot is noise; the colour says enough.
+            g.font = `bold ${Math.round(r * 1.5)}px -apple-system, BlinkMacSystemFont, sans-serif`;
+            g.fillText(mark, x, y + r * 0.08);
+        }
         images[size] = g.getImageData(0, 0, size, size);
     }
     return chrome.action.setIcon({ imageData: images });
@@ -179,7 +202,7 @@ function judge(s) {
     return { level, lines };
 }
 
-async function refreshBadge() {
+async function refreshStatus() {
     const state = await session.get("state");
     let level, lines;
     if (state === "on") {
@@ -198,16 +221,15 @@ async function refreshBadge() {
         level = "off";
         lines = ["NOT on the chain - pages are blocked"];
     }
-    await icon(Boolean(BADGE[level].text));
-    await chrome.action.setBadgeText({ text: BADGE[level].text });
-    await chrome.action.setBadgeBackgroundColor({ color: BADGE[level].color });
+    await icon(level);
+    await chrome.action.setBadgeText({ text: "" });
     await chrome.action.setTitle({ title: ["vpnchain", ...lines].join("\n") });
 }
 
 // Created only when missing: recreating it at every service worker start
 // would push the next refresh back each time.
 chrome.alarms.get("status").then((a) => a || chrome.alarms.create("status", { periodInMinutes: 1 }));
-chrome.alarms.onAlarm.addListener((a) => { if (a.name === "status") refreshBadge(); });
+chrome.alarms.onAlarm.addListener((a) => { if (a.name === "status") refreshStatus(); });
 
 // The dashboard when on the chain, the explanation when not.
 chrome.action.onClicked.addListener(async () => {
@@ -217,7 +239,7 @@ chrome.action.onClicked.addListener(async () => {
     } else {
         chrome.tabs.create({ url: chrome.runtime.getURL("unproxied.html") });
     }
-    refreshBadge();
+    refreshStatus();
 });
 
 // --- explain -----------------------------------------------------------------
