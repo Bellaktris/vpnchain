@@ -111,14 +111,20 @@ function verify() {
     return verifying;
 }
 
+// The lift and the state recording why are cleared at different times:
+// reloading the extension empties session storage but keeps session rules.
+// Only both together are an answer; a lift without one is asked about again,
+// and dropped if this browser turns out not to be on the chain.
 async function check() {
-    if (await lifted()) return;
+    const state = await session.get("state");
+    if ((state === "on" || state === "forced") && (await lifted())) return;
     const reply = await ask({ action: "proxied" });
     if (reply.ok && reply.statusPort) await session.set("statusPort", reply.statusPort);
     if (reply.ok && reply.proxied) {
         await lift("on");
         return;
     }
+    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ALLOW_ID] });
     await session.set("state", "off");
     await session.set("why", reply.ok ? "" : reply.error);
     refreshStatus();
