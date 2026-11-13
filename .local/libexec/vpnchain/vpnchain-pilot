@@ -44,7 +44,10 @@ The priorities, in order, and what each one costs the next:
      the real end-to-end order of eight nodes far better than either alone
      (see geo_ms). The active node is replaced on latency alone only by a
      clearly better one, measured twice: every switch shows the network
-     another name, or with ECH at least another connection.
+     another name, or with ECH at least another connection. In chained mode
+     that one may come from outside the standbys, the active node's own
+     family included (see look_nearer), so a failover to a node far from
+     the peer does not last once a near one answers again.
 
 The state, including recent events, is written to pilot.json beside the env
 file, for the dashboard and for whoever wants to know why the exit moved.
@@ -804,6 +807,79 @@ class Pilot:
                 self.switch(tag, "latency")
                 return
 
+    @staticmethod
+    def clearly_better(new, old):
+        return new < old * UPGRADE_RATIO and new < old - UPGRADE_MS
+
+    def look_nearer(self):
+        """In chained mode, a node clearly better than the active ECH node -
+        nearer the WireGuard peer, typically - from any family, its own
+        included, which the standbys never come from. Without this a
+        failover strands the chain wherever the standby happened to be: on
+        the other side of the world from the peer while a node next to it
+        answers again, since maybe_upgrade looks only at the standbys. ECH
+        nodes only, all on one CDN behind its shared name, so a probe shows
+        the network one more connection to that CDN and nothing it can
+        block by name.
+
+        A candidate has to beat the active node twice, a few minutes apart.
+        With nothing to beat it, the ECH standby gets the same look, from
+        the families a standby may come from, and is replaced after one."""
+        act = self.state["active"]
+        if self.reality_mode or not self.is_ech(act):
+            return
+        act_score = self.score(act)
+        pending = self.state.get("nearer")
+        if pending:
+            if time.time() < pending["at"]:
+                return
+            self.state.pop("nearer")
+            tag = pending["tag"]
+            if tag in self.reserve() and not self.stalled(tag):
+                ms = self.probe(tag)
+                if ms and self.clearly_better(ms + self.geo_ms(tag), act_score):
+                    self.switch(tag, "latency")
+                    # A standby of the new node's family is no standby: the
+                    # node left behind takes its place if its own family
+                    # allows, as on any latency switch, and fill_standbys
+                    # finds another otherwise.
+                    fam = self.family(tag)
+                    sb = [t for t in self.state["standbys"] if self.family(t) != fam]
+                    if len(sb) < len(self.state["standbys"]) and self.family(act) not in \
+                            {fam, *(self.family(t) for t in sb)}:
+                        sb.append(act)
+                        self.state["due"]["standby:" + act] = \
+                            time.time() + random.uniform(*STANDBY_EVERY)
+                    self.state["standbys"] = sb
+            return
+        if not self.due("nearer", STANDBY_EVERY):
+            return
+        # Not one that failed within the hour: probing it again is likely
+        # wasted, and the best-scored dead node would take every turn.
+        hour_ago = time.time() - 3600
+        cands = [t for t in self.reserve() if self.is_ech(t) and not self.stalled(t)
+                 and not (self.stat(t)["fails"] and self.stat(t)["last_try"] > hour_ago)]
+        tag = self.weighted_pick([t for t in cands
+                                  if self.clearly_better(self.score(t), act_score)])
+        if tag:
+            ms = self.probe(tag)
+            if ms and self.clearly_better(ms + self.geo_ms(tag), act_score):
+                self.state["nearer"] = {"tag": tag, "at": time.time() + random.uniform(60, 180)}
+            return
+        worse = next((t for t in self.state["standbys"] if self.is_ech(t)), None)
+        if not worse:
+            return
+        fams = {self.family(t) for t in [act, *self.state["standbys"]] if t != worse}
+        tag = self.weighted_pick([t for t in cands if self.family(t) not in fams
+                                  and self.clearly_better(self.score(t), self.score(worse))])
+        if not tag:
+            return
+        ms = self.probe(tag)
+        if ms and self.clearly_better(ms + self.geo_ms(tag), self.score(worse)):
+            self.state["standbys"] = [t for t in self.state["standbys"] if t != worse] + [tag]
+            self.state["due"]["standby:" + tag] = time.time() + random.uniform(*STANDBY_EVERY)
+            self.event("standby", "%s replaces %s (%.0f ms est.)" % (tag, worse, self.score(tag)))
+
     def explore(self):
         """One node nobody has measured, so the pool keeps up with what the
         provider adds and what got fixed. Replaces a standby only if better."""
@@ -1096,6 +1172,7 @@ class Pilot:
             else:
                 self.state.pop("rotation", None)
                 self.maybe_upgrade()
+                self.look_nearer()
             if self.due("explore", EXPLORE_EVERY):
                 self.explore()
             act = self.state["active"]
