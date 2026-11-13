@@ -103,6 +103,20 @@ async function lift(state) {
     refreshStatus();
 }
 
+// The flag is not the last word: a proxy set by another extension, or by a
+// policy, takes precedence over the command line, and would carry pages off
+// the chain with the flag still in place. Unless it is the pinned proxy
+// itself, that is as good as no flag at all.
+async function overridden(reply) {
+    const { levelOfControl, value } = await chrome.proxy.settings.get({});
+    if (levelOfControl !== "controlled_by_other_extensions" && levelOfControl !== "not_controllable") {
+        return false;
+    }
+    const p = value?.rules?.singleProxy;
+    return !(value?.mode === "fixed_servers" && p?.scheme === "socks5" &&
+             p.host === reply.proxyHost && p.port === reply.proxyPort);
+}
+
 // One at a time: startup and a waking service worker both ask, and two
 // answers in flight would explain the same thing twice.
 let verifying = null;
@@ -120,13 +134,15 @@ async function check() {
     if ((state === "on" || state === "forced") && (await lifted())) return;
     const reply = await ask({ action: "proxied" });
     if (reply.ok && reply.statusPort) await session.set("statusPort", reply.statusPort);
-    if (reply.ok && reply.proxied) {
+    const override = reply.ok && reply.proxied && (await overridden(reply));
+    if (reply.ok && reply.proxied && !override) {
         await lift("on");
         return;
     }
     await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ALLOW_ID] });
     await session.set("state", "off");
-    await session.set("why", reply.ok ? "" : reply.error);
+    await session.set("why", !reply.ok ? reply.error : override
+        ? "Another extension or a policy has set this browser's proxy, which takes precedence over the pinned one." : "");
     refreshStatus();
     // Once per session, so a browser opened from the Dock says why nothing
     // loads rather than leaving a window of blocked tabs to puzzle over.
@@ -304,6 +320,13 @@ chrome.commands.onCommand.addListener(async (command) => {
     if (command !== "incognito") return;
     const reply = await ask({ action: "incognito" });
     if (!reply.ok) console.warn(`vpnchain: ${reply.error}`);
+});
+
+// A proxy set while the browser runs is checked as it is set, whatever the
+// state - including one unblocked by hand.
+chrome.proxy.settings.onChange.addListener(async () => {
+    await session.set("state", null);
+    verify();
 });
 
 chrome.runtime.onInstalled.addListener(() => register().then(verify));

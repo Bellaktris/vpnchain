@@ -121,9 +121,12 @@ def proxied():
     """Exactly the flag 'vpnchain browser' passes. A browser holding some
     other proxy is not on the chain either."""
     sd = statusd()
-    flag = "--proxy-server=socks5://%s:%s" % (sd.env("PROXY_HOST", "127.0.0.1"),
-                                              sd.env("PROXY_PORT", "1080"))
+    host, port = sd.env("PROXY_HOST", "127.0.0.1"), sd.env("PROXY_PORT", "1080")
+    flag = "--proxy-server=socks5://%s:%s" % (host, port)
+    # The proxy too, so the extension can tell whether a proxy set by another
+    # extension or a policy - either of which beats the flag - is this one.
     return {"ok": True, "proxied": flag in parent_args(),
+            "proxyHost": host, "proxyPort": int(port),
             "statusPort": int(sd.env("STATUS_PORT", "8787"))}
 
 

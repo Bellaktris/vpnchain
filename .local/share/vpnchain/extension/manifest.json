@@ -4,7 +4,7 @@
     "version": "3",
     "description": "Keeps the pinned browser off the network unless it was launched on the chain, shows the chain's state, explains the pages it refuses, opens tracker links' destinations directly, and maps the incognito shortcut to the incognito browser.",
     "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAhl8y5IsUD83+AbLlTxZzL9i0P5m+WvqJgR82u4rSbAvDjXjr/NB4UVjZJR4lq5QhDt3oB6CkH4gXP265GfZSdMgI6sa5oysD573gZwPlek6K7znPuZLHPzeBSOOzeFE803qJb6j3lRw1gE8HiKEsmd2LxPuklqTuEq+xgfaW6rqiwLH05RX1smhDTGs0ob5REdHmpHSWU6DAIadsaqf0L/ffMUQL/ih/h3dSkNtvvFGBpPGcblS/V3uQRqwn7ra/VdbDJ6U6BDsQRoocrSKJ93hp1QWGdbrObZ1vRZbSWz55rkXJvBv9lzrB7YrwDM/kvkRyIjAMHmCiI3/xNL1NawIDAQAB",
-    "permissions": ["declarativeNetRequest", "nativeMessaging", "webNavigation", "alarms", "storage"],
+    "permissions": ["declarativeNetRequest", "nativeMessaging", "webNavigation", "alarms", "storage", "proxy"],
     "host_permissions": ["<all_urls>"],
     "background": { "service_worker": "background.js", "type": "module" },
     "action": { "default_title": "vpnchain" },

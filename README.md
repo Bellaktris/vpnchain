@@ -94,7 +94,9 @@ browser it asks a native messaging host, which `vpnchain browser` (and
   so one opened from the Dock or Spotlight browses on the real address. The
   extension blocks every page until the host confirms this browser was
   launched with the pinned proxy, and the block is in force before session
-  restore loads a tab. A browser launched without it shows a page saying so,
+  restore loads a tab. A proxy set by another extension or a policy, which
+  would take precedence over the flag, counts as no flag, checked again
+  whenever one changes. A browser launched without it shows a page saying so,
   and a red dot with a bar on the toolbar icon. Loopback stays open, and the browser's own traffic
   (sync, updates, Safe Browsing) is not the extension's to block.
 - **Shows the chain.** A dot on the toolbar icon, from the status server
