@@ -3181,9 +3181,20 @@ incognito_front() {
     local pid
     pid=$(incognito_main_pid)
     [ -n "$pid" ] || return 0
+    # Asked until it is the front app, for up to ten seconds: macOS ignores
+    # the request while the app is still launching, and a cold start can
+    # outlast the three seconds the launch waits. Backgrounded, so the
+    # caller is not held up by it.
     osascript -l JavaScript -e "ObjC.import('AppKit');
-        \$.NSRunningApplication.runningApplicationWithProcessIdentifier($pid)
-            .activateWithOptions(\$.NSApplicationActivateAllWindows)" >/dev/null 2>&1
+        for (var i = 0; i < 20; i++) {
+            var app = \$.NSRunningApplication.runningApplicationWithProcessIdentifier($pid);
+            if (!app || app.isTerminated) break;
+            if (app.finishedLaunching) {
+                if (\$.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier == $pid) break;
+                app.activateWithOptions(\$.NSApplicationActivateAllWindows);
+            }
+            delay(0.5);
+        }" >/dev/null 2>&1 &
 }
 
 # The incognito browser. Everything this configures lives in the profile it
