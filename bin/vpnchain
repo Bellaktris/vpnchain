@@ -2162,7 +2162,8 @@ keep_out_probe() {
 }
 KEEP_OUT_MUST_PASS=(google.com wikipedia.org github.com 8.8.8.8 1.1.1.1
                     ssl.gstatic.com fonts.googleapis.com www.apple.com
-                    ocsp.apple.com ocsp.pki.goog aliexpress.com lenovo.com)
+                    ocsp.apple.com ocsp.pki.goog aliexpress.com lenovo.com
+                    www.recaptcha.net)
 
 # Global services the country lists carry because they are also served from
 # inside that country. The CN list holds 21 google.com names and 143 apple.com
@@ -2170,15 +2171,19 @@ KEEP_OUT_MUST_PASS=(google.com wikipedia.org github.com 8.8.8.8 1.1.1.1
 # country out but breaking the web: Google Docs reports "No connection" when
 # its ssl.gstatic.com connectivity probe is refused, and certificate checks
 # fail closed. Entries at or under these are taken out of each geosite list
-# before it is verified, so the generated config and its rules are untouched.
+# before it is verified. The lists also carry whole suffixes (the RU one holds
+# .ru and .su), which no filtering of entries can open, so the generated
+# config excuses these names from every keep-out rule as well - the TLDs'
+# among them, which is what lets google.ru through.
 #
 # Trackers among them (doubleclick, google-analytics) are left in, since the
 # blocklist refuses those anyway. akamaized.net is left in too: its entries
 # are Kinopoisk and miHoYo, both the countries' own.
 KEEP_OUT_SHARED=(
-    # Google
+    # Google. recaptcha.net is reCAPTCHA's other home, which sites load it
+    # from to reach China too - refused, the captcha never draws
     google.com gstatic.com googleapis.com googlevideo.com gvt1.com gvt2.com
-    goog
+    goog recaptcha.net google.ru
     # Apple
     apple.com mzstatic.com cdn-apple.com apple-mapkit.com
     # Microsoft
@@ -2782,6 +2787,7 @@ generate_config() {
     BL="$(blocklist_active && echo "$BLOCKLIST_PATH")" \
     KEEP_OUT="$KEEP_OUT_COUNTRIES" KEEP_OUT_DIR="$KEEP_OUT_DIR" \
     KEEP_OUT_TLDS="$(for cc in $KEEP_OUT_COUNTRIES; do keep_out_tlds "$cc"; done)" \
+    KEEP_OUT_SHARED="${KEEP_OUT_SHARED[*]}" \
     TOR_PORT="$TOR_PORT" I2P_PORT="$I2P_PORT" LOG_LEVEL="$LOG_LEVEL" \
     HOME_WG_HOST="${HOME_WG_HOST:-}" HOME_WG_PRIVATE_KEY="${HOME_WG_PRIVATE_KEY:-}" \
     HOME_WG_ADDRESS="${HOME_WG_ADDRESS:-}" \
@@ -3063,9 +3069,21 @@ if bl:
 # address, and the browser hands over names, so the name is resolved first -
 # through the same DNS the tunnel would use for it a moment later anyway.
 # Except .onion and .i2p, which must never reach a resolver at all.
+#
+# Each reject spares KEEP_OUT_SHARED, which the lists cannot be trusted to:
+# a suffix entry like .ru covers google.ru whatever was filtered out of them.
 tlds = e.get("KEEP_OUT_TLDS", "").split()
 if tlds:
-    keep = [{"inbound": ["pinned-in"], "domain_suffix": tlds, "action": "reject"}]
+    shared = e.get("KEEP_OUT_SHARED", "").split()
+
+    def keep_reject(rule):
+        rule = dict(rule, inbound=["pinned-in"])
+        if not shared:
+            return dict(rule, action="reject")
+        return {"type": "logical", "mode": "and", "action": "reject",
+                "rules": [rule, {"domain_suffix": shared, "invert": True}]}
+
+    keep = [keep_reject({"domain_suffix": tlds})]
     sets = {"geosite": [], "geoip": []}
     for cc in e.get("KEEP_OUT", "").split():
         for kind in sets:
@@ -3076,15 +3094,13 @@ if tlds:
                     {"type": "local", "tag": tag, "format": "binary", "path": path})
                 sets[kind].append(tag)
     if sets["geosite"]:
-        keep.append({"inbound": ["pinned-in"], "rule_set": sets["geosite"],
-                     "action": "reject"})
+        keep.append(keep_reject({"rule_set": sets["geosite"]}))
     if sets["geoip"]:
         keep += [
             {"type": "logical", "mode": "and", "action": "resolve",
              "rules": [{"inbound": ["pinned-in"]},
                        {"domain_suffix": ["onion", "i2p"], "invert": True}]},
-            {"inbound": ["pinned-in"], "rule_set": sets["geoip"],
-             "action": "reject"},
+            keep_reject({"rule_set": sets["geoip"]}),
         ]
     cfg["route"]["rules"][0:0] = keep
 
