@@ -24,6 +24,13 @@
 # that identifies you, so torrents belong on the upstream exits only. A client
 # pointed at the wrong port is turned away rather than trusted to be right.
 #
+# With a subscription they have a port of their own, TORRENT_PORT, apart from
+# the shared one: not every node carries them. Some cut any connection that
+# looks like BitTorrent - a tracker announce is enough - which the shared
+# port's latency probes cannot see. The torrent port has a selector of its
+# own, which the pilot tests with an announce in the clear and moves off any
+# node that cuts it.
+#
 # Everything site-specific lives in $XDG_CONFIG_HOME/vpnchain/env, which is
 # deliberately outside this repo. See the template printed by this script when
 # that file is missing.
@@ -50,7 +57,8 @@
 #            ECH - Russia, China, Iran. Reality's visible server name is a
 #            real site's and the node is dialled by stored address, so
 #            neither the name nor DNS gives it away. The shared port goes
-#            through it too, but BitTorrent is refused: dozens of busy
+#            through it too, but BitTorrent is refused, the torrent port
+#            outright: dozens of busy
 #            connections to one server is how such networks find Reality
 #            servers. The incognito browser uses the subscription's Reality
 #            nodes only, never one of your own, whose address is yours alone.
@@ -593,7 +601,13 @@ or, without one, an upstream SOCKS proxy run by something else:
 Optional:
 
     SHARED_PORT=<with a subscription: SOCKS/HTTP port onto the provider's
-             nodes for other programs (torrent client, i2pd), default 20170>
+             nodes for other programs (i2pd and the like), default 20170>
+    TORRENT_PORT=<with a subscription: SOCKS/HTTP port for a torrent client,
+             onto whichever node lets BitTorrent through, default 20171>
+    TORRENT_PROBE_URL=<plain-HTTP URL shaped like a tracker announce, which
+             the pilot sends through the torrent port; a node that cuts it is
+             not used for torrents. The default asks gstatic.com's
+             generate_204, which ignores the query>
     PILOT_AGENT=<launchd label or unit name of vpnchain-pilot, which picks
              the node; unset leaves the selection to you>
     EXIT_REGION=<city of the WireGuard peer, e.g. Frankfurt; the pilot prefers
@@ -1491,6 +1505,7 @@ if nodes != doc["nodes"]:
 PY
 }
 SHARED_PORT="${SHARED_PORT:-20170}"
+TORRENT_PORT="${TORRENT_PORT:-20171}"
 # Resolvers for node names, by address so that none needs a lookup of its
 # own: DoH to each in turn, then the system's resolver as the last resort.
 # Only one is in use at a time - sing-box has no failover between DNS
@@ -1994,7 +2009,8 @@ PY
         ok "the tunnel and the shared port now go through Reality nodes only,"
         ok "your own first; the incognito browser through the subscription's"
         ok "Reality nodes only, never your own"
-        ok "BitTorrent is refused on the shared port while in this mode"
+        ok "BitTorrent is refused on the shared port, and the torrent port"
+        ok "refused outright, while in this mode"
         # i2pd dials out through the shared port, so a running router would
         # move its dozens of connections onto the Reality server with the
         # switch. Stopped here rather than left to be noticed.
@@ -2686,21 +2702,29 @@ live_config_native() {
 # proxy core used to hold. If something still holds it, sing-box would exit
 # at once and launchd would restart it forever, with the browser on no
 # tunnel - so refuse up front, and say why.
+# The torrent port is checked alongside, for the same reason; the first port
+# found held by something else is left in BLOCKED_PORT for the message.
 shared_port_blocked() {
     native && live_config_native || return 1
-    port_listening 127.0.0.1 "$SHARED_PORT" || return 1
-    # Held - by sing-box itself, which is fine, or by anything else.
-    local pid
-    for pid in $(pgrep -f 'sing-box run'); do
-        lsof -nP -a -p "$pid" -iTCP:"$SHARED_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
-            && return 1
+    local port pid mine
+    for port in "$SHARED_PORT" "$TORRENT_PORT"; do
+        port_listening 127.0.0.1 "$port" || continue
+        # Held - by sing-box itself, which is fine, or by anything else.
+        mine=
+        for pid in $(pgrep -f 'sing-box run'); do
+            lsof -nP -a -p "$pid" -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 \
+                && { mine=1; break; }
+        done
+        [ -n "$mine" ] && continue
+        BLOCKED_PORT=$port
+        return 0
     done
-    return 0
+    return 1
 }
 
 refuse_if_port_blocked() {
     shared_port_blocked || return 0
-    bad "port $SHARED_PORT is held by another program - stop it first"
+    bad "port $BLOCKED_PORT is held by another program - stop it first"
     bad "(the proxy core this config replaces, if it is still running)"
     exit 1
 }
@@ -2774,6 +2798,7 @@ generate_config() {
         clash_secret >/dev/null || return 1
     fi
     NODES="$native_nodes" SHARED_PORT="$SHARED_PORT" NODE_DNS="$NODE_DNS" \
+    TORRENT_PORT="$TORRENT_PORT" \
     NODE_DNS_CHOICE="$(cat "$NODE_DNS_STATE" 2>/dev/null)" \
     CLASH_PORT="$CLASH_PORT" CLASH_SECRET="$(native && clash_secret)" \
     CACHE_PATH="$(dirname "$SINGBOX_CONFIG")/cache.db" \
@@ -2971,10 +2996,32 @@ if nodes:
     cfg["route"]["default_domain_resolver"] = "node-dns-" + (
         chosen if chosen in choices else choices[0])
     # The port other programs used to give the separate core. Torrents are
-    # welcome here: this is the shared exit, not the pinned address.
+    # not refused here - this is the shared exit, not the pinned address -
+    # but they belong on the torrent port, since the node the pilot holds
+    # here may be one that cuts BitTorrent.
     cfg["inbounds"].append(
         {"type": "mixed", "tag": "shared-in", "listen": e["P_HOST"],
          "listen_port": int(e["SHARED_PORT"])})
+    # The torrent client's own port, onto a selector of its own that the
+    # pilot moves, apart from the shared port's. The pilot tests it with a
+    # tracker announce sent through this port, and moves on from a node that
+    # cuts it. A urltest group cannot do this: sing-box tests with HEAD, and
+    # the filters seen so far let HEAD through and cut only the GET a real
+    # announce is. Without the pilot the selector stays on its first node.
+    #
+    # Not in chained-reality mode, where the port is refused below: the pilot
+    # would send announces to the Reality nodes, the very pattern that mode
+    # keeps off them, and with no selector it has nothing to test.
+    cfg["inbounds"].append(
+        {"type": "mixed", "tag": "torrent-in", "listen": e["P_HOST"],
+         "listen_port": int(e["TORRENT_PORT"])})
+    if not want_reality:
+        # A switch cuts the old node's connections, so a swarm on a node that
+        # filters does not linger half-working; the client reconnects in
+        # seconds.
+        cfg["outbounds"].append(
+            {"type": "selector", "tag": "torrent", "outbounds": tags,
+             "default": tags[0], "interrupt_exist_connections": True})
     # Except in chained-reality mode, where everything rides one Reality
     # server: torrents there would be dozens of busy parallel connections to
     # a single address presenting itself as the cover site - the pattern the
@@ -2986,7 +3033,11 @@ if nodes:
     # requires encryption is unrecognisable and got through. i2pd, which
     # would also fan out through it, is stopped on the switch as well.
     if want_reality:
-        cfg["route"]["rules"].append({"inbound": ["shared-in"], "action": "reject"})
+        cfg["route"]["rules"].append(
+            {"inbound": ["shared-in", "torrent-in"], "action": "reject"})
+    else:
+        cfg["route"]["rules"].append(
+            {"inbound": ["torrent-in"], "action": "route", "outbound": "torrent"})
     cfg["route"]["rules"].append(
         {"inbound": ["shared-in"], "action": "route", "outbound": up})
     # The incognito browser exists to be unlinked from you, so in

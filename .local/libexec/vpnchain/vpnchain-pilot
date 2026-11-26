@@ -49,6 +49,13 @@ The priorities, in order, and what each one costs the next:
      family included (see look_nearer), so a failover to a node far from
      the peer does not last once a near one answers again.
 
+Torrents have a port and a selector of their own ("torrent"), outside all of
+the above: some nodes cut anything that looks like BitTorrent, which a
+latency probe cannot see. Every several minutes a tracker announce is sent
+through that port - in the clear, as a client's is, since the filters read
+it on the node's side - and a node that cuts it while answering an ordinary
+probe is barred from torrents for a day (see torrent_check).
+
 The state, including recent events, is written to pilot.json beside the env
 file, for the dashboard and for whoever wants to know why the exit moved.
 """
@@ -132,6 +139,21 @@ ROTATE_RETRY = (120, 300)           # after the candidate did not answer
 # failover: with that weighting the two fastest nodes would take the whole day
 # between them, which is the opposite of the point.
 ROTATE_TAU_MS = 400
+
+# The torrent selector's check. The announce is a GET with the parameters a
+# client sends; the filters seen so far cut exactly that and let a HEAD of
+# the same URL through, which is why sing-box's own urltest cannot do this.
+# generate_204 ignores the query, so nothing is announced anywhere. Barred
+# nodes come back after a day, in case the provider changed its mind.
+TORRENT_SELECTOR = "torrent"
+TORRENT_EVERY = (480, 720)
+TORRENT_RETRY = (120, 300)          # after a round where nothing passed
+TORRENT_TRIES = 3                   # candidates tried per round
+TORRENT_BAR = 24 * 3600
+TORRENT_PROBE_URL = (
+    "http://www.gstatic.com/generate_204?info_hash=%aa%bb%cc%dd%ee%ff%00%11"
+    "%22%33%44%55%66%77%88%99%aa%bb%cc%dd&peer_id=-qB5200-aaaaaaaaaaaa"
+    "&port=6881&uploaded=0&downloaded=0&left=1")
 
 # Inside the node's TLS, so the network never sees which; varied anyway since
 # it costs nothing. All anycast, so each answers from next to the node.
@@ -281,6 +303,7 @@ class Pilot:
         s.setdefault("due", {})
         s.setdefault("outage", None)    # {"since", "rounds", "tried", "next"}
         s.setdefault("events", [])
+        s.setdefault("torrent_barred", {})  # tag -> until
         # The first explore and subscribe come one interval after the first
         # start, not at it: a start should not look like a burst.
         for key, every in (("explore", EXPLORE_EVERY), ("subscribe", SUBSCRIBE_EVERY)):
@@ -347,6 +370,9 @@ class Pilot:
             # Forget nodes the provider dropped, keep everything else.
             self.state["stats"] = {t: v for t, v in self.state["stats"].items()
                                    if t in self.all_nodes}
+            self.state["torrent_barred"] = {
+                t: v for t, v in self.state["torrent_barred"].items()
+                if t in self.all_nodes}
         self.nodes = self.all_nodes
 
     def narrow_to_selector(self, members):
@@ -1049,6 +1075,99 @@ class Pilot:
     def stalled(self, tag):
         return self.stat(tag).get("slow_until", 0) > time.time()
 
+    # --- torrents ----------------------------------------------------------
+
+    def announce_ok(self):
+        """Whether a tracker announce gets an answer through the torrent
+        port, i.e. through the node its selector holds. Twice before saying
+        no: one lost connection is not a filter."""
+        port = self.env.get("TORRENT_PORT", "20171")
+        url = self.env.get("TORRENT_PROBE_URL") or TORRENT_PROBE_URL
+        for _ in range(2):
+            try:
+                code = subprocess.run(
+                    ["curl", "-s", "-o", "/dev/null", "-m", "15",
+                     "-w", "%{http_code}",
+                     "--socks5-hostname", "127.0.0.1:%s" % port, url],
+                    capture_output=True, text=True, timeout=25).stdout.strip()
+            except Exception:
+                code = ""
+            if code and code != "000":
+                return True
+        return False
+
+    def torrent_barred(self, tag):
+        return self.state["torrent_barred"].get(tag, 0) > time.time()
+
+    def torrent_pick(self, members, tried):
+        """The next node for torrents: not barred, not tried this round, not
+        stalled or in a suspect family where others are left; the preferred
+        tier, as for the shared port, then latency. The node-to-peer distance
+        in score() is left out - torrents leave at the node, not the peer."""
+        base = [t for t in members if t in self.nodes and t not in tried
+                and not self.torrent_barred(t)]
+        good = [t for t in base if not self.stalled(t)
+                and not self.suspect(self.family(t))]
+        tags = self.prefer(good or base)
+        if not tags:
+            return None
+
+        def ms(t):
+            d = self.stat(t)["delays"]
+            return sorted(d)[len(d) // 2] if d else UNKNOWN_DELAY_MS
+        best = min(ms(t) for t in tags)
+        return random.choices(
+            tags, [math.exp(-(ms(t) - best) / TAU_MS) for t in tags])[0]
+
+    def torrent_check(self):
+        """Keep the torrent selector on a node that lets BitTorrent through.
+        Returns quietly when the config has no torrent selector - in
+        chained-reality mode, or a config from before it existed."""
+        try:
+            r = self.api._call("GET", "/proxies/" + TORRENT_SELECTOR)
+        except Exception:
+            return
+        now, members = r["now"], r.get("all") or []
+        if not self.due("torrent", TORRENT_EVERY):
+            return
+        tried = []
+        tag = now
+        why = None              # why the node held at the start was left
+        for _ in range(TORRENT_TRIES + 1):
+            if tag in members and not self.torrent_barred(tag) and self.announce_ok():
+                if tag != now:
+                    self.event("torrent", "%s -> %s (%s)" % (now, tag, why))
+                return
+            if tag in members and not self.torrent_barred(tag):
+                # Cut: a filter if the node still answers an ordinary probe,
+                # otherwise just down, which the stats already record.
+                if tag in self.nodes and self.probe(tag):
+                    self.state["torrent_barred"][tag] = int(time.time() + TORRENT_BAR)
+                    self.event("torrent", "%s cuts BitTorrent - not used for "
+                               "torrents for %d h" % (tag, TORRENT_BAR // 3600))
+                    why = why or "it cuts BitTorrent"
+                else:
+                    why = why or "it does not answer"
+            else:
+                why = why or "it is barred"
+            tried.append(tag)
+            if len(tried) > TORRENT_TRIES:
+                break
+            tag = self.torrent_pick(members, tried)
+            if not tag:
+                break
+            try:
+                self.api._call("PUT", "/proxies/" + TORRENT_SELECTOR, {"name": tag})
+            except Exception as e:
+                self.event("torrent", "could not move the selector: %r" % e)
+                return
+        # Nothing passed this round. The selector stays on the last one
+        # tried; the next round comes sooner than usual. Not an alert: that
+        # flag is the shared port's, cleared only by its own downloads.
+        self.event("torrent", "no node let an announce through in %d tries"
+                   % len(tried))
+        self.state["due"]["torrent"] = time.time() + random.uniform(*TORRENT_RETRY)
+
     def follow_home(self):
         """Point the "exit" selector at the home route behind the home router
         and at the tunnel everywhere else. 'vpnchain home test' answers from
@@ -1182,6 +1301,9 @@ class Pilot:
             if (self.dns_current() != self.dns_choices()[0]
                     and self.due("dns-prefer", (1800, 3600))):
                 self.prefer_dns()
+
+        if not self.reality_mode:
+            self.torrent_check()
 
         if self.due("subscribe", SUBSCRIBE_EVERY):
             self.subscribe()
